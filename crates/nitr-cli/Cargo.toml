@@ -12,7 +12,7 @@ documentation = "https://docs.rs/nitr-cli"
 readme = "../../README.md"
 categories = ["web-programming::http-server", "command-line-utilities"]
 keywords = ["dynamic-web-server", "http-server", "lua-server"]
-include = ["src/**/*.rs", "src/**/*.lua", "Cargo.toml", "LICENSE-APACHE", "LICENSE-MIT"]
+include = ["src/**/*.rs", "src/**/*.lua", "Cargo.toml", "src/nitr-api.toml", "LICENSE-APACHE", "LICENSE-MIT"]
 publish = true
 
 

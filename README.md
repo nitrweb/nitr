@@ -18,8 +18,8 @@
   </div>
 </div>
 
-> [!NOTE] Status
-> Nitr is in early development and not ready for production use yet. Feel free to try it out and contribute.
+> [!NOTE]
+> Nitr is in **early development** and not ready for production use yet. Feel free to try it out and contribute.
 
 ## Overview
 
