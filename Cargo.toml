@@ -39,8 +39,8 @@ edition = "2024"
 rust-version = "1.88.0"
 authors = ["Jose Quintana <https://joseluisq.net>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/joseluisq/nitr"
-homepage = "https://github.com/joseluisq/nitr"
+repository = "https://github.com/nitrweb/nitr"
+homepage = "https://github.com/nitrweb/nitr"
 
 [workspace.dependencies]
 # Workspace crates

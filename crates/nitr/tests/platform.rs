@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! End-to-end tests for the phase-7 platform features: static file
 //! serving (conditional requests, traversal protection, SPA fallback,
 //! `app:static` and `[static]` config), and the in-process test client.

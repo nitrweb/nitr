@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# This file is part of Nitr.
+# See https://nitrweb.com/ for more information
+# Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 # Local entry points mirroring what CI runs (.github/workflows/), so a
 # contributor can reproduce a red check without reading the workflows.
 #

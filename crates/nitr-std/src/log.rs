@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! Structured logging for Lua handlers: `log.info(msg, fields?)` and
 //! friends, backed by `tracing`. Events fire inside the per-request span,
 //! so they automatically carry the request id, method, and path.

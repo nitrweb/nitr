@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! Base64 encoding and decoding for Lua handlers: `nitr.base64`.
 //!
 //! One careful implementation instead of one per application: scripts

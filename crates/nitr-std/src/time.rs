@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! Safe clocks and time formatting for Lua handlers: `nitr.time`.
 //!
 //! This exists so scripts never need the `os` Lua standard library for a

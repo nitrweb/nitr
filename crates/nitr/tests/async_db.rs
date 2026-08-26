@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! End-to-end tests for phase 6: `nitr.await_all` concurrency, `nitr.fetch` options,
 //! SSRF policy (default-deny, allow-list), policy-checked redirects, and
 //! SQLite transactions (commit, rollback, savepoint nesting).

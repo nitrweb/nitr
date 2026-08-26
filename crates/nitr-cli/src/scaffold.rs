@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! `nitr init`: scaffolds a new application, matching the documented
 //! package layout. The scaffold is many users' first and most-copied
 //! example, so it demonstrates the patterns worth copying — middleware,
@@ -62,7 +67,7 @@ pub fn init(dir: &Path, minimal: bool) -> anyhow::Result<()> {
 }
 
 const NITR_TOML: &str = r#"# Nitr application configuration.
-# Reference: https://github.com/joseluisq/nitr (see the annotated nitr.toml)
+# Reference: https://github.com/nitrweb/nitr (see the annotated nitr.toml)
 listen = "127.0.0.1:3000"
 handler_script = "app.lua"
 config_script = "config.lua"

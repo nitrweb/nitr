@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! Rust-side protection enforced before a request reaches Lua: rate
 //! limiting and request-size limits. These are infrastructure concerns —
 //! implementing them in Lua would let the thing being protected against

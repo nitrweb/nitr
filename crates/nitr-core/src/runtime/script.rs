@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! Script loading and its diagnostics: the dual expression/block parse
 //! that keeps error line numbers honest, and the load-error renderer that
 //! points at the offending source line.

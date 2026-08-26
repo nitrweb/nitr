@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! Cross-origin resource sharing, enforced in Rust.
 //!
 //! CORS is policy, not application logic: a preflight carries no body and

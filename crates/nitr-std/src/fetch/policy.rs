@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! Outbound-request policy for the `fetch` builtin: SSRF protection.
 //!
 //! Once scripts can `fetch(...)`, the server is a potential SSRF primitive,

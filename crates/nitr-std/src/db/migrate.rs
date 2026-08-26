@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! Schema migrations: plain SQL files applied in order and recorded.
 //!
 //! No DSL, no ORM, no down-migrations. A migration is a `.sql` file whose

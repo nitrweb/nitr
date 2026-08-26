@@ -1,8 +1,25 @@
-# Nitr [![devel](https://github.com/joseluisq/nitr/actions/workflows/devel.yml/badge.svg)](https://github.com/joseluisq/nitr/actions/workflows/devel.yml) [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/joseluisq/nitr?utm_source=badge)
+<div>
+  <div align="center">
+    <a href="https://nitrweb.com" title="Nitr website">
+      <img src="https://avatars.githubusercontent.com/u/321541693?s=400&u=9bbbe39f0ffbcea9c39acf23f005f930d0dfc084&v=4" height="100" width="100"
+    /></a>
+  </div>
 
-> A Rust web server embedding [Lua](https://www.lua.org/) for fast, efficient and safe smaller dynamic backends.
+<h1 align="center">Nitr</h1>
 
-**STATUS:** Nitr is in early development and not ready for production use. Feel free to try it out and contribute.
+<h4 align="center">
+    A Rust web server embedding <a href="https://www.lua.org/" title="Lua">Lua</a> for fast, efficient and safe lightweight dynamic backends.
+  </h4>
+
+<div align="center">
+    <a href="https://github.com/nitrweb/nitr/actions/workflows/devel.yml" title="devel ci"><img src="https://github.com/nitrweb/nitr/actions/workflows/devel.yml/badge.svg?branch=master"></a> 
+    <a href="https://app.codspeed.io/nitrweb/nitr?utm_source=badge" title="CodSpeed performance benchmarks"><img src="https://img.shields.io/endpoint?url=https://codspeed.io/badge.json" alt="CodSpeed"/></a> 
+    
+  </div>
+</div>
+
+> [!NOTE] Status
+> Nitr is in early development and not ready for production use yet. Feel free to try it out and contribute.
 
 ## Overview
 
@@ -269,7 +286,7 @@ Every push and pull request runs them on [CodSpeed](https://app.codspeed.io/jose
 
 Unless you explicitly state otherwise, any contribution you intentionally submitted for inclusion in current work, as defined in the Apache-2.0 license, shall be dual licensed as described below, without any additional terms or conditions.
 
-Feel free to submit a [pull request](https://github.com/joseluisq/nitr/pulls) or file an [issue](https://github.com/joseluisq/nitr/issues).
+Feel free to submit a [pull request](https://github.com/nitrweb/nitr/pulls) or file an [issue](https://github.com/nitrweb/nitr/issues).
 
 ## License
 

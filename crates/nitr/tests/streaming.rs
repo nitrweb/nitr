@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! End-to-end tests for streaming bodies: writer callback, iterator mode,
 //! SSE, the per-chunk execution budget, the `max_streams` cap, and client
 //! disconnect recovery.

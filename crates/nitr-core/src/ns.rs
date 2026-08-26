@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! The `nitr` namespace table: the single place where every Nitr API is
 //! exposed to Lua. Builtins, the application object, and the configuration
 //! snapshot mount as fields of the global `nitr` table; user-defined Rust

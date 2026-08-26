@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! The `conn` builtin: SQLite statements and transactions. Blocking
 //! rusqlite calls run on the blocking thread pool; each Lua state owns its
 //! own connection, and requests are serialized per state, so a transaction

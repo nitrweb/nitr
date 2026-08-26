@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! End-to-end test: build a real server with the builder API, serve over a
 //! TCP socket, exercise the Lua handler, and shut down gracefully.
 

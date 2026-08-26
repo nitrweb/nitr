@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! `Accept` header negotiation: a hostile header must never panic, and
 //! what it picks must behave like a real preference order.
 //!
@@ -14,7 +19,11 @@ fuzz_target!(|input: (&str, Vec<&str>)| {
     let winner = nitr_std::best_match(accept, &offers);
 
     if let Some(i) = winner {
-        assert!(i < offers.len(), "winner {i} out of {} offers", offers.len());
+        assert!(
+            i < offers.len(),
+            "winner {i} out of {} offers",
+            offers.len()
+        );
 
         // Deterministic: the same negotiation picks the same offer.
         assert_eq!(

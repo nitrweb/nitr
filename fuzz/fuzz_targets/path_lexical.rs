@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! Lexical path handling: `normalize` is used to sanitize untrusted path
 //! input, so the properties a prefix check depends on are asserted under
 //! fuzzing — no `..` survives in an absolute path, normalizing again

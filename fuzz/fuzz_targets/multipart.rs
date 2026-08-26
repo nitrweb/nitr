@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
 //! The multipart layer over arbitrary bodies and content types: boundary
 //! extraction, the part-count cap, and the per-field byte cap applied
 //! while reading — the same loop `req:multipart()` runs, minus Lua and
