@@ -170,10 +170,23 @@ fn elf_machine_reads_both_endiannesses_and_ignores_non_elf() {
         "a missing file is not an ELF"
     );
 
-    // The real binary under test is an ELF on this platform or it is not
-    // one at all; either way the answer must agree with `/bin/sh`, since
-    // a native run is exactly when these tests must not skip.
-    if elf_machine(Path::new("/bin/sh")).is_some() {
+    // The `nitr` binary and this test are built in one cargo invocation
+    // for one target, so their headers must agree — on a non-ELF platform
+    // by both being `None`.
+    let me = std::env::current_exe().ok().and_then(|p| elf_machine(&p));
+    assert_eq!(
+        elf_machine(Path::new(env!("CARGO_BIN_EXE_nitr"))),
+        me,
+        "the nitr binary and this test share a build target"
+    );
+
+    // Matching `/bin/sh` is the native case, where the guard must never
+    // classify the run as cross-compiled. A MISmatch proves nothing
+    // either way: an i686 test run inside an x86_64 container differs
+    // from its shell yet executes natively (the kernel runs both), which
+    // is exactly why `binary_runs` lets the exec decide and reads the
+    // header only to classify a failure.
+    if me.is_some() && elf_machine(Path::new("/bin/sh")) == me {
         assert!(
             foreign_machine().is_none(),
             "a native test run must not be classified as cross-compiled"
