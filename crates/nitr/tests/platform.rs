@@ -12,7 +12,41 @@
 
 mod harness;
 
+use std::net::SocketAddr;
+
 use harness::{TestDir, TestServer};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+/// Sends a request line *verbatim* over a raw socket and returns the
+/// response status code.
+///
+/// `reqwest` routes every path through `Url::parse`, which normalizes
+/// `..` out of an http(s) path before it ever leaves the client — so
+/// `GET /../x` is sent as `GET /x`, and a server-side traversal guard is
+/// never exercised. Only a raw socket puts the hostile bytes on the wire
+/// unchanged.
+async fn raw_status(addr: SocketAddr, raw_path: &str) -> u16 {
+    let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    sock.write_all(
+        format!("GET {raw_path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .expect("write request");
+    let mut raw = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sock.read_to_end(&mut raw),
+    )
+    .await
+    .expect("the server must answer")
+    .expect("read response");
+    let head = String::from_utf8_lossy(&raw);
+    head.strip_prefix("HTTP/1.1 ")
+        .and_then(|rest| rest.get(..3))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status line in response to `{raw_path}`: {head}"))
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn static_files_and_spa_end_to_end() {
@@ -77,15 +111,33 @@ return app
             .contains("javascript")
     );
 
-    // Traversal attempts never leave the mount.
+    // Traversal attempts never leave the mount. Sent over a raw socket so
+    // the literal `..` and percent-encodings actually reach the server —
+    // `server.get()` would let `Url::parse` normalize them away first, so
+    // two of these would 404 on a *missing file* even with the guard gone.
+    // `site/` contains index.html + assets/, and Cargo.toml sits two
+    // levels up, so a working escape would find a real file.
+    let addr = server.addr();
     for path in [
         "/../Cargo.toml",
+        "/../../Cargo.toml",
+        "/assets/../../Cargo.toml",
         "/%2e%2e/Cargo.toml",
-        "/assets/../../etc/passwd",
+        "/%2e%2e%2fCargo.toml",
+        "/..%2fCargo.toml",
+        "/assets/%2e%2e/%2e%2e/Cargo.toml",
+        "/%2e%2e%5cCargo.toml", // backslash form
+        "/..%5cCargo.toml",
+        // Double-encoded: `%252e` decodes once to `%2e`, which must NOT be
+        // decoded again into `.` — a single pass is the whole contract.
+        "/%252e%252e/Cargo.toml",
     ] {
-        let resp = server.get(path).await;
-        assert_eq!(resp.status(), 404, "{path} must be rejected");
+        assert_eq!(raw_status(addr, path).await, 404, "{path} must be rejected");
     }
+
+    // The Lua route is still reachable over the raw socket: proof the 404s
+    // above are the guard firing, not the server refusing everything.
+    assert_eq!(raw_status(addr, "/assets/app.js").await, 200);
 
     // Lua routes still win over the root static mount.
     let resp = server.get("/api/ping").await;

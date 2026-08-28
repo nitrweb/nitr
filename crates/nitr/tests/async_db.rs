@@ -221,7 +221,10 @@ return app
         "got: {body}"
     );
 
-    // Metadata-endpoint style link-local addresses are refused too.
+    // Metadata-endpoint style link-local addresses are refused too — and
+    // the refusal must be the *policy* speaking, not a connect timeout to
+    // an unroutable address (which would pass even with the SSRF filter
+    // removed). Asserting the policy message pins that distinction.
     let body: serde_json::Value = client
         .get(server.url("/try"))
         .query(&[("url", "http://169.254.169.254/latest/meta-data/")])
@@ -232,6 +235,14 @@ return app
         .await
         .expect("body");
     assert_eq!(body["ok"], false);
+    assert!(
+        body["err"]
+            .as_str()
+            .expect("err string")
+            .contains("private or local"),
+        "the metadata address must be refused by the SSRF policy, not a \
+         network error: {body}"
+    );
 
     server.stop().await;
 
@@ -266,6 +277,113 @@ return app
             .contains("allowed_hosts"),
         "got: {body}"
     );
+
+    server.stop().await;
+}
+
+/// The documented contract that had no negative test: `check_url` runs on
+/// every redirect hop, so a redirect **cannot cross the trust boundary**.
+/// The only prior redirect test followed a hop to an *allowed* target and
+/// asserted 200 — it would pass with the per-hop re-validation removed.
+///
+/// Loopback forces the shape of the test: to fetch its own address at all
+/// the server must allow private networks, so the boundary under test is
+/// `allowed_hosts`, re-checked on the hop. The initial request goes to the
+/// one listed host and succeeds; the redirect it follows points off the
+/// list and must be refused mid-chain, not connected to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_redirects_are_revalidated_against_the_policy_per_hop() {
+    let mut builder = TestServer::builder("p6-redirect-policy")
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP | nitr::Builtins::FETCH)
+        .config(|cfg| {
+            // Several workers: the handler fetches the server's own routes,
+            // so the request holding a state needs *another* free state to
+            // answer the self-call — one worker would shed it as a 503.
+            cfg.workers = 3;
+            cfg.fetch.allow_private_networks = true;
+            // Only the server's own loopback host is reachable.
+            cfg.fetch.allowed_hosts = Some(vec!["127.0.0.1".into()]);
+        });
+    let addr = builder.reserve();
+
+    let app = format!(
+        r#"
+local BASE = "http://{addr}"
+local app = nitr.app()
+
+-- Redirects that leave the allowed host: an unlisted public name and the
+-- cloud-metadata address (unlisted here, so caught as an unlisted host on
+-- the hop rather than needing a resolution).
+app:get("/to-unlisted", function(req)
+    return nitr.redirect("http://unlisted.example.com/secret")
+end)
+app:get("/to-metadata", function(req)
+    return nitr.redirect("http://169.254.169.254/latest/meta-data/")
+end)
+
+-- A same-host redirect stays inside the boundary and is followed.
+app:get("/to-self", function(req) return nitr.redirect("/landed") end)
+app:get("/landed", function(req) return nitr.text("landed") end)
+
+app:get("/follow", function(req)
+    local ok, res = pcall(function()
+        return nitr.fetch("GET", BASE .. req.query.path):send()
+    end)
+    return nitr.json({{
+        ok = ok,
+        err = ok and "" or tostring(res),
+        status = ok and res.status or 0,
+    }})
+end)
+
+-- Follows the redirect and reports what it landed on, for the positive case.
+app:get("/follow-ok", function(req)
+    local resp = nitr.fetch("GET", BASE .. "/to-self"):send()
+    return nitr.json({{ status = resp.status, body = resp:text() }})
+end)
+
+return app
+"#
+    );
+    let mut server = builder.handler(app).spawn().await;
+    let client = server.client().clone();
+
+    // A redirect off the allowed host is refused on the hop, naming the
+    // policy — proof the block is the re-check, not a failed connection to
+    // unlisted.example.com (which would surface a DNS/connect error).
+    for path in ["/to-unlisted", "/to-metadata"] {
+        let body: serde_json::Value = client
+            .get(server.url("/follow"))
+            .query(&[("path", path)])
+            .send()
+            .await
+            .expect("follow redirect")
+            .json()
+            .await
+            .expect("body");
+        assert_eq!(body["ok"], false, "{path} must be refused: {body}");
+        assert!(
+            body["err"]
+                .as_str()
+                .expect("err string")
+                .contains("allowed_hosts"),
+            "{path} must be refused by the per-hop policy check: {body}"
+        );
+    }
+
+    // The positive control: a redirect that stays on the allowed host is
+    // followed to completion, so the negatives above are the boundary
+    // firing, not redirects being broken outright.
+    let body: serde_json::Value = client
+        .get(server.url("/follow-ok"))
+        .send()
+        .await
+        .expect("follow same-host redirect")
+        .json()
+        .await
+        .expect("body");
+    assert_eq!(body["status"], 200);
+    assert_eq!(body["body"], "landed");
 
     server.stop().await;
 }

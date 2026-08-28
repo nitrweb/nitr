@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 678f1d13c24efb1c281b46dbfd10877bc8e780120831fe574d06cd0db0587941 # shrinks to token = "?"
+cc 2b5c8834367889cff7664ef115bf6c641fdb369b067a9c0329ad438e0674226c # shrinks to content_type = "multipart/form-data;boundary="

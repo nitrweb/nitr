@@ -309,6 +309,54 @@ mod tests {
         cfg.validate().expect("disabled health is not validated");
     }
 
+    /// An unknown `[compression]` algorithm is a startup refusal naming
+    /// the offending value, not a silently un-negotiable encoding.
+    #[test]
+    fn unknown_compression_algorithms_are_startup_errors() {
+        let mut cfg = valid_base();
+        cfg.compression.algorithms = vec!["br".into(), "zstd".into()];
+        let err = cfg.validate().expect_err("unknown algorithm");
+        let msg = err.to_string();
+        assert!(msg.contains("zstd"), "got: {msg}");
+        assert!(msg.contains("[compression]"), "got: {msg}");
+
+        // The two supported names still validate, in either order.
+        let mut cfg = valid_base();
+        cfg.compression.algorithms = vec!["gzip".into(), "br".into()];
+        cfg.validate().expect("br and gzip are the supported set");
+    }
+
+    /// `[lua] stdlib` is strict: a misspelled library name refuses to
+    /// start, naming the string, instead of silently loading nothing.
+    #[test]
+    fn unknown_lua_stdlib_names_are_startup_errors() {
+        let mut lua = LuaConfig::default();
+        lua.stdlib.push("iio".into());
+        let err = lua.parse_stdlib().expect_err("unknown stdlib name");
+        assert!(err.to_string().contains("`iio`"), "got: {err}");
+
+        // Every documented name parses, including the dangerous opt-ins.
+        let all = LuaConfig {
+            stdlib: [
+                "coroutine",
+                "table",
+                "io",
+                "os",
+                "string",
+                "utf8",
+                "math",
+                "package",
+                "debug",
+            ]
+            .map(String::from)
+            .to_vec(),
+            ..LuaConfig::default()
+        };
+        let libs = all.parse_stdlib().expect("all known names");
+        assert!(libs.contains(mlua::StdLib::IO));
+        assert!(libs.contains(mlua::StdLib::DEBUG));
+    }
+
     #[test]
     fn missing_paths_are_named_at_startup() {
         let mut cfg = valid_base();

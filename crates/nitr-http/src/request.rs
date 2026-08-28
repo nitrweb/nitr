@@ -561,7 +561,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    // `start_paused`: both the budget and the trickle below run on tokio
+    // timers, so virtual time makes these exact — the old real-clock
+    // margins (a 30ms trickle against an 80ms budget) rode on the
+    // scheduler's mood on a loaded runner.
+    #[tokio::test(start_paused = true)]
     async fn a_stalled_body_read_fails_and_sets_the_flag() {
         let stalled = Arc::new(AtomicBool::new(false));
         let mut body = StalledBody {
@@ -582,7 +586,7 @@ mod tests {
     /// The budget bounds *progress*, not total transfer: a transfer whose
     /// every gap stays under the budget completes no matter how long it
     /// takes in total.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_slow_but_moving_body_completes() {
         let stalled = Arc::new(AtomicBool::new(false));
         let mut body = StalledBody {

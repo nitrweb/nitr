@@ -190,8 +190,14 @@ impl RateLimiter {
     /// Returns `Err(retry_after_seconds)` when the client exceeded its
     /// budget for the current window.
     fn check(&self, req: &LuaRequest) -> std::result::Result<(), u64> {
+        self.check_at(req, Instant::now())
+    }
+
+    /// [`check`](Self::check) at an explicit instant — the seam that lets
+    /// tests drive window expiry and bucket eviction deterministically
+    /// instead of sleeping against the real clock.
+    fn check_at(&self, req: &LuaRequest, now: Instant) -> std::result::Result<(), u64> {
         let ip = self.client_ip(req);
-        let now = Instant::now();
         let mut buckets = match self.buckets.lock() {
             Ok(guard) => guard,
             // Poisoning is unreachable in practice (no panics while held);
@@ -284,12 +290,102 @@ mod tests {
 
     #[test]
     fn the_window_resets_the_budget() {
+        // Driven through `check_at` with synthetic instants: the old
+        // real-clock version (60 ms sleep against a 30 ms window) passed
+        // or failed with the scheduler's mood on a loaded runner.
         let limiter = limiter(1, 30, false);
         let req = request("10.0.0.1", None);
-        assert!(limiter.check(&req).is_ok());
-        assert!(limiter.check(&req).is_err());
-        std::thread::sleep(Duration::from_millis(60));
-        assert!(limiter.check(&req).is_ok(), "a new window starts fresh");
+        let t0 = Instant::now();
+        assert!(limiter.check_at(&req, t0).is_ok());
+        assert!(limiter.check_at(&req, t0).is_err(), "over budget in-window");
+        // One instant short of the window boundary is still the old window.
+        assert!(
+            limiter
+                .check_at(&req, t0 + Duration::from_millis(29))
+                .is_err()
+        );
+        assert!(
+            limiter
+                .check_at(&req, t0 + Duration::from_millis(30))
+                .is_ok(),
+            "a new window starts fresh"
+        );
+    }
+
+    /// The purge backstop (guard against unbounded `HashMap` growth from
+    /// spoofed source IPs): once the map exceeds `BUCKET_PURGE_THRESHOLD`,
+    /// the next check drops every bucket whose window has passed.
+    #[test]
+    fn stale_buckets_are_purged_past_the_threshold() {
+        let limiter = limiter(100, 1_000, false);
+        let t0 = Instant::now();
+
+        // One bucket per distinct client IP, all opened at t0.
+        for n in 0..=BUCKET_PURGE_THRESHOLD as u32 {
+            let ip = format!("10.{}.{}.{}", n >> 16 & 0xff, n >> 8 & 0xff, n & 0xff);
+            assert!(limiter.check_at(&request(&ip, None), t0).is_ok());
+        }
+        assert!(
+            limiter.buckets.lock().expect("buckets").len() > BUCKET_PURGE_THRESHOLD,
+            "the map must actually be past the threshold for the purge to be tested"
+        );
+
+        // A later request finds the map oversized and evicts everything
+        // stale; only itself (fresh) survives.
+        let later = t0 + Duration::from_millis(1_500);
+        assert!(
+            limiter
+                .check_at(&request("192.168.0.1", None), later)
+                .is_ok()
+        );
+        assert_eq!(
+            limiter.buckets.lock().expect("buckets").len(),
+            1,
+            "stale buckets must be evicted, not accumulate forever"
+        );
+    }
+
+    /// The trusted-id validation edges (`len <= 64`, ASCII-graphic only,
+    /// non-empty): everything outside the shape is *replaced* by a fresh
+    /// UUID, never echoed — a proxy header is still attacker-influenced
+    /// text headed for log pipelines.
+    #[test]
+    fn trusted_request_ids_validate_the_shape_edges() {
+        let cfg = Config {
+            trust_request_id: true,
+            ..Default::default()
+        };
+        let protection = Protection::new(&cfg);
+        let id_for = |value: &[u8]| {
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert(
+                "x-request-id",
+                HeaderValue::from_bytes(value).expect("header value"),
+            );
+            protection.request_id_for_parts(&headers)
+        };
+
+        // In shape: passed through verbatim, including the 64-byte edge.
+        assert_eq!(id_for(b"req-from-proxy-1"), "req-from-proxy-1");
+        let at_cap = "a".repeat(64);
+        assert_eq!(id_for(at_cap.as_bytes()), at_cap);
+
+        // Out of shape: one past the cap, empty, whitespace, non-ASCII.
+        let over_cap = "a".repeat(65).into_bytes();
+        for bad in [&over_cap[..], b"", b"has space", "caf\u{e9}".as_bytes()] {
+            let id = id_for(bad);
+            assert_ne!(id.as_bytes(), bad, "{bad:?} must not be echoed");
+            assert!(
+                uuid::Uuid::parse_str(&id).is_ok(),
+                "the replacement must be a generated UUID, got `{id}`"
+            );
+        }
+
+        // And without trust, even a well-shaped id is replaced.
+        let untrusted = Protection::new(&Config::default());
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("req-1"));
+        assert_ne!(untrusted.request_id_for_parts(&headers), "req-1");
     }
 
     #[test]

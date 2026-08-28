@@ -22,6 +22,35 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+// ---------------------------------------------------------------------------
+// The suite's flake budget, in one place.
+//
+// Every timing tolerance the harness grants lives here: how long a spawn
+// may take to answer, how long a drain may take, how long the pool may
+// take to reflect a checkout or a recycle. Tests inherit these instead of
+// inventing their own margins, so when CI slows down there is exactly one
+// screw to turn — and one diff to review when someone turns it.
+
+/// Graceful-drain deadline configured on every test server (seconds).
+/// Generous enough for a real drain, short enough that a hung drain fails
+/// the test rather than idling toward the CI timeout.
+const SHUTDOWN_GRACE_SECS: u64 = 5;
+
+/// How long [`TestServer::stop`]/[`shutdown`](TestServer::shutdown) waits
+/// for the serve task to finish before declaring the server hung.
+const JOIN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Readiness poll for a spawned server: attempts × interval bounds how
+/// long a server may take to answer its first TCP connect.
+const READINESS_ATTEMPTS: u32 = 200;
+const READINESS_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How long pool state (checkouts, recycles, refills) may lag the event
+/// that caused it before [`TestServer::wait_until_available`] and the
+/// post-stop leak check give up.
+const POOL_SETTLE_DEADLINE: Duration = Duration::from_secs(5);
+const POOL_SETTLE_INTERVAL: Duration = Duration::from_millis(10);
+
 /// A scratch directory private to one test.
 ///
 /// Every test runs as a thread of the same process, so a directory keyed
@@ -94,11 +123,11 @@ pub fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
 /// this is near-instant (the socket is bound before the server task even
 /// starts); the loop guards the day that stops being true.
 pub async fn wait_until_listening(addr: SocketAddr) {
-    for _ in 0..200 {
+    for _ in 0..READINESS_ATTEMPTS {
         if tokio::net::TcpStream::connect(addr).await.is_ok() {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(READINESS_INTERVAL).await;
     }
     panic!("nothing came up on {addr}");
 }
@@ -120,6 +149,7 @@ pub struct Builder {
     seed_sql: Vec<String>,
     db_path: Option<PathBuf>,
     listener: Option<std::net::TcpListener>,
+    health_listener: Option<std::net::TcpListener>,
 }
 
 impl TestServer {
@@ -129,7 +159,7 @@ impl TestServer {
         let mut cfg = nitr::Config::default();
         // Tests want prompt teardown: a graceful drain deadline that
         // fails the test, not the CI job, and no stream grace.
-        cfg.shutdown.grace = 5;
+        cfg.shutdown.grace = SHUTDOWN_GRACE_SECS;
         cfg.shutdown.stream_grace = 0;
         Builder {
             dir: TestDir::new(label),
@@ -142,6 +172,7 @@ impl TestServer {
             seed_sql: Vec::new(),
             db_path: None,
             listener: None,
+            health_listener: None,
         }
     }
 }
@@ -225,6 +256,18 @@ impl Builder {
         addr
     }
 
+    /// Reserves a separate probe address for `[health] bind` the same way
+    /// [`reserve`](Self::reserve) reserves the main one: the listener is
+    /// kept and adopted by the server, so — unlike a bind-drop-rebind —
+    /// nothing can take the port in between. This is what makes a
+    /// separate-bind health test race-free.
+    pub fn reserve_health(&mut self) -> SocketAddr {
+        let (listener, addr) = reserve_addr();
+        self.cfg.health.bind = Some(addr);
+        self.health_listener = Some(listener);
+        addr
+    }
+
     /// A SQL batch executed against the configured database before the
     /// server builds (so boot-time checks see the seeded schema).
     pub fn seed_sql(mut self, batch: impl Into<String>) -> Self {
@@ -291,12 +334,11 @@ impl Builder {
                 (listener, addr)
             }
         };
-        let server = self
-            .prepare()
-            .listener(listener)
-            .build()
-            .await
-            .expect("build server");
+        let mut builder = self.prepare().listener(listener);
+        if let Some(health) = self.health_listener.take() {
+            builder = builder.health_listener(health);
+        }
+        let server = builder.build().await.expect("build server");
 
         let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let pool = server.pool();
@@ -350,6 +392,25 @@ impl TestServer {
         &self.pool
     }
 
+    /// Polls until `available()` states remain in the pool (bounded, 5 s).
+    ///
+    /// The deterministic replacement for "sleep and hope": a test that
+    /// needs an in-flight request to have checked its state out (or given
+    /// it back) waits for the observable fact instead of a margin.
+    pub async fn wait_until_available(&self, want: usize) {
+        let deadline = std::time::Instant::now() + POOL_SETTLE_DEADLINE;
+        while self.pool.available() != want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pool never reached {want} available state(s) \
+                 (size {}, available {})",
+                self.pool.size(),
+                self.pool.available()
+            );
+            tokio::time::sleep(POOL_SETTLE_INTERVAL).await;
+        }
+    }
+
     /// Whether the serve task has already exited — a server that failed
     /// to come up (say, a stolen port for a secondary bind) rather than
     /// one still serving.
@@ -400,6 +461,24 @@ impl TestServer {
     /// uploaded file) still have their evidence.
     pub async fn stop(&mut self) {
         self.shutdown().await.expect("clean shutdown");
+        // Leak accounting: after a clean drain, every Lua state must be
+        // back in the pool. A missing one means something checked a state
+        // out and never returned it — a leak nothing else in the suite
+        // would notice, since the next test gets a fresh server. Bounded
+        // poll rather than an instant assert: guards return their states
+        // a beat after the drain resolves, and a recycled state's rebuild
+        // lands off the request path.
+        let size = self.pool.size();
+        let deadline = std::time::Instant::now() + POOL_SETTLE_DEADLINE;
+        while self.pool.available() != size {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "leak: only {} of {size} Lua state(s) returned to the pool \
+                 after a clean shutdown",
+                self.pool.available(),
+            );
+            tokio::time::sleep(POOL_SETTLE_INTERVAL).await;
+        }
     }
 
     /// Like [`stop`](Self::stop), but hands back the serve result instead
@@ -408,7 +487,7 @@ impl TestServer {
     pub async fn shutdown(&mut self) -> nitr::Result {
         let _ = self.stop.take().expect("not stopped").send(());
         let served = self.served.take().expect("not stopped");
-        match tokio::time::timeout(Duration::from_secs(10), served).await {
+        match tokio::time::timeout(JOIN_DEADLINE, served).await {
             Ok(task) => task.expect("server task"),
             Err(_) => panic!("the server did not shut down within 10s"),
         }

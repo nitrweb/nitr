@@ -60,7 +60,7 @@ return {{}}
 async fn a_save_reloads_once_and_the_rebuilds_own_writes_do_not_loop() {
     let builder = TestServer::builder("dev-reload");
     let counter = builder.dir().join("rebuilds.log");
-    let server = builder
+    let mut server = builder
         .handler(HANDLER_V1)
         .config_script(counting_config_script(&counter))
         .config(|cfg| {
@@ -98,12 +98,30 @@ async fn a_save_reloads_once_and_the_rebuilds_own_writes_do_not_loop() {
     }
 
     // Let the trailing debounce window (from the last redundant save
-    // above) fire and finish its rebuild...
-    tokio::time::sleep(Duration::from_millis(700)).await;
-    let settled = std::fs::metadata(&counter).expect("counter file").len();
+    // above) fire and finish its rebuild: poll until the rebuild counter
+    // holds still for a few consecutive reads, instead of trusting a
+    // fixed 700ms to have covered the debounce on a loaded runner.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut settled = std::fs::metadata(&counter).expect("counter file").len();
+    let mut stable_reads = 0u32;
+    while stable_reads < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "the rebuild counter never settled after the last save"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let size = std::fs::metadata(&counter).expect("counter file").len();
+        if size == settled {
+            stable_reads += 1;
+        } else {
+            settled = size;
+            stable_reads = 0;
+        }
+    }
     // ...then hold still. Before the input filter, the rebuild's own
     // write re-triggered the watcher every ~200ms, so a quiet second is
-    // the loop's absence, not its slowness.
+    // the loop's absence, not its slowness. (A quiet window is the only
+    // way to prove an absence; the poll above just anchors its start.)
     tokio::time::sleep(Duration::from_secs(1)).await;
     let after = std::fs::metadata(&counter).expect("counter file").len();
     assert_eq!(
@@ -115,4 +133,8 @@ async fn a_save_reloads_once_and_the_rebuilds_own_writes_do_not_loop() {
     // And the reloaded application still serves.
     let resp = server.client().get(&version).send().await.expect("get v2");
     assert_eq!(body(resp).await, "v2");
+
+    // Every integration test stops its server deterministically; this one
+    // used to abort-drop the serve task instead.
+    server.stop().await;
 }

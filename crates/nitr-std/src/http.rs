@@ -555,8 +555,11 @@ mod tests {
             proptest::prop_assert_eq!(verified.as_deref(), Some(value.as_str()));
 
             // One changed character anywhere — payload or MAC — must fail.
-            let pos = pos.index(signed.len());
+            // The index is taken over the collected chars, not the byte
+            // length: the two only coincide while the signed encoding
+            // stays pure ASCII, and the test must not depend on that.
             let mut tampered: Vec<char> = signed.chars().collect();
+            let pos = pos.index(tampered.len());
             tampered[pos] = if tampered[pos] == 'A' { 'B' } else { 'A' };
             let tampered: String = tampered.into_iter().collect();
             proptest::prop_assert_eq!(verify(&name, &tampered, &secret), None);

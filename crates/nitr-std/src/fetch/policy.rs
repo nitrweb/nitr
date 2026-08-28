@@ -254,29 +254,61 @@ mod tests {
 
     #[tokio::test]
     async fn policy_checks_urls() {
+        // Each refusal is pinned to its *reason*: a bare `is_err()` here
+        // would also pass when the check failed for something unrelated
+        // to the policy being tested.
         let default = FetchOptions::default();
         let url: Url = "http://127.0.0.1:8080/x".parse().expect("url");
-        assert!(check_url(&url, &default).await.is_err());
+        let err = check_url(&url, &default)
+            .await
+            .expect_err("loopback under the default policy");
+        assert!(err.to_string().contains("private or local"), "got: {err}");
 
         let open = FetchOptions {
             allow_private_networks: true,
             ..Default::default()
         };
-        assert!(check_url(&url, &open).await.is_ok());
+        check_url(&url, &open)
+            .await
+            .expect("loopback once private networks are allowed");
 
-        // Non-http schemes are always refused.
+        // Non-http schemes are always refused, even under the open policy.
         let ftp: Url = "ftp://example.com/x".parse().expect("url");
-        assert!(check_url(&ftp, &open).await.is_err());
+        let err = check_url(&ftp, &open).await.expect_err("non-http scheme");
+        assert!(err.to_string().contains("http/https"), "got: {err}");
 
-        // The allow-list applies even with private networks allowed.
+        // The allow-list applies even with private networks allowed, and
+        // the refusal names the setting to change.
         let listed = FetchOptions {
             allowed_hosts: Some(vec!["api.example.com".into()]),
             allow_private_networks: true,
             ..Default::default()
         };
         let other: Url = "http://evil.example.com/".parse().expect("url");
-        assert!(check_url(&other, &listed).await.is_err());
+        let err = check_url(&other, &listed).await.expect_err("unlisted host");
+        assert!(err.to_string().contains("allowed_hosts"), "got: {err}");
+        // Host matching is case-insensitive, per DNS.
         let ok: Url = "http://API.example.com/".parse().expect("url");
-        assert!(check_url(&ok, &listed).await.is_ok());
+        check_url(&ok, &listed)
+            .await
+            .expect("listed host, any case");
+
+        // A forbidden *IP literal* is refused without any resolution — the
+        // metadata-endpoint shape (`169.254.169.254`) must never depend on
+        // what the host's resolver does.
+        for literal in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/x",
+            "http://10.0.0.7/x",
+        ] {
+            let url: Url = literal.parse().expect("url");
+            let err = check_url(&url, &default)
+                .await
+                .expect_err("forbidden IP literal");
+            assert!(
+                err.to_string().contains("private or local"),
+                "{literal}: {err}"
+            );
+        }
     }
 }

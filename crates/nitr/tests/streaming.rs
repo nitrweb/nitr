@@ -12,7 +12,7 @@
 
 mod harness;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use harness::TestServer;
 
@@ -153,15 +153,30 @@ async fn streaming_bodies_end_to_end() {
         .await
         .expect("hold");
     assert_eq!(held.status(), 200);
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let resp = client
-        .get(format!("{base}/stream"))
-        .send()
-        .await
-        .expect("stream while held");
-    assert_eq!(resp.status(), 503);
+    // The 200 headers arrive before the body starts producing, so the
+    // stream slot is claimed slightly later — poll until a second stream
+    // is actually refused rather than sleeping a guessed 200ms. (A fresh
+    // /stream before the slot is taken would succeed and complete fast, so
+    // retrying is safe.)
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let resp = client
+            .get(format!("{base}/stream"))
+            .send()
+            .await
+            .expect("stream while held");
+        if resp.status() == 503 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the held stream never claimed the only stream slot"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
+    // A plain (non-streaming) request is unaffected by the exhausted slot.
     let resp = client
         .get(format!("{base}/plain"))
         .send()
@@ -170,16 +185,25 @@ async fn streaming_bodies_end_to_end() {
     assert_eq!(resp.status(), 200);
 
     // Dropping the client cancels the held stream, frees its slot and
-    // returns its state to the pool.
+    // returns its state to the pool. Poll until a new stream is accepted
+    // again instead of sleeping a fixed 500ms.
     drop(held);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let resp = client
-        .get(format!("{base}/stream"))
-        .send()
-        .await
-        .expect("stream after release");
-    assert_eq!(resp.status(), 200);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let resp = loop {
+        let resp = client
+            .get(format!("{base}/stream"))
+            .send()
+            .await
+            .expect("stream after release");
+        if resp.status() == 200 {
+            break resp;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the stream slot was never released after the client hung up"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert_eq!(resp.text().await.expect("body after release"), "[1,2,3]");
 
     server.stop().await;

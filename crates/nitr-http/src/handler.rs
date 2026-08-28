@@ -658,9 +658,13 @@ fn resolve_source_path(
 }
 
 fn escape_html(text: &str) -> String {
+    // Quotes included: the snippet is rendered in element context today,
+    // but escaping is the wrong place to depend on that staying true.
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 #[cfg(test)]
@@ -723,11 +727,44 @@ mod tests {
     #[tokio::test]
     async fn rejects_invalid_headers_gracefully() {
         let lua = Lua::new();
+        // Each refusal must name the offending header — a failure for an
+        // unrelated reason (a body error, say) would not — and the whole
+        // conversion fails, so no partial header set can ever be sent.
         let bad_name = eval_table(&lua, r#"{ headers = { ["bad name"] = "x" } }"#);
-        assert!(to_response(bad_name).is_err());
+        let err = to_response(bad_name).expect_err("space in a header name");
+        assert!(err.to_string().contains("bad name"), "got: {err}");
 
         let bad_type = eval_table(&lua, r#"{ headers = { ok = function() end } }"#);
-        assert!(to_response(bad_type).is_err());
+        let err = to_response(bad_type).expect_err("function as a header value");
+        assert!(err.to_string().contains("header `ok`"), "got: {err}");
+    }
+
+    /// CRLF in a header value is response splitting; the unit-level
+    /// contract (mirroring the end-to-end one in `standards.rs`) is that
+    /// the conversion fails naming the header — the injected bytes never
+    /// exist in any response, because no response exists.
+    #[tokio::test]
+    async fn header_values_with_crlf_are_refused_not_split() {
+        let lua = Lua::new();
+        let split = eval_table(
+            &lua,
+            "{ headers = { [\"X-Evil\"] = \"a\\r\\nInjected: yes\" } }",
+        );
+        let err = to_response(split).expect_err("CRLF in a header value");
+        assert!(
+            err.to_string()
+                .contains("invalid value for header `x-evil`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn escape_html_neutralizes_markup_and_quotes() {
+        assert_eq!(
+            escape_html(r#"<a href="x" onmouseover='y'>&z</a>"#),
+            "&lt;a href=&quot;x&quot; onmouseover=&#39;y&#39;&gt;&amp;z&lt;/a&gt;"
+        );
+        assert_eq!(escape_html("plain text"), "plain text");
     }
 
     #[tokio::test]

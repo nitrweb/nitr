@@ -113,15 +113,32 @@ async fn trusted_request_ids_pass_through() {
         .expect("GET /");
     assert_eq!(resp.headers()["x-request-id"], "req-from-proxy-1");
 
-    // Malformed inbound ids are replaced, not echoed.
+    // The 64-byte edge is the longest id passed through.
+    let at_cap = "b".repeat(64);
     let resp = server
         .client()
         .get(server.url("/"))
-        .header("x-request-id", "bad id with spaces")
+        .header("x-request-id", &at_cap)
         .send()
         .await
         .expect("GET /");
-    assert_ne!(resp.headers()["x-request-id"], "bad id with spaces");
+    assert_eq!(resp.headers()["x-request-id"], at_cap.as_str());
+
+    // Malformed inbound ids are replaced, not echoed: whitespace, one byte
+    // past the length cap, empty. (Non-ASCII is covered at the unit level;
+    // reqwest itself refuses to send such a header value.)
+    for bad in ["bad id with spaces", &"b".repeat(65), ""] {
+        let resp = server
+            .client()
+            .get(server.url("/"))
+            .header("x-request-id", bad)
+            .send()
+            .await
+            .expect("GET /");
+        let echoed = resp.headers()["x-request-id"].to_str().expect("id");
+        assert_ne!(echoed, bad, "{bad:?} must be replaced, not echoed");
+        assert_eq!(echoed.len(), 36, "the replacement must be a fresh UUID");
+    }
 
     server.stop().await;
 }

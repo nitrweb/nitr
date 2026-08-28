@@ -109,6 +109,102 @@ async fn cpu_bound_loops_hit_the_instruction_hook() {
     assert_eq!(resp.get::<String>("body").expect("body"), "alive");
 }
 
+/// The default library set is the sandbox: nothing that reaches the
+/// filesystem, the process, or the VM internals may exist as a global.
+/// This is the test that makes flipping a bit in the default `StdLib`
+/// set a visible failure instead of an invisible policy change.
+#[test]
+fn the_default_library_set_carries_no_ambient_authority() {
+    let rt = Runtime::new().expect("runtime");
+    let globals = rt.lua().globals();
+
+    // Filesystem, process, and debug-introspection entry points, plus the
+    // base-library functions that read arbitrary files.
+    for name in ["io", "os", "debug", "dofile", "loadfile"] {
+        let value: Value = globals.get(name).expect("read global");
+        assert!(
+            value.is_nil(),
+            "`{name}` must not be exposed by the default sandbox, got a {}",
+            value.type_name()
+        );
+    }
+
+    // The safe computational set is present — the sandbox is a policy,
+    // not an accident of loading nothing.
+    for name in [
+        "math",
+        "table",
+        "string",
+        "utf8",
+        "coroutine",
+        "require",
+        "pcall",
+    ] {
+        let value: Value = globals.get(name).expect("read global");
+        assert!(!value.is_nil(), "`{name}` must be available by default");
+    }
+}
+
+/// `require` confinement (`RuntimeOpts::package_dir`): `package.path` is
+/// pinned to the configured directory, `package.cpath` is emptied (no
+/// native modules), modules inside load, and every escape shape misses.
+#[tokio::test]
+async fn require_is_confined_to_the_package_dir() {
+    // A package dir with one module, and a would-be target right above it.
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("nitr-rt-confine-{}-{id}", std::process::id()));
+    let pkg = root.join("pkg");
+    std::fs::create_dir_all(&pkg).expect("mkdir pkg");
+    std::fs::write(pkg.join("inside.lua"), "return { where = 'inside' }").expect("write inside");
+    std::fs::write(root.join("outside.lua"), "return { where = 'outside' }")
+        .expect("write outside");
+
+    let rt = Runtime::new_with(RuntimeOpts {
+        libs: StdLib::MATH | StdLib::TABLE | StdLib::STRING | StdLib::PACKAGE,
+        memory_limit: 8 * 1024 * 1024,
+        dev_mode: false,
+        exec_timeout: None,
+        package_dir: Some(pkg.clone()),
+    })
+    .expect("runtime");
+    let lua = rt.lua();
+
+    // The pinned search path and the emptied native-module path.
+    let dir = pkg.to_string_lossy();
+    let path: String = lua
+        .load("return package.path")
+        .eval()
+        .expect("package.path");
+    assert_eq!(path, format!("{dir}/?.lua;{dir}/?/init.lua"));
+    let cpath: String = lua
+        .load("return package.cpath")
+        .eval()
+        .expect("package.cpath");
+    assert_eq!(cpath, "", "native module loading must be disabled");
+
+    // A module inside the directory loads.
+    let inside: String = lua
+        .load("return require('inside').where")
+        .eval()
+        .expect("require inside");
+    assert_eq!(inside, "inside");
+
+    // Escape shapes: the sibling exists on disk, so a hole in the
+    // confinement would *succeed* here rather than 404 into a false pass.
+    for escape in ["outside", "../outside", "..outside", "pkg/../../outside"] {
+        let result = lua
+            .load(format!("return require('{escape}').where"))
+            .eval::<String>();
+        assert!(
+            result.is_err(),
+            "require({escape:?}) must not reach outside the package dir"
+        );
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn modules_mount_under_nitr_ext_and_reject_collisions() {
     let rt = test_runtime(None);

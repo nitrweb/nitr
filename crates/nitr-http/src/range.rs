@@ -162,6 +162,35 @@ mod tests {
         assert_eq!(parse("bytes=0-0", 0), Resolved::Unsatisfiable);
     }
 
+    /// The arithmetic edges: `u64::MAX` numerals, the clamp path, and
+    /// suffix forms against very large representations — the places where
+    /// an overflow would turn into an out-of-bounds file read.
+    #[test]
+    fn extreme_numerals_never_produce_an_out_of_bounds_range() {
+        const MAX: &str = "18446744073709551615"; // u64::MAX
+
+        // A start beyond any real file is unsatisfiable, not wrapped.
+        assert_eq!(
+            parse(&format!("bytes={MAX}-"), 1000),
+            Resolved::Unsatisfiable
+        );
+        // An end of u64::MAX clamps to the last byte.
+        assert_eq!(parse(&format!("bytes=0-{MAX}"), 1000), partial(0, 999));
+        // A u64::MAX suffix is the whole file (saturating, not wrapping).
+        assert_eq!(parse(&format!("bytes=-{MAX}"), 1000), partial(0, 999));
+        // One past u64::MAX fails to parse and is ignored as malformed.
+        assert_eq!(parse("bytes=18446744073709551616-", 1000), Resolved::Full);
+
+        // Large representations: the same forms at a length near u64::MAX.
+        let len = u64::MAX;
+        assert_eq!(parse("bytes=0-99", len), partial(0, 99));
+        assert_eq!(
+            parse(&format!("bytes={}-", len - 1), len),
+            partial(len - 1, len - 1)
+        );
+        assert_eq!(parse("bytes=-1", len), partial(len - 1, len - 1));
+    }
+
     #[test]
     fn ignores_what_it_does_not_understand() {
         // Unknown units and malformed values fall back to the full body
@@ -201,15 +230,40 @@ mod tests {
         );
     }
 
+    /// Header text that keeps `parse` past the `bytes=` gate most of the
+    /// time: unstructured input alone bails at `strip_prefix` on
+    /// essentially every case, leaving the `Partial` arm dead.
+    fn range_header() -> impl proptest::prelude::Strategy<Value = String> {
+        use proptest::prelude::*;
+        prop_oneof![
+            // Raw attacker input, for totality.
+            1 => "[ -~]{0,40}".boxed(),
+            // Numeric spec soup after the prefix: digits, dashes, commas,
+            // spaces — every branch of the three-form match.
+            4 => "[0-9 ,\\-]{0,30}".prop_map(|s| format!("bytes={s}")).boxed(),
+            // Well-formed spans with numerals up to and beyond u64::MAX.
+            4 => ("[0-9]{1,20}", "[0-9]{0,20}")
+                .prop_map(|(a, b)| format!("bytes={a}-{b}"))
+                .boxed(),
+            // Suffix form.
+            2 => "[0-9]{1,20}".prop_map(|n| format!("bytes=-{n}")).boxed(),
+        ]
+    }
+
     proptest::proptest! {
         /// Property: parsing is total over arbitrary header text, and any
         /// range it accepts lies entirely within the representation — a
         /// `Partial` out of bounds would slice the static file server out
-        /// of its buffer.
+        /// of its buffer. The strategy weights `bytes=`-prefixed input so
+        /// the accepting arm is actually reached, and the length covers
+        /// the top of the `u64` domain where overflow lives.
         #[test]
         fn prop_parse_is_total_and_accepted_ranges_are_in_bounds(
-            header in "[ -~]{0,40}",
-            len in 0u64..100_000,
+            header in range_header(),
+            len in proptest::prop_oneof![
+                0u64..100_000,
+                (u64::MAX - 1_000)..=u64::MAX,
+            ],
         ) {
             match parse(&header, len) {
                 Resolved::Partial { start, end } => {
@@ -221,12 +275,13 @@ mod tests {
         }
 
         /// Property: a syntactically valid single range inside the
-        /// representation resolves to exactly itself.
+        /// representation resolves to exactly itself — across the whole
+        /// `u64` domain, not just small files.
         #[test]
         fn prop_valid_single_ranges_resolve_exactly(
-            start in 0u64..1000,
-            span in 0u64..1000,
-            slack in 1u64..1000,
+            start in 0u64..(u64::MAX / 4),
+            span in 0u64..(u64::MAX / 4),
+            slack in 1u64..(u64::MAX / 4),
         ) {
             let end = start + span;
             let len = end + slack; // strictly beyond `end`
@@ -234,6 +289,38 @@ mod tests {
             proptest::prop_assert_eq!(
                 parse(&header, len),
                 Resolved::Partial { start, end }
+            );
+        }
+
+        /// Property: an explicit end at or past the representation clamps
+        /// to the last byte rather than being rejected or served beyond
+        /// the file.
+        #[test]
+        fn prop_overlong_ends_clamp_to_the_last_byte(
+            len in 1u64..(u64::MAX / 2),
+            start_frac in 0.0f64..1.0,
+            excess in 0u64..(u64::MAX / 2),
+        ) {
+            // `min` guards the f64 rounding at the top of the u64 domain.
+            let start = (((len - 1) as f64 * start_frac) as u64).min(len - 1);
+            let end = (len - 1).saturating_add(excess).saturating_add(1);
+            let header = format!("bytes={start}-{end}");
+            proptest::prop_assert_eq!(
+                parse(&header, len),
+                Resolved::Partial { start, end: len - 1 }
+            );
+        }
+
+        /// Property: the suffix form `-N` serves exactly the final
+        /// `min(N, len)` bytes.
+        #[test]
+        fn prop_suffix_ranges_serve_the_tail(
+            len in 1u64..u64::MAX,
+            suffix in 1u64..u64::MAX,
+        ) {
+            proptest::prop_assert_eq!(
+                parse(&format!("bytes=-{suffix}"), len),
+                Resolved::Partial { start: len.saturating_sub(suffix), end: len - 1 }
             );
         }
     }

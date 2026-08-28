@@ -6,7 +6,7 @@
 //! End-to-end tests for the `nitr` binary: version, effective-config
 //! printing, `nitr build` artifacts, and pidfile-based reload.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn nitr() -> Command {
@@ -18,12 +18,22 @@ fn nitr() -> Command {
 /// emulated, but a child process it spawns is a foreign ELF the host
 /// cannot exec — every end-to-end test would fail on the exec, not on
 /// anything it means to assert. Those tests skip instead.
+///
+/// The skip is reserved for exactly that case: when the binary *can* be
+/// spawned but `-v` fails, that is a crash-on-startup regression, and the
+/// suite fails loudly instead of turning green with everything skipped.
 fn binary_runs() -> bool {
-    nitr()
-        .arg("-v")
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+    match nitr().arg("-v").output() {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => panic!(
+            "`nitr -v` executed but failed (exit {:?}) — a startup regression, \
+             not a cross-compilation skip: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        // The exec itself failed: a foreign ELF the host cannot run.
+        Err(_) => false,
+    }
 }
 
 /// Skips the calling test (with a note) when the binary cannot run.
@@ -36,13 +46,52 @@ macro_rules! require_runnable_binary {
     };
 }
 
+/// A scratch application directory: unique per test (counter + pid, so
+/// parallel runs and repeated names never collide), removed on success,
+/// and kept — with its path printed — when the test panicked. The same
+/// rules as the integration harness's `TestDir`; a bare temp path with a
+/// trailing `remove_dir_all` leaks exactly when the evidence matters.
+struct Scratch {
+    path: PathBuf,
+}
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("nitr-cli-{name}-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("create scratch dir");
+        Self { path }
+    }
+
+    fn join(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("[test] failed; keeping {}", self.path.display());
+        } else {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 /// A scratch application directory scaffolded by `nitr init`.
-fn scaffold(name: &str, minimal: bool) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("nitr-cli-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch dir");
+fn scaffold(name: &str, minimal: bool) -> Scratch {
+    let dir = Scratch::new(name);
     let mut cmd = nitr();
-    cmd.arg("init").arg(&dir);
+    cmd.arg("init").arg(&dir.path);
     if minimal {
         cmd.arg("--minimal");
     }
@@ -93,7 +142,6 @@ fn check_print_config_shows_the_effective_layering() {
     );
     // …and the environment override that beat the default.
     assert!(stdout.contains("workers = 3"), "got: {stdout}");
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -141,7 +189,6 @@ fn env_files_feed_overrides_and_the_process_environment_wins() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("missing.env"), "got: {stderr}");
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -165,7 +212,6 @@ fn renamed_env_variables_fail_with_the_new_name() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains(replacement), "got: {stderr}");
     }
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// The sectioned override follows the `NITR_<SECTION>_<OPTION>` scheme and
@@ -190,7 +236,6 @@ fn the_templating_dir_can_be_overridden_from_the_environment() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("[templating]"), "got: {stdout}");
     assert!(stdout.contains("dir = \"tpl\""), "got: {stdout}");
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 // The full scaffold uses the database and templates; a build without
@@ -264,8 +309,6 @@ fn build_produces_a_self_contained_artifact() {
         "got: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// `nitr run` writes the configured pidfile, `nitr reload` signals through
@@ -329,8 +372,6 @@ fn scaffolded_app_tests_pass_and_filter() {
     assert!(stdout.contains("FAIL fails loudly"), "got: {stdout}");
     assert!(stdout.contains("expected 2 to equal 3"), "got: {stdout}");
     assert!(stdout.contains("failing_test.lua:3"), "got: {stdout}");
-
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[cfg(unix)]
@@ -401,6 +442,26 @@ fn pidfile_reload_and_cleanup() {
         String::from_utf8_lossy(&out.stderr)
     );
 
+    // Exit code 0 only proves a signal was sent somewhere; the contract is
+    // that the *server* received it and swapped its pool. The server logs
+    // both ends of the swap — wait for the completion line.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let logged = std::fs::read_to_string(dir.join("server.log")).unwrap_or_default();
+        if logged.contains("reload complete: new runtime pool is live") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server never logged the pool swap; log so far: {logged}"
+        );
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "SIGHUP must reload the server, not kill it"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
     // A graceful stop (SIGTERM) removes the pidfile on the way out.
     signal(pid, "-TERM");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -409,8 +470,6 @@ fn pidfile_reload_and_cleanup() {
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
     assert!(!pidfile.exists(), "a clean exit must remove the pidfile");
-
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[cfg(unix)]

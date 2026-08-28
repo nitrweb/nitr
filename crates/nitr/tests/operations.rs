@@ -11,7 +11,7 @@
 
 mod harness;
 
-use harness::{TestServer, reserve_addr};
+use harness::TestServer;
 
 const APP: &str = r#"
 local app = nitr.app()
@@ -73,41 +73,17 @@ async fn disabled_health_passes_through_to_the_app() {
 /// no longer answers them, and the probe port answers nothing else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn separate_bind_keeps_probes_off_the_public_port() {
-    // Reserving a port and releasing it for the server to rebind is a
-    // race: another test (or process) can take it in between. Retry with
-    // a fresh port instead of hoping — resilience beats a lucky draw.
-    let mut attempt = 0;
-    let (mut h, probe_addr) = loop {
-        attempt += 1;
-        let probe_addr = {
-            let (listener, addr) = reserve_addr();
-            drop(listener);
-            addr
-        };
-        let h = start(|cfg| cfg.health.bind = Some(probe_addr)).await;
-        // The probe listener comes up with the server; if something stole
-        // the port, the serve task has already failed — start over.
-        let mut listening = false;
-        for _ in 0..100 {
-            if tokio::net::TcpStream::connect(probe_addr).await.is_ok() {
-                listening = true;
-                break;
-            }
-            if h.serve_finished() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        if listening {
-            break (h, probe_addr);
-        }
-        // A failed spawn cannot shut down cleanly; dropping aborts it.
-        drop(h);
-        assert!(
-            attempt < 5,
-            "no probe port could be bound in {attempt} attempts"
-        );
-    };
+    // `reserve_health()` pre-binds the probe port and the server adopts
+    // the listener — the same no-release handoff the main listener uses —
+    // so there is no window for another test to take the port, and no
+    // retry loop covering for one. (This used to be the one genuinely
+    // racy construct in the suite: reserve, release, hope to rebind.)
+    let mut builder = TestServer::builder("operations")
+        .handler(APP)
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
+        .config(|cfg| cfg.workers = 1);
+    let probe_addr = builder.reserve_health();
+    let mut h = builder.spawn().await;
     let client = h.client().clone();
 
     // Probes on the probe port; the app never answers there.

@@ -81,3 +81,6 @@ multer = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# `test-util` enables `start_paused` so the body-timeout tests run on
+# virtual time instead of real-clock margins.
+tokio = { workspace = true, features = ["test-util"] }

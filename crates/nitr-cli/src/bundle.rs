@@ -91,9 +91,7 @@ pub fn load() -> anyhow::Result<Option<Config>> {
             std::env::temp_dir().join(format!("nitr-app-{key:016x}.{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&staging);
         std::fs::create_dir_all(&staging)?;
-        tar::Archive::new(tar.as_slice())
-            .unpack(&staging)
-            .context("cannot extract the bundled application")?;
+        extract(&tar, &staging)?;
         std::fs::File::create(staging.join(".nitr-extracted"))?;
         match std::fs::rename(&staging, &root) {
             Ok(()) => {}
@@ -123,6 +121,72 @@ pub fn load() -> anyhow::Result<Option<Config>> {
     }
     cfg.dev_mode = false;
     Ok(Some(cfg))
+}
+
+/// Extracts the bundle archive into `staging`, validating every entry.
+///
+/// A bundle is normally our own output, but the extraction must not
+/// *depend* on that: anyone can append a hand-crafted archive to the
+/// binary. Rather than lean on `tar`'s implicit containment (it skips
+/// `..` entries *silently* and only catches symlink write-through at
+/// unpack time), every entry is checked against an explicit policy and
+/// anything outside it is a hard error — a tampered bundle refuses to
+/// run instead of running partially:
+///
+/// * an entry name must be relative and made of plain path components —
+///   no `..`, no root, no drive prefix;
+/// * only regular files and directories may appear. `nitr build` never
+///   emits link entries (its builder follows symlinks and archives their
+///   contents), so a link can only come from a crafted archive — and a
+///   symlink entry is the classic two-step traversal: plant
+///   `link -> ..`, then write through `link/`.
+///
+/// [`unpack_in`](tar::Entry::unpack_in) stays underneath as the second
+/// wall: it independently re-validates the destination against the
+/// staging root, so even a gap in the policy above cannot escape it.
+fn extract(tar: &[u8], staging: &Path) -> anyhow::Result<()> {
+    let mut archive = tar::Archive::new(tar);
+    let entries = archive
+        .entries()
+        .context("cannot read the bundled application archive")?;
+    for entry in entries {
+        let mut entry = entry.context("cannot read a bundle archive entry")?;
+        let path = entry
+            .path()
+            .context("a bundle archive entry has an unreadable name")?
+            .into_owned();
+        if !path
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+        {
+            bail!(
+                "the bundled archive names `{}`, which would land outside \
+                 the extraction directory; the bundle is corrupt or tampered with",
+                path.display()
+            );
+        }
+        let kind = entry.header().entry_type();
+        if !matches!(kind, tar::EntryType::Regular | tar::EntryType::Directory) {
+            bail!(
+                "the bundled archive contains `{}` as a {kind:?} entry; a bundle \
+                 holds only regular files and directories, so the bundle is \
+                 corrupt or tampered with",
+                path.display()
+            );
+        }
+        let unpacked = entry
+            .unpack_in(staging)
+            .with_context(|| format!("cannot extract `{}`", path.display()))?;
+        if !unpacked {
+            // Unreachable with the checks above; kept so a future `tar`
+            // semantic change fails closed instead of skipping silently.
+            bail!(
+                "the archive entry `{}` was refused by the extractor",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// A path may enter the archive only if it stays inside the application
@@ -281,6 +345,192 @@ mod tests {
         assert!(archivable(Path::new("../escape.lua"), "x").is_err());
         assert!(archivable(Path::new("/etc/passwd"), "x").is_err());
         assert!(archivable(Path::new("a/../../b"), "x").is_err());
+    }
+
+    /// A scratch directory for one extraction test: unique, removed on
+    /// success, kept (with its path printed) on panic for post-mortem.
+    struct Scratch {
+        root: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir()
+                .join(format!("nitr-bundle-{label}-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&root).expect("create scratch dir");
+            Self { root }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!("[test] failed; keeping {}", self.root.display());
+            } else {
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+    }
+
+    /// Appends a file entry with `name` written into the GNU header bytes
+    /// directly — `append_data` refuses hostile names (`..`, absolute) at
+    /// build time, but an attacker's tar writer has no such scruples, and
+    /// the *extraction* side is what these tests probe.
+    fn raw_entry(builder: &mut tar::Builder<Vec<u8>>, name: &str, data: &[u8]) {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.as_gnu_mut().expect("gnu header").name[..name.len()]
+            .copy_from_slice(name.as_bytes());
+        header.set_cksum();
+        builder.append(&header, data).expect("append raw entry");
+    }
+
+    /// A benign archive — the shape `nitr build` produces (regular files,
+    /// nested directories, `./`-prefixed names) — extracts fully. The
+    /// positive control for the refusal tests below.
+    #[test]
+    fn wellformed_archives_extract_fully() {
+        let scratch = Scratch::new("extract-ok");
+        let staging = scratch.root.join("staging");
+        std::fs::create_dir_all(&staging).expect("mkdir");
+
+        let mut builder = tar::Builder::new(Vec::new());
+        raw_entry(&mut builder, "nitr.toml", b"listen = \"127.0.0.1:0\"");
+        raw_entry(&mut builder, "./app.lua", b"return {}");
+        let mut dir = tar::Header::new_gnu();
+        dir.set_entry_type(tar::EntryType::Directory);
+        dir.set_size(0);
+        dir.set_mode(0o755);
+        dir.as_gnu_mut().expect("gnu header").name[..7].copy_from_slice(b"routes/");
+        dir.set_cksum();
+        builder.append(&dir, &[][..]).expect("append dir");
+        raw_entry(&mut builder, "routes/notes.lua", b"return {}");
+        let tar = builder.into_inner().expect("finish");
+
+        extract(&tar, &staging).expect("a well-formed bundle extracts");
+        assert_eq!(
+            std::fs::read(staging.join("nitr.toml")).expect("config"),
+            b"listen = \"127.0.0.1:0\""
+        );
+        assert!(staging.join("app.lua").is_file());
+        assert!(staging.join("routes/notes.lua").is_file());
+    }
+
+    /// Zip-slip: a hand-crafted archive whose entries would land outside
+    /// the extraction directory is a *hard error* naming the entry — a
+    /// tampered bundle refuses to run rather than running partially — and
+    /// nothing may materialize outside staging.
+    #[test]
+    fn hostile_archives_are_refused_and_write_nothing_outside() {
+        // `..` traversal in an entry name.
+        {
+            let scratch = Scratch::new("slip-dotdot");
+            let staging = scratch.root.join("staging");
+            std::fs::create_dir_all(&staging).expect("mkdir");
+            let mut builder = tar::Builder::new(Vec::new());
+            raw_entry(&mut builder, "ok.lua", b"return {}");
+            raw_entry(&mut builder, "../escape.txt", b"pwned");
+            let tar = builder.into_inner().expect("finish");
+
+            let err = extract(&tar, &staging).expect_err("a `..` entry must refuse");
+            assert!(
+                err.to_string().contains("../escape.txt"),
+                "the refusal must name the entry: {err}"
+            );
+            assert!(
+                !scratch.root.join("escape.txt").exists(),
+                "the traversal entry must not have landed above staging"
+            );
+            assert!(
+                !staging.join("escape.txt").exists(),
+                "the traversal entry must not have been re-rooted either"
+            );
+        }
+
+        // An absolute entry name.
+        {
+            let scratch = Scratch::new("slip-absolute");
+            let staging = scratch.root.join("staging");
+            std::fs::create_dir_all(&staging).expect("mkdir");
+            // A target that must never appear: unique per run, in a
+            // location the archive names absolutely.
+            let forbidden = std::env::temp_dir().join(format!(
+                "nitr-bundle-absolute-escape-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&forbidden);
+
+            let mut builder = tar::Builder::new(Vec::new());
+            raw_entry(&mut builder, &forbidden.to_string_lossy(), b"pwned");
+            let tar = builder.into_inner().expect("finish");
+
+            extract(&tar, &staging).expect_err("an absolute entry must refuse");
+            assert!(
+                !forbidden.exists(),
+                "an absolute entry name must never be honored as written"
+            );
+        }
+
+        // A symlink pointing out of the tree, then a file written through
+        // it — the two-step shape that defeats name-only validation. The
+        // policy refuses at the *link entry itself*: `nitr build` never
+        // emits links, so one can only mean a crafted archive.
+        #[cfg(unix)]
+        {
+            let scratch = Scratch::new("slip-symlink");
+            let staging = scratch.root.join("staging");
+            std::fs::create_dir_all(&staging).expect("mkdir");
+            let mut builder = tar::Builder::new(Vec::new());
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_size(0);
+            link.set_mode(0o777);
+            link.set_cksum();
+            builder
+                .append_link(&mut link, "link", "..")
+                .expect("append symlink");
+            raw_entry(&mut builder, "link/pwned.txt", b"pwned");
+            let tar = builder.into_inner().expect("finish");
+
+            let err = extract(&tar, &staging).expect_err("a symlink entry must refuse");
+            assert!(
+                err.to_string().contains("Symlink"),
+                "the refusal must name the entry type: {err}"
+            );
+            assert!(
+                !scratch.root.join("pwned.txt").exists(),
+                "the file behind the symlink must not have landed above staging"
+            );
+            assert!(
+                !staging.join("link").exists(),
+                "the link itself must not have been created before the refusal"
+            );
+        }
+
+        // A hard link to a file outside staging — same policy, same
+        // refusal: only regular files and directories may appear.
+        {
+            let scratch = Scratch::new("slip-hardlink");
+            let staging = scratch.root.join("staging");
+            std::fs::create_dir_all(&staging).expect("mkdir");
+            let mut builder = tar::Builder::new(Vec::new());
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Link);
+            link.set_size(0);
+            link.set_mode(0o644);
+            link.set_cksum();
+            builder
+                .append_link(&mut link, "alias", "../outside.txt")
+                .expect("append hard link");
+            let tar = builder.into_inner().expect("finish");
+
+            let err = extract(&tar, &staging).expect_err("a hard-link entry must refuse");
+            assert!(err.to_string().contains("Link"), "got: {err}");
+        }
     }
 
     #[test]

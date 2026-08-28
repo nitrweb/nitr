@@ -473,6 +473,144 @@ async fn form_and_multipart_bodies_are_parsed_in_rust() {
     srv.stop().await;
 }
 
+/// `[limits] max_field_bytes` and `max_file_bytes`, end to end — the
+/// guards standing between an upload and the 8 MiB Lua state limit had no
+/// test firing them. An oversized *field* is refused while `part:text()`
+/// buffers it; an oversized *file* is refused mid-stream by `part:save()`,
+/// and the truncated file is removed rather than left for the application
+/// to trip over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multipart_field_and_file_limits_fire() {
+    let b = TestServer::builder("standards-multipart-limits")
+        .handler(
+            r#"
+local app = nitr.app()
+
+-- pcall around the parse so the limit error comes back as data the test
+-- can assert on, instead of a generic 500.
+app:post("/upload", function(req)
+    local ok, err = pcall(function()
+        req:multipart(function(part)
+            if part.filename then
+                part:save(nitr.cfg.upload_dir .. "/" .. part.filename)
+            else
+                part:text()
+            end
+        end)
+    end)
+    return nitr.json({ ok = ok, err = ok and "" or tostring(err) })
+end)
+
+return app
+"#,
+        )
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
+        .config(|cfg| {
+            cfg.workers = 1;
+            cfg.limits.max_field_bytes = 64;
+            cfg.limits.max_file_bytes = 1024;
+        });
+    let uploads = b.dir().join("uploads");
+    std::fs::create_dir_all(&uploads).expect("uploads dir");
+    let mut srv = b
+        .config_script(format!(
+            "return {{ upload_dir = {:?} }}",
+            uploads.to_string_lossy()
+        ))
+        .spawn()
+        .await;
+
+    let boundary = "----nitrlimitboundary";
+    let multipart = |parts: &[(&str, Option<&str>, Vec<u8>)]| {
+        let mut body = Vec::new();
+        for (name, filename, bytes) in parts {
+            let disposition = match filename {
+                Some(f) => format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; \
+                     name=\"{name}\"; filename=\"{f}\"\r\n\r\n"
+                ),
+                None => format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n"
+                ),
+            };
+            body.extend_from_slice(disposition.as_bytes());
+            body.extend_from_slice(bytes);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        body
+    };
+    let post = |body: Vec<u8>| {
+        srv.client()
+            .post(srv.url("/upload"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+    };
+
+    // Within both caps: everything parses.
+    let body: serde_json::Value = post(multipart(&[
+        ("note", None, vec![b'a'; 64]),
+        ("doc", Some("small.bin"), vec![b'z'; 1024]),
+    ]))
+    .send()
+    .await
+    .expect("in-limit upload")
+    .json()
+    .await
+    .expect("json");
+    assert_eq!(body["ok"], true, "got: {body}");
+    assert_eq!(
+        std::fs::read(uploads.join("small.bin"))
+            .expect("saved")
+            .len(),
+        1024
+    );
+
+    // One byte over the field cap: refused, naming the limit.
+    let body: serde_json::Value = post(multipart(&[("note", None, vec![b'a'; 65])]))
+        .send()
+        .await
+        .expect("oversized field")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(body["ok"], false, "got: {body}");
+    assert!(
+        body["err"]
+            .as_str()
+            .expect("err")
+            .contains("exceeds the 64 byte limit"),
+        "got: {body}"
+    );
+
+    // One byte over the file cap: refused mid-stream, and the truncated
+    // file is cleaned up.
+    let body: serde_json::Value = post(multipart(&[("doc", Some("big.bin"), vec![b'z'; 1025])]))
+        .send()
+        .await
+        .expect("oversized file")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(body["ok"], false, "got: {body}");
+    assert!(
+        body["err"]
+            .as_str()
+            .expect("err")
+            .contains("exceeds the 1024 byte limit"),
+        "got: {body}"
+    );
+    assert!(
+        !uploads.join("big.bin").exists(),
+        "a rejected upload must not leave a truncated file behind"
+    );
+
+    srv.stop().await;
+}
+
 /// `req:read(n)` consumes a body in bounded pieces.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn incremental_reads_bound_what_lua_holds() {

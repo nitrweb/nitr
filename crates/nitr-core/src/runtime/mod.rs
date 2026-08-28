@@ -134,6 +134,16 @@ impl Runtime {
         let lua = Lua::new_with(opts.libs, LuaOptions::default())?;
         lua.set_memory_limit(opts.memory_limit)?;
 
+        // The base library is always loaded, and it carries `dofile` and
+        // `loadfile` — reading and executing arbitrary files is the same
+        // ambient authority the excluded-by-default `io` library gates.
+        // They follow the same opt-in: absent unless IO was requested.
+        if !opts.libs.contains(StdLib::IO) {
+            let globals = lua.globals();
+            globals.set("dofile", Value::Nil)?;
+            globals.set("loadfile", Value::Nil)?;
+        }
+
         // Confine `require` to the configured directory and forbid loading
         // native modules.
         if opts.libs.contains(StdLib::PACKAGE)

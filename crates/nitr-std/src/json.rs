@@ -87,8 +87,13 @@ mod tests {
         use proptest::prelude::*;
         let leaf = prop_oneof![
             any::<bool>().prop_map(SerdeValue::from),
-            any::<i32>().prop_map(SerdeValue::from),
-            "[ -~]{0,20}".prop_map(SerdeValue::from),
+            // The full i64 domain: Lua 5.4 integers are 64-bit, so the
+            // extremes must survive the trip exactly.
+            any::<i64>().prop_map(SerdeValue::from),
+            // Arbitrary Unicode, not just printable ASCII: JSON escapes,
+            // multi-byte sequences, and control characters all ride
+            // through Lua strings (which are plain byte strings).
+            "\\PC{0,20}".prop_map(SerdeValue::from),
         ];
         leaf.prop_recursive(3, 24, 4, |inner| {
             prop_oneof![
@@ -165,13 +170,19 @@ mod tests {
         /// JSON document survives the trip through Lua values.
         #[test]
         fn prop_json_round_trips_through_lua(tree in json_value()) {
+            // `prop_assert!` throughout (not `expect`), so a failing input
+            // shrinks to a minimal counterexample instead of panicking on
+            // the first monster proptest generated.
             let lua = Lua::new();
             let json = create_json_fn(&lua).expect("json");
             let text = serde_json::to_string(&tree).expect("serialize");
-            let decoded: Value = json.call_method("decode", text).expect("decode");
-            let encoded: String = json.call_method("encode", decoded).expect("encode");
-            let back: SerdeValue = serde_json::from_str(&encoded).expect("parse");
-            proptest::prop_assert_eq!(back, tree);
+            let decoded = json.call_method::<Value>("decode", text);
+            proptest::prop_assert!(decoded.is_ok(), "decode failed: {:?}", decoded.err());
+            let encoded = json.call_method::<String>("encode", decoded.expect("checked"));
+            proptest::prop_assert!(encoded.is_ok(), "encode failed: {:?}", encoded.err());
+            let back = serde_json::from_str::<SerdeValue>(&encoded.expect("checked"));
+            proptest::prop_assert!(back.is_ok(), "re-parse failed: {:?}", back.err());
+            proptest::prop_assert_eq!(back.expect("checked"), tree);
         }
 
         /// Property: for any depth, encoding either succeeds (within the

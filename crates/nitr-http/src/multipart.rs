@@ -206,11 +206,21 @@ pub(crate) fn boundary(content_type: Option<&str>) -> mlua::Result<String> {
     let content_type = content_type.ok_or_else(|| {
         mlua::Error::RuntimeError("req:multipart() requires a Content-Type header".into())
     })?;
-    multer::parse_boundary(content_type).map_err(|_| {
+    let boundary = multer::parse_boundary(content_type).map_err(|_| {
         mlua::Error::RuntimeError(format!(
             "req:multipart() requires a multipart/form-data body, got `{content_type}`"
         ))
-    })
+    })?;
+    // The mime parser accepts `boundary=` (and `boundary=""`) with an
+    // empty value; RFC 2046 requires 1–70 characters, and an empty
+    // delimiter would make every `--` line a part separator. Refuse it
+    // rather than hand the parser a degenerate delimiter.
+    if boundary.is_empty() {
+        return Err(mlua::Error::RuntimeError(format!(
+            "req:multipart() requires a non-empty boundary parameter, got `{content_type}`"
+        )));
+    }
+    Ok(boundary)
 }
 
 #[cfg(test)]
@@ -229,14 +239,113 @@ mod tests {
             boundary(Some("multipart/form-data")).is_err(),
             "no boundary parameter"
         );
+        // Found by the boundary proptest: the mime parser hands back an
+        // *empty* boundary for these, which RFC 2046 forbids and which
+        // would make every `--` line a delimiter.
+        assert!(
+            boundary(Some("multipart/form-data;boundary=")).is_err(),
+            "empty boundary value"
+        );
+        assert!(
+            boundary(Some(r#"multipart/form-data; boundary="""#)).is_err(),
+            "empty quoted boundary"
+        );
+    }
+
+    /// The parameter-syntax corners an attacker actually controls: quoted
+    /// values (with spaces and `;` inside the quotes), duplicate
+    /// `boundary=` parameters, and surrounding parameter noise.
+    #[test]
+    fn boundary_handles_quoting_and_duplicate_parameters() {
+        // A quoted value comes back unquoted.
+        assert_eq!(
+            boundary(Some(r#"multipart/form-data; boundary="XyZ09""#)).expect("quoted"),
+            "XyZ09"
+        );
+        // Quoting admits characters a bare token cannot carry.
+        assert_eq!(
+            boundary(Some(r#"multipart/form-data; boundary="a b;c""#)).expect("quoted specials"),
+            "a b;c"
+        );
+        // Other parameters around the boundary do not confuse extraction.
+        assert_eq!(
+            boundary(Some("multipart/form-data; charset=utf-8; boundary=B1; x=y"))
+                .expect("with neighbors"),
+            "B1"
+        );
+        // Duplicate boundary parameters must not smuggle a second value
+        // past whichever one the server picked: the outcome is pinned so
+        // a behavior change here is a visible diff, not a silent one.
+        let dup = boundary(Some("multipart/form-data; boundary=first; boundary=second"));
+        assert_eq!(dup.expect("duplicate params"), "first");
+    }
+
+    /// The Rust-side byte caps fire while *reading*, before anything is
+    /// handed to Lua: an oversized field is refused at `max_field_bytes`
+    /// and an over-count body at `max_parts`, both with the limit named.
+    #[tokio::test]
+    async fn field_and_part_caps_fire_while_reading() {
+        fn part(name: &str, payload: &str) -> String {
+            format!("--B\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{payload}\r\n")
+        }
+        let ct = Some("multipart/form-data; boundary=B");
+
+        // Within both caps: parses, counting every part.
+        let ok = format!("{}{}--B--\r\n", part("a", "small"), part("b", "tiny"));
+        let count = consume_for_fuzzing(ct, Bytes::from(ok.clone()), 4, 64)
+            .await
+            .expect("well-formed body within the caps");
+        assert_eq!(count, 2);
+
+        // One field over the byte cap: refused, and the limit is named so
+        // the operator knows which knob was hit.
+        let big = format!("{}--B--\r\n", part("a", &"x".repeat(100)));
+        let err = consume_for_fuzzing(ct, Bytes::from(big), 4, 32)
+            .await
+            .expect_err("an oversized field must be refused");
+        assert!(
+            err.to_string().contains("exceeds the 32 byte limit"),
+            "got: {err}"
+        );
+
+        // One part over the count cap: refused, naming the count.
+        let err = consume_for_fuzzing(ct, Bytes::from(ok), 1, 64)
+            .await
+            .expect_err("a third part beyond max_parts must be refused");
+        assert!(err.to_string().contains("more than 1 parts"), "got: {err}");
     }
 
     proptest::proptest! {
         /// Property: boundary extraction is total over arbitrary header
-        /// text — the content type is fully attacker-controlled.
+        /// text — the content type is fully attacker-controlled — and any
+        /// boundary it *does* accept came from a multipart content type
+        /// that actually carried a boundary parameter. (The second half is
+        /// what makes this a property rather than a smoke test: a
+        /// `boundary()` that returned something for `application/json`
+        /// would fail here.)
         #[test]
-        fn prop_boundary_parsing_is_total(content_type in "[ -~]{0,60}") {
-            let _ = boundary(Some(&content_type));
+        fn prop_boundary_parsing_is_total_and_only_multipart_yields(
+            content_type in proptest::prop_oneof![
+                // Unstructured attacker input.
+                "[ -~]{0,60}",
+                // Near-miss mutations that keep the parser in its
+                // interesting states instead of bailing at the type check.
+                "multipart/(form-data|mixed|x)([;,][ -~]{0,40})?",
+                "multipart/form-data; ?boundary=[ -~]{0,35}",
+            ],
+        ) {
+            if let Ok(b) = boundary(Some(&content_type)) {
+                let ct = content_type.trim_start().to_ascii_lowercase();
+                proptest::prop_assert!(
+                    ct.starts_with("multipart/"),
+                    "`{content_type}` is not multipart but yielded `{b}`"
+                );
+                proptest::prop_assert!(
+                    ct.contains("boundary"),
+                    "`{content_type}` names no boundary but yielded `{b}`"
+                );
+                proptest::prop_assert!(!b.is_empty(), "`{content_type}` yielded an empty boundary");
+            }
         }
 
         /// Property: a well-formed content type round-trips its boundary

@@ -129,8 +129,9 @@ async fn a_saturated_pool_sheds_instead_of_queueing() {
         let url = h.url("/slow");
         async move { client.get(url).send().await }
     });
-    // Give the slow request time to check the state out.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait for the fact, not a guessed interval: the slow request has
+    // checked the only state out once nothing is available.
+    h.wait_until_available(0).await;
 
     let resp = h.get("/ok").await;
     assert_eq!(resp.status(), 503);
@@ -249,8 +250,9 @@ async fn a_panic_does_not_disturb_concurrent_requests_on_other_states() {
             })
         })
         .collect();
-    // Let them all check their states out.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Wait until all three have checked their states out: on four workers
+    // that leaves exactly one free — the one the panic will use.
+    h.wait_until_available(1).await;
 
     // The fourth state panics mid-request.
     let resp = h.get("/panic").await;
@@ -364,8 +366,11 @@ async fn a_user_coroutine_cannot_escape_the_execution_budget() {
     .expect("the spinning coroutine must be stopped, not run forever")
     .expect("response");
     assert_eq!(resp.status(), 500);
+    // Tight against the 1s budget (real time is ~1.1s), not the 10s outer
+    // timeout: a regression that let the coroutine spin for, say, 4s would
+    // slip under a 5s bound but not this one.
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_millis(2_500),
         "stopped after {:?}, well past the 1s budget",
         started.elapsed()
     );
@@ -450,10 +455,12 @@ async fn a_client_disconnect_releases_the_pooled_state() {
     sock.write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .await
         .expect("write request");
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The handler has checked the only state out.
+    h.wait_until_available(0).await;
     drop(sock);
-    // Let hyper notice the peer is gone and drop the handler future.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait for hyper to notice the peer is gone, drop the handler future,
+    // and return the state to the pool — the release under test.
+    h.wait_until_available(1).await;
 
     // The 3s handler is long gone; if the state were still checked out this
     // would exceed the 500ms wait budget and come back 503.
@@ -485,7 +492,8 @@ async fn shutdown_drains_in_flight_requests() {
         let url = h.url("/slow");
         async move { client.get(url).send().await }
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // On two workers, the in-flight /slow leaves one state free.
+    h.wait_until_available(1).await;
 
     // Signal shutdown while the request is still running; `shutdown`
     // resolves only after the drain, so run it concurrently with the
@@ -504,16 +512,24 @@ async fn shutdown_drains_in_flight_requests() {
         .expect("shutdown task")
         .expect("a drained shutdown is not an error");
 
-    // The listener is closed: no new connection is accepted.
-    assert!(
-        tokio::net::TcpStream::connect(addr).await.is_err()
-            || client
-                .get(format!("http://{addr}/ok"))
-                .send()
-                .await
-                .is_err(),
-        "the server must stop accepting after the drain"
-    );
+    // The listener is closed after the drain: a *fresh TCP connection* is
+    // refused. The old assertion was a disjunction — connect fails OR the
+    // request fails — which passed on any client-side error at all (a pool
+    // hiccup, a reused dead connection). This discriminates: a brand-new
+    // connect must be refused. Polled briefly because dropping the accept
+    // loop races this line by microseconds.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match tokio::net::TcpStream::connect(addr).await {
+            Err(_) => break,
+            Ok(_) => assert!(
+                std::time::Instant::now() < deadline,
+                "the server must stop accepting new connections after the drain"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(client);
 }
 
 /// A request that outlives the drain deadline is cut, and the server says so
@@ -528,7 +544,8 @@ async fn an_expired_drain_deadline_is_reported() {
         let url = h.url("/slow");
         async move { client.get(url).send().await }
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The in-flight /slow has checked its state out (two workers, one busy).
+    h.wait_until_available(1).await;
 
     let err = h
         .shutdown()
@@ -638,6 +655,65 @@ async fn a_slow_but_moving_body_is_not_punished() {
     h.stop().await;
 }
 
+/// A header block larger than `[limits] max_header_bytes` is refused
+/// before any handler runs — the guard was wired to hyper's `max_buf_size`
+/// but exercised by nothing. Sent on a raw socket because no HTTP client
+/// will emit a header block this size on request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversized_header_block_is_rejected() {
+    let mut h = start(|cfg| {
+        cfg.workers = 1;
+        // The effective buffer is `max(this, 8 KiB)`; 16 KiB so the 64 KiB
+        // block below clearly overruns it.
+        cfg.limits.max_header_bytes = 16 * 1024;
+    })
+    .await;
+
+    let mut sock = tokio::net::TcpStream::connect(h.addr())
+        .await
+        .expect("connect");
+    // A single 64 KiB header value, four times the buffer.
+    let mut req = b"GET /ok HTTP/1.1\r\nHost: localhost\r\nX-Big: ".to_vec();
+    req.extend(std::iter::repeat_n(b'A', 64 * 1024));
+    req.extend_from_slice(b"\r\n\r\n");
+    // The write may not fully land before the server hangs up — that is
+    // itself the guard firing, so the write is best-effort.
+    let _ = sock.write_all(&req).await;
+
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut raw))
+        .await
+        .expect("the server must answer or close, not hang on the huge header")
+        .expect("read response");
+    let head = String::from_utf8_lossy(&raw).to_lowercase();
+    assert!(
+        head.starts_with("http/1.1 431"),
+        "an over-limit header block must answer 431: {head}"
+    );
+    assert!(head.contains("connection: close"), "got: {head}");
+    // `read_to_end` returning proves the close was real.
+
+    // The positive control: a header block just under the buffer is
+    // ordinary traffic — the 431 above is the limit firing, not the
+    // server rejecting big-ish headers wholesale.
+    let mut sock = tokio::net::TcpStream::connect(h.addr())
+        .await
+        .expect("connect again");
+    let mut req = b"GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nX-Big: ".to_vec();
+    req.extend(std::iter::repeat_n(b'A', 8 * 1024));
+    req.extend_from_slice(b"\r\n\r\n");
+    sock.write_all(&req).await.expect("write in-limit request");
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut raw))
+        .await
+        .expect("the server must answer")
+        .expect("read response");
+    let head = String::from_utf8_lossy(&raw);
+    assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
+
+    h.stop().await;
+}
+
 /// The header deadline is configurable now (it was a hardcoded 30 s): a
 /// connection that never completes its request headers is cut at
 /// `[limits] header_read_ms`, not half a minute later.
@@ -663,9 +739,13 @@ async fn an_incomplete_header_read_is_cut_at_the_configured_deadline() {
         .await
         .expect("the connection must be cut at the deadline, not at 30 s")
         .expect("read until close");
+    // Bounded well under the old hardcoded 30s but *also* well under the
+    // 5s outer timeout, so this assertion carries its own weight instead
+    // of merely restating a timeout that already succeeded. Real time is
+    // ~0.3s (the configured deadline).
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "took {:?}",
+        started.elapsed() < Duration::from_secs(2),
+        "the header deadline (300ms) did not fire promptly: took {:?}",
         started.elapsed()
     );
     let head = String::from_utf8_lossy(&raw);

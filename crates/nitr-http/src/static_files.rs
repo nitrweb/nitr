@@ -415,20 +415,115 @@ mod tests {
         assert_eq!(root.relative("/x/y.css"), Some("x/y.css"));
     }
 
+    /// A private scratch directory per test: unique (counter + pid, so
+    /// parallel tests never share), removed on success, and kept — with
+    /// its path printed — when the test panicked, mirroring the
+    /// integration harness's `TestDir` rules.
+    struct TestRoot {
+        path: PathBuf,
+    }
+
+    impl TestRoot {
+        fn new(label: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("nitr-static-{label}-{}-{id}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("create test dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!("[test] failed; keeping {}", self.path.display());
+            } else {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn traversal_and_escapes_are_rejected() {
-        let dir = std::env::temp_dir().join(format!("nitr-static-test-{}", std::process::id()));
+        let root = TestRoot::new("traversal");
+        let dir = root.path.join("mount");
         std::fs::create_dir_all(dir.join("sub")).expect("mkdir");
         std::fs::write(dir.join("ok.txt"), b"ok").expect("write");
         std::fs::write(dir.join("sub/inner.txt"), b"inner").expect("write");
+        // A real file *outside* the mount, so a broken `resolve` that
+        // walked out would find something rather than a benign 404.
+        std::fs::write(root.path.join("secret.txt"), b"outside").expect("write");
 
-        assert!(resolve(&dir, "ok.txt").await.is_some());
-        assert!(resolve(&dir, "sub/inner.txt").await.is_some());
-        assert!(resolve(&dir, "../etc/passwd").await.is_none());
-        assert!(resolve(&dir, "sub/../../etc/passwd").await.is_none());
-        assert!(resolve(&dir, "/etc/passwd").await.is_none());
-        assert!(resolve(&dir, "missing.txt").await.is_none());
+        // The positive cases pin *which* file resolved, not merely that
+        // something did: a resolve() returning a constant path would
+        // otherwise pass.
+        async fn canonical(p: PathBuf) -> PathBuf {
+            tokio::fs::canonicalize(p).await.expect("canonical")
+        }
+        assert_eq!(
+            resolve(&dir, "ok.txt").await,
+            Some(canonical(dir.join("ok.txt")).await)
+        );
+        assert_eq!(
+            resolve(&dir, "sub/inner.txt").await,
+            Some(canonical(dir.join("sub/inner.txt")).await)
+        );
 
-        std::fs::remove_dir_all(&dir).ok();
+        // Vectors aimed at the file that exists one level up.
+        for hostile in [
+            "../secret.txt",
+            "sub/../../secret.txt",
+            "sub/../../../etc/passwd",
+            "/etc/passwd",
+            "..",
+            "sub/..\\..\\secret.txt",
+        ] {
+            assert_eq!(
+                resolve(&dir, hostile).await,
+                None,
+                "{hostile} must not resolve"
+            );
+        }
+        assert_eq!(resolve(&dir, "missing.txt").await, None);
+    }
+
+    /// Symlink policy: a link whose canonical target leaves the mount is
+    /// refused; one that stays inside resolves to its target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinks_cannot_escape_the_mount() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestRoot::new("symlink");
+        let dir = root.path.join("mount");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("ok.txt"), b"ok").expect("write");
+        std::fs::write(root.path.join("secret.txt"), b"outside").expect("write");
+        std::fs::create_dir_all(root.path.join("outside-dir")).expect("mkdir");
+        std::fs::write(root.path.join("outside-dir/leak.txt"), b"leak").expect("write");
+
+        // A file link and a directory link, both escaping the mount.
+        symlink(root.path.join("secret.txt"), dir.join("link.txt")).expect("file link");
+        symlink(root.path.join("outside-dir"), dir.join("sublink")).expect("dir link");
+        assert_eq!(resolve(&dir, "link.txt").await, None, "file symlink escape");
+        assert_eq!(
+            resolve(&dir, "sublink/leak.txt").await,
+            None,
+            "directory symlink escape"
+        );
+
+        // A link that stays inside the mount is legitimate and resolves
+        // to its canonical target.
+        symlink(dir.join("ok.txt"), dir.join("alias.txt")).expect("inside link");
+        assert_eq!(
+            resolve(&dir, "alias.txt").await,
+            Some(
+                tokio::fs::canonicalize(dir.join("ok.txt"))
+                    .await
+                    .expect("canonical")
+            )
+        );
     }
 }

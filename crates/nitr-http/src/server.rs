@@ -55,6 +55,10 @@ pub struct Server {
     /// [`ServerBuilder::listener`]); when absent, `serve` binds
     /// `cfg.listen` itself.
     listener: Option<std::net::TcpListener>,
+    /// A caller-supplied, already-bound listener for the health probes
+    /// (see [`ServerBuilder::health_listener`]); when absent and
+    /// `[health] bind` is set, `serve` binds that address itself.
+    health_listener: Option<std::net::TcpListener>,
     /// Cleared as soon as a drain starts, so a load balancer can stop
     /// routing before requests begin to fail. Read by
     /// [`is_ready()`](Self::is_ready), which a readiness probe surfaces.
@@ -107,6 +111,7 @@ pub struct ServerBuilder {
     setup_fns: Vec<SetupFn>,
     modules: Vec<Module>,
     listener: Option<std::net::TcpListener>,
+    health_listener: Option<std::net::TcpListener>,
 }
 
 impl Server {
@@ -259,11 +264,21 @@ impl Server {
             })
         });
         let mut probe_task = None;
-        let main_health = match (&health_state, self.cfg.health.bind) {
-            (Some(state), Some(addr)) => {
-                let probe_listener = TcpListener::bind(addr).await.map_err(|err| {
-                    Error::Config(format!("unable to bind [health] bind = {addr}: {err}"))
-                })?;
+        let main_health = match (&health_state, self.health_listener.take()) {
+            // An adopted probe listener wins over binding `[health] bind`
+            // ourselves — the same rule the main listener follows — so the
+            // port was never released between choosing it and serving.
+            (Some(state), Some(std_listener)) => {
+                let probe_listener = std_listener
+                    .set_nonblocking(true)
+                    .and_then(|()| TcpListener::from_std(std_listener))
+                    .map_err(|err| {
+                        Error::Config(format!("unable to adopt the given health listener: {err}"))
+                    })?;
+                let addr = probe_listener
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "<unknown>".into());
                 tracing::info!("health endpoints on http://{addr}");
                 probe_task = Some(tokio::spawn(crate::health::serve_probes(
                     probe_listener,
@@ -271,7 +286,20 @@ impl Server {
                 )));
                 None
             }
-            (Some(state), None) => Some(state.clone()),
+            (Some(state), None) => match self.cfg.health.bind {
+                Some(addr) => {
+                    let probe_listener = TcpListener::bind(addr).await.map_err(|err| {
+                        Error::Config(format!("unable to bind [health] bind = {addr}: {err}"))
+                    })?;
+                    tracing::info!("health endpoints on http://{addr}");
+                    probe_task = Some(tokio::spawn(crate::health::serve_probes(
+                        probe_listener,
+                        state.clone(),
+                    )));
+                    None
+                }
+                None => Some(state.clone()),
+            },
             (None, _) => None,
         };
 
@@ -417,6 +445,18 @@ impl ServerBuilder {
         self
     }
 
+    /// Serves the health probes on an already-bound listener instead of
+    /// binding `[health] bind`.
+    ///
+    /// The probe-port counterpart of [`listener`](Self::listener), closing
+    /// the same choose-then-bind window: reserve port 0, read the real
+    /// address, hand the listener over. Ignored when `[health] enabled`
+    /// is off.
+    pub fn health_listener(mut self, listener: std::net::TcpListener) -> Self {
+        self.health_listener = Some(listener);
+        self
+    }
+
     /// Lua script executed once per request.
     pub fn handler_script(mut self, path: impl Into<PathBuf>) -> Self {
         self.cfg.handler_script = path.into();
@@ -554,6 +594,7 @@ impl ServerBuilder {
             streams: Arc::new(Semaphore::new(max_streams)),
             max_streams,
             listener: self.listener,
+            health_listener: self.health_listener,
             ready: Arc::new(AtomicBool::new(true)),
             cache,
         })
