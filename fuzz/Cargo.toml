@@ -3,6 +3,10 @@
 #
 #   cargo install cargo-fuzz
 #   cargo +nightly fuzz run cookie_verify -- -max_total_time=60
+#
+# The crate carries a library (`src/lib.rs`) as well as the targets: it
+# holds the shared input format every target decodes with. See its module
+# docs for why the targets do not take `Arbitrary` tuples.
 [package]
 name = "nitr-fuzz"
 version = "0.0.0"
@@ -14,12 +18,28 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-arbitrary = { version = "1", features = ["derive"] }
-nitr-std = { path = "../crates/nitr-std" }
-nitr-http = { path = "../crates/nitr-http", features = ["multipart"] }
+# `crypto` reaches JWT verification and AEAD open — both parse
+# attacker-supplied tokens. `fetch` is deliberately NOT enabled: it would
+# pull reqwest (over half the dependency graph) into every fuzz build to
+# reach an IP-range `match` whose URL parsing lives upstream in the `url`
+# crate, which is fuzzed by its own maintainers.
+nitr-std = { path = "../crates/nitr-std", features = ["crypto"] }
+nitr-http = { path = "../crates/nitr-http", features = ["multipart", "compression"] }
 mlua = { version = "0.12", features = ["lua54", "vendored", "serialize", "send"] }
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "fs"] }
 bytes = "1"
+hyper = "1"
+tempfile = "3"
+# The oracle for the one differential worth having: `nitr.url.query_parse`
+# hand-rolls the `+`-then-percent decoding that `form_urlencoded` already
+# implements, and nitr-http itself uses the latter for `req.query`. Two
+# implementations of one parse, over the same attacker bytes, in one repo.
+# Free: nitr-http already depends on `url`, so it is compiled either way.
+url = "2"
+
+[lib]
+name = "nitr_fuzz"
+path = "src/lib.rs"
 
 [[bin]]
 name = "cookie_verify"
@@ -59,6 +79,55 @@ bench = false
 [[bin]]
 name = "multipart"
 path = "fuzz_targets/multipart.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "static_resolve"
+path = "fuzz_targets/static_resolve.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "url_lexical"
+path = "fuzz_targets/url_lexical.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cookie_header"
+path = "fuzz_targets/cookie_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "accept_encoding"
+path = "fuzz_targets/accept_encoding.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jwt_verify"
+path = "fuzz_targets/jwt_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "validate_formats"
+path = "fuzz_targets/validate_formats.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "conditional_headers"
+path = "fuzz_targets/conditional_headers.rs"
 test = false
 doc = false
 bench = false

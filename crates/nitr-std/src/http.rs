@@ -302,6 +302,14 @@ impl RequestCookies {
         )
     }
 
+    /// The parsed (name, value) pairs, in header order, for the
+    /// `cookie_header` fuzz target — the parse result is otherwise only
+    /// observable through Lua indexing.
+    #[doc(hidden)]
+    pub fn pairs(&self) -> &[(String, String)] {
+        &self.0
+    }
+
     pub(crate) fn get(&self, name: &str) -> Option<&str> {
         self.0
             .iter()

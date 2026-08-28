@@ -39,7 +39,8 @@ nitr-core → nitr-std → nitr-http → nitr → nitr-cli
 ## What is deliberately not promised
 
 - Internal module layout of any crate (`pub(crate)` boundaries move freely).
-- The `#[doc(hidden)]` fuzzing seams (`nitr_std::fuzzing`).
+- The `#[doc(hidden)]` fuzzing seams (`nitr_std::fuzzing`, `nitr_http::fuzzing`)
+  and the items they re-export, which are `pub` only to reach `fuzz/`.
 - Benchmark names and numbers, the test framework's failure text, and the
   dev-mode 500 page's markup.
 - Behavior reachable only through `Server::builder().setup()` — the

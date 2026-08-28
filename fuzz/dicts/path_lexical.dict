@@ -1,0 +1,52 @@
+# Tokens for `path_lexical`. The input is
+#   path \0 path
+# so the NUL that ends the first field is itself the most valuable token:
+# without it every input is one giant path and the second field — the
+# untrusted segment joined under a trusted base — stays empty.
+"\x00"
+
+# --- Separators, in both styles and doubled --------------------------
+# The doubled forms are roots (`//` is UNC), not repetitions, which is
+# where the parser stops agreeing with a naive split.
+"/"
+"\\"
+"//"
+"\\\\"
+"/\\"
+"\\/"
+
+# --- Dot components --------------------------------------------------
+"."
+".."
+"./"
+"../"
+".\\"
+"..\\"
+"../../"
+"..\\..\\"
+# Lookalikes that are names, not traversal — the segments a filter
+# written with `starts_with("..")` would wrongly eat.
+"..."
+"..a"
+".. "
+"..%2f"
+
+# --- Windows roots ---------------------------------------------------
+# A bare drive is drive-relative (no floor for `..`); the anchored form
+# is. Confusing the two is the bug the target's last assertion is for.
+":"
+"C:"
+"C:\\"
+"C:/"
+"C:.."
+"C:..\\"
+"\\\\server\\share"
+"//server/share"
+
+# --- Realistic bases and payloads ------------------------------------
+"/srv/app"
+"/etc/passwd"
+"C:\\Windows\\System32"
+"index.html"
+"a/b/../c"
+" "

@@ -277,6 +277,33 @@ cargo bench --features all --bench dispatch # one target
 
 Every push and pull request runs them on [CodSpeed](https://app.codspeed.io/joseluisq/nitr) under CPU simulation, so a regression shows up as a diff on the pull request instead of as a surprise in production.
 
+## Fuzzing
+
+The parsers an attacker fully controls are fuzzed with
+[cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz): signed cookies and
+the `Cookie` header, `Accept` and `Accept-Encoding` negotiation,
+conditional-request headers, `Range` headers, multipart bodies, the
+JSON-Lua boundary and its depth guard, lexical paths, static path
+resolution (the traversal defense), URL and query splitting, JWT
+verification, and the declarative validators.
+
+Targets assert behavior, not just absence of crashes — round-trips,
+idempotence, tamper rejection, and the bounds a caller depends on (a
+served static path is always inside its mount; an accepted byte range
+always lies inside the representation).
+
+```sh
+make fuzz               # every target, bounded time, seeded like CI
+make fuzz FUZZ_TIME=300 # longer
+```
+
+Needs a nightly toolchain and `cargo install cargo-fuzz`, which is why it
+is not part of `make all`. Every pull request runs 90 seconds per target;
+a nightly job runs an hour per target, where the depth actually comes
+from. Seeds are committed under [fuzz/seeds](fuzz/seeds) — see its README
+for the input format each target decodes, and how to check that a seed
+reaches the code it was written for.
+
 ## Name origins
 
 *Niter* or *nitre* is the mineral form of potassium nitrate, KNO3. It is a soft, white, highly soluble mineral found primarily in arid climates or cave deposits.

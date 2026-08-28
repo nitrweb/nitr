@@ -63,7 +63,7 @@ impl Body for LimitedBody {
 /// `If-None-Match` wins over `If-Modified-Since` when both are present,
 /// which is what RFC 9110 requires: an entity tag is an exact identifier
 /// and a date is a heuristic.
-pub(crate) fn is_fresh(
+pub fn is_fresh(
     headers: &hyper::HeaderMap,
     etag: Option<&str>,
     last_modified: Option<i64>,

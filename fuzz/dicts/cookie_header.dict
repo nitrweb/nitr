@@ -1,0 +1,50 @@
+# Tokens for `cookie_header`. The input is
+#   u16 pick | lookup \0 header
+# so the NUL that ends the lookup name is itself a token: without it every
+# input is one giant lookup name and the header is always empty.
+"\x00"
+
+# --- RFC 6265 cookie-string -------------------------------------------
+# The two delimiters the whole parse is built on, and the segment shapes
+# that decide whether a segment yields a cookie at all.
+";"
+"; "
+"="
+"a=1; b=2"
+"session="
+"session=abc"
+# Segments the parser must drop rather than turn into a cookie: no `=`,
+# an empty name, nothing but whitespace.
+"noequals"
+"=novalue"
+";;"
+"; ;"
+"   "
+"\x09"
+# Whitespace around a pair is trimmed, so these decide whether the trim
+# happened before or after the name/value split.
+" = "
+" a = 1 "
+
+# --- shapes that would be attribute keys in a Set-Cookie --------------
+# `split_parse` gives each one its own cookie, so these reach the
+# name-with-a-capital and the empty-value paths.
+"HttpOnly"
+"Secure"
+"Path=/"
+"Domain="
+"Max-Age=0"
+"SameSite=Lax"
+"Expires="
+
+# --- values that try to smuggle a second cookie ------------------------
+"%3B"
+"%3D"
+"%20"
+"\""
+"\"v a l\""
+","
+"x=y=z"
+# The one name that cannot be reached through `req.cookies.<name>`,
+# because mlua resolves the registered method first.
+"verify"

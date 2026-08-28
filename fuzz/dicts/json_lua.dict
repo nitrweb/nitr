@@ -1,0 +1,75 @@
+# Tokens for `json_lua`. The input is
+#   u16 depth | json \0 builder-program…
+# so the NUL that ends the document is a token in its own right: without
+# it every mutation lands in the JSON and the table builder is never fed.
+"\x00"
+
+# --- JSON structure ----------------------------------------------------
+"{"
+"}"
+"["
+"]"
+":"
+","
+"\""
+"{}"
+"[]"
+"{\"a\":1}"
+"[1,2,3]"
+"{\"a\":{\"b\":[1,{}]}}"
+# Nesting in bulk: the decoder's recursion limit is 128 and the encoder's
+# guard is 128, and neither is reachable one bracket at a time.
+"[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[["
+"]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]"
+
+# --- literals ----------------------------------------------------------
+"null"
+"true"
+"false"
+
+# --- the numbers a Lua round trip has to survive -----------------------
+"0"
+"-0.0"
+"1.0"
+"9223372036854775807"
+"-9223372036854775808"
+"9223372036854775808"
+"1e308"
+"1e309"
+"1e-400"
+# Not JSON, and the point: a decoder that took these would be accepting a
+# dialect its own encoder cannot produce. Pinned in the target's REFUSED
+# table, along with the rest of the laxer grammar below.
+"NaN"
+"Infinity"
+"-Infinity"
+
+# --- the laxer dialects a decoder must not drift into ------------------
+# A trailing comma, a bare or single-quoted name, a comment, and anything
+# at all after a complete value.
+",}"
+",]"
+"'"
+"//"
+"/*"
+"xyz"
+"0x"
+"+1"
+".5"
+"01"
+
+# --- strings -----------------------------------------------------------
+"\\u0000"
+"\\ud800"
+"\\udbff\\udfff"
+"\\\\"
+"\\\""
+"\\n"
+"\xc3\xb1"
+"\xff\xfe"
+
+# --- shapes that only matter on the way out ----------------------------
+# A duplicated name, which is what an integer key colliding with the equal
+# string key produces, and the empty containers Lua cannot tell apart.
+"{\"2\":\"a\",\"2\":\"b\"}"
+"{\"a\":[],\"b\":{}}"

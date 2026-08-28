@@ -1,0 +1,60 @@
+# Tokens for `static_resolve`. The input is
+#   u8 mount | url-path…
+# so there is no field separator to synthesize — everything after the
+# first byte is the URL. A raw NUL is still worth a token: it is what a
+# decoded `%00` becomes, and a path that truncates at one would serve
+# `/ok.txt\0.png` as `ok.txt`.
+"\x00"
+
+# --- The traversal alphabet ------------------------------------------
+".."
+"../"
+"..\\"
+"./"
+"//"
+"/./"
+"/../"
+"....//"
+"/etc/passwd"
+
+# --- Percent-encoded traversal ---------------------------------------
+# The decode is what stands between these and the component filter, so
+# the fuzzer needs the escapes themselves as tokens: byte-by-byte it
+# would almost never assemble a valid `%XX`.
+"%2e"
+"%2E"
+"%2e%2e"
+"%2f"
+"%2F"
+"%2e%2e%2f"
+"%5c"
+"%00"
+# Double encoding: `%252e` decodes once to the *name* `%2e`, and must not
+# decode a second time into `.`.
+"%252e"
+"%252f"
+"%25252e"
+# Over-long and non-UTF-8 forms, which must be refused rather than
+# decoded to a separator.
+"%c0%ae"
+"%c0%af"
+"%e0%80%ae"
+"%ff"
+
+# --- The mounts and the tree -----------------------------------------
+# Reaching a real file is what turns a filter bug into an assertion
+# failure, so the names that exist (inside and outside) are all here.
+"/public/"
+"/publicfoo"
+"/assets/"
+"index.html"
+"ok.txt"
+"sub/"
+"inner.txt"
+"secret.txt"
+"outside/"
+"leak.txt"
+"escape.txt"
+"escape-dir/"
+"alias.txt"
+"dangling.txt"

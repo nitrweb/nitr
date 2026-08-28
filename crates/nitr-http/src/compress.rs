@@ -41,14 +41,16 @@ use crate::handler::HttpResponse;
 
 /// A content coding Nitr can produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Encoding {
+pub enum Encoding {
+    /// Brotli (`br`).
     Brotli,
+    /// gzip.
     Gzip,
 }
 
 impl Encoding {
     /// The `Content-Encoding` token.
-    pub(crate) fn token(self) -> &'static str {
+    pub fn token(self) -> &'static str {
         match self {
             Encoding::Brotli => "br",
             Encoding::Gzip => "gzip",
@@ -63,7 +65,8 @@ impl Encoding {
         }
     }
 
-    fn from_token(token: &str) -> Option<Self> {
+    /// The coding a request token names, if Nitr can produce it.
+    pub fn from_token(token: &str) -> Option<Self> {
         match token {
             "br" => Some(Encoding::Brotli),
             "gzip" => Some(Encoding::Gzip),
@@ -75,7 +78,7 @@ impl Encoding {
 /// The compiled `[compression]` policy plus the negotiation machinery,
 /// which is needed for sidecars even when on-the-fly compression is off.
 #[derive(Debug)]
-pub(crate) struct Compression {
+pub struct Compression {
     /// Offered algorithms in server-preference order.
     algorithms: Vec<Encoding>,
     #[cfg(feature = "compression")]
@@ -118,9 +121,30 @@ impl Compression {
         }
     }
 
+    /// A negotiator offering exactly `algorithms`, so the fuzz target can
+    /// drive the real [`Compression::negotiate`] instead of re-spelling its
+    /// predicate — a copy of the rule cannot catch a change to the rule.
+    ///
+    /// The remaining fields belong to the compression path and are left
+    /// inert: `negotiate` deliberately reads only the offered list, ignoring
+    /// `enabled` so sidecar lookup still works with on-the-fly compression
+    /// switched off.
+    #[doc(hidden)]
+    pub fn negotiator_for_fuzzing(algorithms: Vec<Encoding>) -> Self {
+        Self {
+            algorithms,
+            #[cfg(feature = "compression")]
+            enabled: false,
+            #[cfg(feature = "compression")]
+            min_size: 0,
+            #[cfg(feature = "compression")]
+            types: Vec::new(),
+        }
+    }
+
     /// The best encoding for this request, considering only what the server
     /// offers. Used for sidecar lookup, so it ignores `enabled`.
-    pub(crate) fn negotiate(&self, accept_encoding: Option<&HeaderValue>) -> Option<Encoding> {
+    pub fn negotiate(&self, accept_encoding: Option<&HeaderValue>) -> Option<Encoding> {
         let accepted = parse_accept_encoding(accept_encoding?.to_str().ok()?);
         // Server preference order wins among everything the client accepts,
         // so the `algorithms` list is a real knob rather than advisory.
@@ -222,7 +246,7 @@ impl Compression {
 
 /// Parses `Accept-Encoding` into (encoding, q-value) pairs, keeping only
 /// codings we can produce.
-fn parse_accept_encoding(value: &str) -> Vec<(Encoding, f32)> {
+pub fn parse_accept_encoding(value: &str) -> Vec<(Encoding, f32)> {
     value
         .split(',')
         .filter_map(|entry| {

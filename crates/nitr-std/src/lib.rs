@@ -55,11 +55,15 @@ pub use utils::error_lua_value;
 /// Not part of the public API; no stability promise applies here.
 #[doc(hidden)]
 pub mod fuzzing {
+    #[cfg(feature = "crypto")]
+    pub use crate::crypto::create_crypto_table;
     pub use crate::http::{sign, verify};
     pub use crate::json::create_json_fn;
     pub use crate::path::{
         basename, dirname, is_absolute, is_windows_style, join, normalize, split_root,
     };
+    pub use crate::url::create_url_table;
+    pub use crate::validate::format::{check_format, format_names};
 }
 
 #[cfg(feature = "db")]

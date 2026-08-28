@@ -1,0 +1,58 @@
+# Tokens for `validate_formats`. The input is
+#   value…
+# — the whole input is the value, and every run checks it against every
+# name `format_names()` advertises, so there is no selector to spell and
+# every token below is value text.
+
+# --- the separators every validator splits or strips on ----------------
+"@"
+"."
+".."
+"-"
+" "
+
+# --- email / hostname --------------------------------------------------
+"user@example.com"
+"example.com"
+"localhost"
+# The label rules: an edge hyphen, an empty label, and the punycode prefix
+# that is legal and looks like neither.
+"-a"
+"a-"
+"xn--"
+"a..b"
+
+# --- url ---------------------------------------------------------------
+"http://"
+"https://"
+"://"
+# The schemes a `format = "url"` value must never be, and the authority
+# shapes that decide whether one is.
+"javascript:"
+"data:text/html,"
+
+# --- uuid / hex --------------------------------------------------------
+"550e8400-e29b-41d4-a716-446655440000"
+"deadbeef"
+
+# --- ip ----------------------------------------------------------------
+"127.0.0.1"
+"::1"
+"::ffff:127.0.0.1"
+"%eth0"
+
+# --- date / datetime ---------------------------------------------------
+"2020-01-01"
+"T00:00:00Z"
+"+01:00"
+
+# --- base64 ------------------------------------------------------------
+"aGVsbG8="
+"AAAA"
+"=="
+"-_"
+
+# --- bytes that survive as text but are not ASCII ----------------------
+"\xc3\xa9"
+"\xef\xbc\x91"
+"\x00"

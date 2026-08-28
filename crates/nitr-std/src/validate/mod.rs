@@ -14,7 +14,7 @@
 use mlua::{Lua, Table, UserData, UserDataMethods, Value};
 
 mod compile;
-mod format;
+pub(crate) mod format;
 #[cfg(test)]
 mod tests;
 

@@ -13,6 +13,61 @@ fn nitr() -> Command {
     Command::new(env!("CARGO_BIN_EXE_nitr"))
 }
 
+/// The machine an ELF file was built for (`e_machine`), or `None` when the
+/// file is not an ELF — which is the answer on any non-ELF platform too.
+///
+/// Bytes 18..20 of the header, read in the endianness byte 5 declares.
+fn elf_machine(path: &Path) -> Option<u16> {
+    use std::io::Read;
+
+    let mut header = [0u8; 20];
+    std::fs::File::open(path)
+        .ok()?
+        .read_exact(&mut header)
+        .ok()?;
+    if &header[..4] != b"\x7fELF" {
+        return None;
+    }
+    let machine = [header[18], header[19]];
+    match header[5] {
+        1 => Some(u16::from_le_bytes(machine)),
+        2 => Some(u16::from_be_bytes(machine)),
+        _ => None,
+    }
+}
+
+/// A name for the machine numbers the CI matrix actually produces, so a
+/// skip in the log says which architecture it skipped rather than a number.
+fn machine_name(machine: u16) -> String {
+    match machine {
+        3 => "x86".into(),
+        8 => "mips".into(),
+        20 => "powerpc".into(),
+        21 => "powerpc64".into(),
+        22 => "s390x".into(),
+        40 => "arm".into(),
+        62 => "x86_64".into(),
+        183 => "aarch64".into(),
+        243 => "riscv".into(),
+        other => format!("machine {other:#x}"),
+    }
+}
+
+/// Whether the compiled `nitr` binary was built for a different machine
+/// than this host executes natively.
+///
+/// `/bin/sh` is the reference for "native": it is the one executable POSIX
+/// guarantees is present, and it is also precisely the program glibc
+/// substitutes when an exec fails (see [`binary_runs`]), so comparing
+/// against it answers the question that actually matters. Reading bytes
+/// beats asking the system — under `qemu-user` `uname` reports the
+/// *emulated* architecture, so it would claim a match either way.
+fn foreign_machine() -> Option<(u16, u16)> {
+    let ours = elf_machine(Path::new(env!("CARGO_BIN_EXE_nitr")))?;
+    let native = elf_machine(Path::new("/bin/sh"))?;
+    (ours != native).then_some((ours, native))
+}
+
 /// Whether the compiled `nitr` binary can actually execute here. Under a
 /// cross-compiled test run (the CI's qemu matrix) the *test binary* is
 /// emulated, but a child process it spawns is a foreign ELF the host
@@ -22,28 +77,108 @@ fn nitr() -> Command {
 /// The skip is reserved for exactly that case: when the binary *can* be
 /// spawned but `-v` fails, that is a crash-on-startup regression, and the
 /// suite fails loudly instead of turning green with everything skipped.
+///
+/// Telling the two apart needs the ELF header, because a failed exec has
+/// two different shapes. When the spawn goes through `posix_spawn` the
+/// kernel's `ENOEXEC` comes straight back as an `Err`. When it goes
+/// through `execvp` it does not: POSIX requires `execvp` to answer
+/// `ENOEXEC` by retrying the file through `/bin/sh`, so the spawn
+/// *succeeds*, the child is a shell choking on the ELF header, and it
+/// exits 2 exactly like a real startup failure would. Only the header
+/// distinguishes them — a binary built for another machine never ran at
+/// all, so there is no regression to report.
 fn binary_runs() -> bool {
     match nitr().arg("-v").output() {
         Ok(out) if out.status.success() => true,
+        // The exec failed outright: `posix_spawn` reports `ENOEXEC` back.
+        Err(_) => false,
+        // The exec was answered by a shell, not by `nitr`.
+        Ok(_) if foreign_machine().is_some() => false,
         Ok(out) => panic!(
             "`nitr -v` executed but failed (exit {:?}) — a startup regression, \
              not a cross-compilation skip: {}",
             out.status.code(),
             String::from_utf8_lossy(&out.stderr)
         ),
-        // The exec itself failed: a foreign ELF the host cannot run.
-        Err(_) => false,
     }
 }
 
-/// Skips the calling test (with a note) when the binary cannot run.
+/// Skips the calling test (with a note) when the binary cannot run. The
+/// note names both machines: "skipped" with no reason is how a suite
+/// quietly stops testing anything.
 macro_rules! require_runnable_binary {
     () => {
         if !binary_runs() {
-            eprintln!("skipping: the target binary cannot execute on this host (cross-compiled)");
+            match foreign_machine() {
+                Some((ours, native)) => eprintln!(
+                    "skipping: `nitr` is built for {} and this host runs {} natively",
+                    machine_name(ours),
+                    machine_name(native)
+                ),
+                None => {
+                    eprintln!("skipping: the target binary cannot execute on this host")
+                }
+            }
             return;
         }
     };
+}
+
+/// The header read that decides skip-versus-fail must be right in both
+/// endiannesses, or the cross matrix either skips silently on a real
+/// regression or fails the whole suite on a machine mismatch. Synthetic
+/// headers pin the two field offsets and the endianness byte without
+/// needing a cross toolchain to produce a real foreign binary.
+#[test]
+fn elf_machine_reads_both_endiannesses_and_ignores_non_elf() {
+    let scratch = Scratch::new("elf-machine");
+
+    // s390x: big-endian, e_machine 22 — the case that started this.
+    let mut big = [0u8; 20];
+    big[..4].copy_from_slice(b"\x7fELF");
+    big[4] = 2; // ELFCLASS64
+    big[5] = 2; // ELFDATA2MSB
+    big[18..20].copy_from_slice(&22u16.to_be_bytes());
+    let be = scratch.join("s390x");
+    std::fs::write(&be, big).expect("write big-endian header");
+    assert_eq!(elf_machine(&be), Some(22), "big-endian e_machine");
+
+    // x86_64: little-endian, e_machine 62. Same bytes, other order —
+    // reading this one as big-endian would yield 15872, not 62.
+    let mut little = [0u8; 20];
+    little[..4].copy_from_slice(b"\x7fELF");
+    little[4] = 2;
+    little[5] = 1; // ELFDATA2LSB
+    little[18..20].copy_from_slice(&62u16.to_le_bytes());
+    let le = scratch.join("x86_64");
+    std::fs::write(&le, little).expect("write little-endian header");
+    assert_eq!(elf_machine(&le), Some(62), "little-endian e_machine");
+
+    // Not an ELF, and too short to hold a header: both must decline
+    // rather than read whatever bytes happen to sit at offset 18.
+    let script = scratch.join("script");
+    std::fs::write(&script, b"#!/bin/sh\necho hello\n").expect("write script");
+    assert_eq!(elf_machine(&script), None, "a shell script is not an ELF");
+
+    let stub = scratch.join("stub");
+    std::fs::write(&stub, b"\x7fELF").expect("write truncated header");
+    assert_eq!(elf_machine(&stub), None, "a truncated header is not usable");
+
+    assert_eq!(
+        elf_machine(&scratch.join("absent")),
+        None,
+        "a missing file is not an ELF"
+    );
+
+    // The real binary under test is an ELF on this platform or it is not
+    // one at all; either way the answer must agree with `/bin/sh`, since
+    // a native run is exactly when these tests must not skip.
+    if elf_machine(Path::new("/bin/sh")).is_some() {
+        assert!(
+            foreign_machine().is_none(),
+            "a native test run must not be classified as cross-compiled"
+        );
+    }
 }
 
 /// A scratch application directory: unique per test (counter + pid, so

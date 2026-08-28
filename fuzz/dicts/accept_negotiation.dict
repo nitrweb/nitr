@@ -1,0 +1,48 @@
+# Tokens for `accept_negotiation`. The input is
+#   accept \0 offer \0 offer \0 …
+# so the NUL is the most valuable token here: it is the only way to grow
+# the offer list, and the tie-break rule needs at least two offers.
+"\x00"
+"\x00\x00"
+
+# --- Media ranges, RFC 9110 §12.5.1 -----------------------------------
+# The three specificity tiers the ranking is built on: an exact type, a
+# subtype wildcard, and `*/*`.
+"text/html"
+"text/plain"
+"application/json"
+"application/xml"
+"application/octet-stream"
+"image/png"
+"text/*"
+"image/*"
+"*/*"
+"/"
+"*"
+# Case is compared insensitively, so a folded spelling is a real input.
+"TEXT/HTML"
+
+# --- The list and parameter grammar -----------------------------------
+","
+", "
+";"
+"; "
+";q="
+"q="
+" ; q = "
+
+# --- Weights ----------------------------------------------------------
+# Zero and below are refusals; anything unparseable is meant to be one.
+"q=0"
+"q=1"
+"q=0.9"
+"q=0.5"
+"q=0.001"
+";q=0"
+"NaN"
+"nan"
+"-1"
+"text/html;q=0.9"
+"*/*;q=0.1"
+"application/json;q=0"
+"text/html,application/json;q=0.9,*/*;q=0.1"

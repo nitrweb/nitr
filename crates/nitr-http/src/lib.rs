@@ -35,9 +35,14 @@ pub mod testing;
 /// Not part of the public API; no stability promise applies here.
 #[doc(hidden)]
 pub mod fuzzing {
+    pub use crate::compress::{Compression, Encoding, parse_accept_encoding};
     #[cfg(feature = "multipart")]
     pub use crate::multipart::consume_for_fuzzing as consume_multipart;
-    pub use crate::range::{Resolved, parse as parse_range};
+    pub use crate::range::{
+        Resolved, if_range_matches, parse as parse_range, resolve as resolve_range,
+    };
+    pub use crate::request::is_fresh;
+    pub use crate::static_files::{StaticMount, resolve_for_fuzzing as resolve_static};
 }
 
 /// The hyper `Service` dispatching requests to the Lua pool.

@@ -45,7 +45,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Builds the `nitr.crypto` table.
-pub(crate) fn create_crypto_table(lua: &Lua) -> mlua::Result<Table> {
+pub fn create_crypto_table(lua: &Lua) -> mlua::Result<Table> {
     let crypto = lua.create_table()?;
 
     // Digest and MAC results are lowercase hex strings: printable, easy to

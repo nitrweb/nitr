@@ -43,6 +43,23 @@ pub(super) const FORMATS: &[(&str, Format)] = &[
 ];
 
 /// One DNS label: 1–63 chars, alphanumeric plus inner hyphens.
+/// Checks `value` against the named format, for the `validate_formats`
+/// fuzz target: `None` when no such format exists, else the verdict.
+///
+/// A function rather than a `pub` [`Format`] so the hand-rolled
+/// validators can be fuzzed without making the enum — and a doc comment
+/// per variant — part of any public surface.
+#[doc(hidden)]
+pub fn check_format(name: &str, value: &str) -> Option<bool> {
+    Format::parse(name).map(|format| format.check(value))
+}
+
+/// Every format name [`check_format`] accepts.
+#[doc(hidden)]
+pub fn format_names() -> Vec<&'static str> {
+    FORMATS.iter().map(|(name, _)| *name).collect()
+}
+
 fn is_hostname_label(label: &str) -> bool {
     !label.is_empty()
         && label.len() <= 63

@@ -1,0 +1,49 @@
+# libFuzzer dictionary for the `multipart` target.
+#
+# The input is `u8 have_type | u16 chunk | u8 max_parts | u16 max_field |
+# content-type \0 body`, so the NUL that ends the content-type field is
+# itself a structural token — without it the whole input is one content
+# type and the body is empty.
+"\x00"
+
+# Content types: the accepted one, the near misses that must not parse, and
+# the boundary-parameter corners (empty, quoted, duplicated).
+"multipart/form-data"
+"multipart/mixed"
+"multipart/form-data; boundary=B"
+"application/x-www-form-urlencoded"
+"; boundary="
+"boundary="
+"boundary=\"\""
+"charset=utf-8"
+
+# Delimiter grammar: CRLF, the two leading dashes, and the closing dashes.
+# A delimiter is CRLF + "--" + boundary, and the trailing CRLF/"--" is what
+# tells an opening delimiter from the terminator.
+"\x0d\x0a"
+"\x0d\x0a\x0d\x0a"
+"--"
+"--B"
+"--B\x0d\x0a"
+"--B--\x0d\x0a"
+"\x0d\x0a--B\x0d\x0a"
+"\x0d\x0a--B--\x0d\x0a"
+"--XX--"
+
+# Part headers. multer reads `name` and `filename` from Content-Disposition;
+# `filename` is what makes a part a file rather than a field.
+"Content-Disposition: form-data"
+"content-disposition: form-data; name=\""
+"; name=\""
+"; filename=\""
+"filename=\"\""
+"Content-Type: text/plain"
+"Content-Type: application/octet-stream"
+"Content-Transfer-Encoding: binary"
+"form-data"
+
+# Line endings that are *not* the delimiter's: a bare LF or CR must not be
+# accepted where CRLF is required.
+"\x0a"
+"\x0d"
+"\x20"

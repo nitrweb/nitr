@@ -1,0 +1,58 @@
+# Tokens for `accept_encoding`. The input is
+#   u8 q_choice | accept-encoding
+# so everything after the first byte is header text; there is no NUL in
+# this layout (a NUL would only truncate the header).
+
+# --- The two codings Nitr can produce --------------------------------
+# Everything else in the header is discarded, so without these tokens the
+# parser returns an empty list on almost every input.
+"gzip"
+"br"
+"gzip, deflate, br"
+"br, gzip"
+# Names that must NOT be matched: a substring or prefix comparison would
+# take these for the real thing and label the body with a coding the
+# client cannot read.
+"x-gzip"
+"gzipped"
+"deflate"
+"identity"
+"compress"
+"zstd"
+"*"
+# Case and padding are normalized away, so both spellings matter.
+"GZIP"
+"BR"
+" gzip "
+
+# --- The list and parameter grammar ----------------------------------
+","
+", "
+";"
+"; "
+";q="
+"q="
+" ; q = "
+
+# --- Weights, RFC 9110 §12.4.2 ---------------------------------------
+# `q=0` is a refusal; the float parse also accepts things the grammar
+# never allowed, which is where the interesting behaviour lives.
+"q=0"
+"q=1"
+"q=0.5"
+"q=0.001"
+";q=0"
+";q=1"
+"gzip;q=0"
+"br;q=1.0"
+"NaN"
+"nan"
+"inf"
+"-inf"
+"-1"
+"1e40"
+# Two weights on one entry, and a weight that is not a float at all: the
+# two places where this parser and `nitr_std::http::best_match` give
+# opposite answers (first-wins vs last-wins, 1.0 vs 0.0 on a bad parse).
+";q=1;q=0"
+"q=zzz"

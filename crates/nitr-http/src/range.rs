@@ -38,7 +38,7 @@ pub enum Resolved {
 /// validator the client is holding a stale copy, and stitching fresh bytes
 /// into it would produce a corrupt file. In that case the whole
 /// representation is sent instead, which is exactly what `If-Range` is for.
-pub(crate) fn resolve(
+pub fn resolve(
     headers: &HeaderMap,
     len: u64,
     etag: &str,
@@ -54,7 +54,7 @@ pub(crate) fn resolve(
 }
 
 /// Whether a present `If-Range` validator still matches. Absent means yes.
-fn if_range_matches(headers: &HeaderMap, etag: &str, modified: Option<SystemTime>) -> bool {
+pub fn if_range_matches(headers: &HeaderMap, etag: &str, modified: Option<SystemTime>) -> bool {
     let Some(value) = headers.get(header::IF_RANGE).and_then(|v| v.to_str().ok()) else {
         return true;
     };

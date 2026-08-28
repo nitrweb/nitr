@@ -35,7 +35,7 @@ const INLINE_LIMIT: u64 = 256 * 1024;
 
 /// One static mount: requests under `mount` are served from `dir`.
 #[derive(Debug, Clone)]
-pub(crate) struct StaticMount {
+pub struct StaticMount {
     /// URL prefix, normalized to start with `/` and not end with one
     /// (except the root mount `/`).
     pub(crate) mount: String,
@@ -47,7 +47,8 @@ pub(crate) struct StaticMount {
 }
 
 impl StaticMount {
-    pub(crate) fn new(
+    /// A mount serving `dir` at the URL prefix `mount`.
+    pub fn new(
         mount: impl Into<String>,
         dir: impl Into<PathBuf>,
         spa: bool,
@@ -69,7 +70,7 @@ impl StaticMount {
     }
 
     /// The request path relative to this mount, when it applies.
-    fn relative<'p>(&self, path: &'p str) -> Option<&'p str> {
+    pub fn relative<'p>(&self, path: &'p str) -> Option<&'p str> {
         if self.mount == "/" {
             return Some(path.trim_start_matches('/'));
         }
@@ -135,6 +136,25 @@ pub(crate) async fn try_serve(
         return Some(serve_file(req, mount, &file, compression).await);
     }
     None
+}
+
+/// The traversal defense as one call, for the `static_resolve` fuzz
+/// target: percent-decode the URL path, take it relative to the mount,
+/// and resolve it — the same three steps [`try_serve`] performs, in the
+/// same order, so what the fuzzer explores is the served path and not a
+/// reimplementation of it.
+///
+/// Only the *path* handling is shared; `try_serve` additionally picks a
+/// mount and serves the file, neither of which changes which paths are
+/// reachable. Keep this next to `try_serve` so the two cannot drift
+/// unnoticed.
+#[doc(hidden)]
+pub async fn resolve_for_fuzzing(mount: &StaticMount, url_path: &str) -> Option<PathBuf> {
+    let decoded = percent_encoding::percent_decode_str(url_path)
+        .decode_utf8()
+        .ok()?;
+    let rel = mount.relative(&decoded)?;
+    resolve(&mount.dir, rel).await
 }
 
 /// Resolves a relative URL path to a regular file inside `dir`, or `None`

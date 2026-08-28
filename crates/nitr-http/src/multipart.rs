@@ -167,25 +167,57 @@ async fn flush(file: &mut tokio::fs::File, path: &str) -> mlua::Result<()> {
         .map_err(|err| mlua::Error::RuntimeError(format!("failed writing to `{path}`: {err}")))
 }
 
+/// What a fuzzed multipart walk observed: how many parts were admitted,
+/// and the largest number of bytes any single field yielded.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultipartWalk {
+    /// Parts admitted (never above `max_parts`).
+    pub parts: usize,
+    /// The largest single field, in bytes (never above
+    /// `max_field_bytes`).
+    pub largest_field: u64,
+}
+
 /// Drives the whole multipart parse over an in-memory body the way
 /// `req:multipart()` does — boundary extraction, part counting against
 /// `max_parts`, and the per-field byte cap applied while reading — but
 /// without a Lua state or disk writes. Exposed for the fuzz target only;
 /// the Lua-facing `LuaPart` methods are covered by the integration tests.
+///
+/// `chunk_size` splits the body into that many bytes per stream frame
+/// (`0` means one frame for the whole body). A real body arrives from
+/// hyper as many frames, and multer carries boundary-matching state
+/// across them — the delimiter, and the CRLF before it, can straddle a
+/// frame edge. Feeding one frame would leave that state machine, the
+/// most intricate part of the parser, entirely unexercised.
 #[doc(hidden)]
 pub async fn consume_for_fuzzing(
     content_type: Option<&str>,
     body: bytes::Bytes,
+    chunk_size: usize,
     max_parts: usize,
     max_field_bytes: u64,
-) -> mlua::Result<usize> {
+) -> mlua::Result<MultipartWalk> {
     let boundary = boundary(content_type)?;
-    let stream = futures_util::stream::once(async move { Ok::<_, std::convert::Infallible>(body) });
+    let frames: Vec<bytes::Bytes> = match chunk_size {
+        0 => vec![body],
+        n => body.chunks(n).map(bytes::Bytes::copy_from_slice).collect(),
+    };
+    let stream = futures_util::stream::iter(
+        frames
+            .into_iter()
+            .map(Ok::<_, std::convert::Infallible>)
+            .collect::<Vec<_>>(),
+    );
     let mut parser = multer::Multipart::new(stream, boundary);
-    let mut count = 0usize;
+    let mut walk = MultipartWalk {
+        parts: 0,
+        largest_field: 0,
+    };
     while let Some(mut field) = parser.next_field().await.into_lua_err()? {
-        count += 1;
-        if count > max_parts {
+        walk.parts += 1;
+        if walk.parts > max_parts {
             return Err(mlua::Error::RuntimeError(format!(
                 "multipart body has more than {max_parts} parts"
             )));
@@ -197,8 +229,9 @@ pub async fn consume_for_fuzzing(
                 return Err(too_large("field", "field", max_field_bytes));
             }
         }
+        walk.largest_field = walk.largest_field.max(read);
     }
-    Ok(count)
+    Ok(walk)
 }
 
 /// The `boundary` parameter of a `multipart/form-data` content type.
@@ -292,15 +325,25 @@ mod tests {
 
         // Within both caps: parses, counting every part.
         let ok = format!("{}{}--B--\r\n", part("a", "small"), part("b", "tiny"));
-        let count = consume_for_fuzzing(ct, Bytes::from(ok.clone()), 4, 64)
+        let walk = consume_for_fuzzing(ct, Bytes::from(ok.clone()), 0, 4, 64)
             .await
             .expect("well-formed body within the caps");
-        assert_eq!(count, 2);
+        assert_eq!(walk.parts, 2);
+        assert_eq!(walk.largest_field, 5, "`small` is the larger field");
+
+        // The same body split into single-byte frames must parse
+        // identically: the delimiter and its leading CRLF then straddle
+        // frame edges, which is where multer's boundary state machine
+        // lives.
+        let chunked = consume_for_fuzzing(ct, Bytes::from(ok.clone()), 1, 4, 64)
+            .await
+            .expect("a frame-split body parses the same");
+        assert_eq!(chunked, walk, "framing must not change the parse");
 
         // One field over the byte cap: refused, and the limit is named so
         // the operator knows which knob was hit.
         let big = format!("{}--B--\r\n", part("a", &"x".repeat(100)));
-        let err = consume_for_fuzzing(ct, Bytes::from(big), 4, 32)
+        let err = consume_for_fuzzing(ct, Bytes::from(big), 0, 4, 32)
             .await
             .expect_err("an oversized field must be refused");
         assert!(
@@ -309,7 +352,7 @@ mod tests {
         );
 
         // One part over the count cap: refused, naming the count.
-        let err = consume_for_fuzzing(ct, Bytes::from(ok), 1, 64)
+        let err = consume_for_fuzzing(ct, Bytes::from(ok), 0, 1, 64)
             .await
             .expect_err("a third part beyond max_parts must be refused");
         assert!(err.to_string().contains("more than 1 parts"), "got: {err}");

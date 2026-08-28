@@ -1,0 +1,57 @@
+# Tokens for `range_header`. The input is
+#   u64 len | u64 modified_secs | range \0 if-range \0 etag-inner
+# so the NUL that ends a field is itself a token worth having: without it
+# the fuzzer spends its budget on one giant `range` field and never
+# reaches the If-Range or etag text at all.
+"\x00"
+
+# --- Range, RFC 9110 §14.1 ------------------------------------------
+# The `bytes=` gate: without it every input bails at `strip_prefix` and
+# the three accepting arms are dead.
+"bytes="
+"bytes=0-"
+"bytes=-"
+"bytes=0-0"
+"0-499"
+"500-"
+"-100"
+"-0"
+"-"
+# Multiple ranges (answered in full) and the OWS the parser trims.
+", "
+" "
+"\x09"
+# The numeric edges: u64::MAX, one past it, and a numeral that overflows.
+"18446744073709551615"
+"18446744073709551616"
+"99999999999999999999"
+# Units that are not `bytes` must be ignored rather than refused.
+"items="
+"none"
+
+# --- If-Range as an entity tag, RFC 9110 §13.1.5 ---------------------
+# Strong comparison only: `W/"x"` must never match `"x"`.
+"\""
+"W/"
+"W/\""
+"\"3e8-6553f100\""
+
+# --- If-Range as an HTTP-date, RFC 9110 §5.6.7 -----------------------
+# All three grammars a recipient has to accept, plus the pieces a mutant
+# needs to build a near-miss date of its own.
+"GMT"
+" GMT"
+"Sun, 06 Nov 1994 08:49:37 GMT"
+"Sunday, 06-Nov-94 08:49:37 GMT"
+"Sun Nov  6 08:49:37 1994"
+"Thu, 01 Jan 1970 00:00:00 GMT"
+"Tue, 14 Nov 2023 22:13:20 GMT"
+"Mon, 29 Feb 2016 12:00:00 GMT"
+"Fri, 31 Dec 9999 23:59:59 GMT"
+"-Nov-"
+"00:00:00"
+"23:59:59"
+"1970"
+"9999"
+"Feb"
+"Dec"

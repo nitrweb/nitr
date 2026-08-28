@@ -1,0 +1,57 @@
+# Tokens for `url_lexical`. The input is
+#   u32 port | query \0 url
+# so the NUL that ends the query field is itself a token worth having:
+# without it the fuzzer spends its whole budget inside one giant query and
+# never reaches `parse` at all.
+"\x00"
+
+# --- x-www-form-urlencoded, the differential's grammar ----------------
+# The three separators, plus the `+`-as-space and `%XX` rules that are the
+# entire difference between `form_decode` and a plain percent-decode.
+"&"
+"="
+"+"
+"?"
+"?a=1&b=2"
+"a=1&a=2"
+"&&"
+"=v"
+"flag"
+"%20"
+"%2B"
+"%3D"
+"%26"
+"%00"
+"%C3%B1"
+# Malformed escapes: a truncated one, a non-hex one, a lone `%`. All three
+# must survive `form_decode` and must survive it the same way on both
+# sides of the differential.
+"%2"
+"%zz"
+"%"
+# Lower-case hex: percent-encoding emits upper case, so this is the input
+# that tells a case-folding decoder from an exact one.
+"%c3%b1"
+
+# --- RFC 3986, the splitter's grammar ---------------------------------
+"://"
+"//"
+"https://"
+"mailto:"
+"MailTo:"
+"@"
+"#"
+# Authority shapes: userinfo, the IPv6 brackets `split_authority` special
+# cases, and the port edges either side of the u16 the parse lands in.
+"user@"
+"a@b@"
+"[::1]"
+"[::1]:3000"
+":8443"
+":0"
+":65535"
+":65536"
+":99999"
+":abc"
+"?#"
+"//?#"

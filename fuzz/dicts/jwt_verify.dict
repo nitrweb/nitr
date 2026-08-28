@@ -1,0 +1,55 @@
+# Tokens for `jwt_verify`. The input is
+#   u8 alg | u8 sig | u8 allow | u8 tamper | key \0 alg-text \0 payload \0 token
+# so the NUL that ends a field is itself a token: without it the fuzzer
+# spends its whole budget inside the key and never reaches the token.
+"\x00"
+
+# --- the compact serialization ----------------------------------------
+"."
+".."
+"eyJ"
+# `{"alg":"HS256","typ":"JWT"}` and `{"alg":"none"}` base64url-encoded:
+# the two headers every JWT corpus is really about.
+"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+"eyJhbGciOiJub25lIn0"
+"eyJhbGciOiJSUzI1NiJ9"
+"eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+
+# --- header fields, as plain text (the alg-text field) -----------------
+"alg"
+"typ"
+"JWT"
+"kid"
+"jku"
+
+# --- the algorithm names ----------------------------------------------
+"HS256"
+"HS384"
+"HS512"
+# Case variants and the downgrade: the allow-list is compared with `==`,
+# and these are what tell an exact compare from a folded one.
+"hs256"
+"Hs256"
+"none"
+"None"
+"NONE"
+"RS256"
+"ES256"
+"PS256"
+
+# --- claims ------------------------------------------------------------
+"{\"alg\":\"none\"}"
+"{\"alg\":\"HS256\",\"typ\":\"JWT\"}"
+"{\"sub\":\"42\"}"
+"exp"
+"nbf"
+"iat"
+"sub"
+"iss"
+"aud"
+"4000000000"
+
+# --- base64url edges ---------------------------------------------------
+"-_"
+"=="
+"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"

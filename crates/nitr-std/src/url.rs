@@ -58,7 +58,7 @@ fn split_authority(authority: &str) -> (Option<&str>, &str, Option<u16>) {
 }
 
 /// Builds the `nitr.url` table.
-pub(crate) fn create_url_table(lua: &Lua) -> mlua::Result<Table> {
+pub fn create_url_table(lua: &Lua) -> mlua::Result<Table> {
     let url = lua.create_table()?;
 
     // Component encoding/decoding. `decode` does not treat `+` as a

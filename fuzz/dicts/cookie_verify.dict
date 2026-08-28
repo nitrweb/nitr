@@ -1,0 +1,41 @@
+# Tokens for `cookie_verify`. The input is
+#   u16 tamper | u16 cut | name \0 secret \0 other_secret \0 hostile \0 value
+# and four of the five fields are NUL-terminated, so the separator is the
+# single most valuable token here: without it every input is one enormous
+# cookie name and `value` is never reached.
+"\x00"
+"\x00\x00"
+
+# --- the signed-string grammar: base64url payload "." base64url MAC ----
+# The separator `verify` splits on, and the two alphabet characters that
+# tell base64url from standard base64.
+"."
+".."
+"-"
+"_"
+# Standard-base64 characters, which must NOT appear in a signature and so
+# make a decode failure easy for the fuzzer to reach.
+"+"
+"/"
+"="
+# Signature-shaped runs. A real MAC is 43 characters; these let the fuzzer
+# build strings of the right length without discovering the length itself.
+"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+"AAAA"
+"AAAAAAAA"
+
+# --- a genuine signed cookie ------------------------------------------
+# sign("session", "user-42", "s3cret"), split into its parts so a mutation
+# can graft either half onto something else.
+"dXNlci00Mg.OFYOV27UObENfcm060qnIV2pgFryh6r1zglatvieHoc"
+"dXNlci00Mg"
+"OFYOV27UObENfcm060qnIV2pgFryh6r1zglatvieHoc"
+"session"
+"s3cret"
+
+# --- the strings the MAC is computed over ------------------------------
+# The MAC covers `name "=" payload`, so an `=` inside a name is where a
+# concatenation ambiguity would live if the payload were ever variable.
+"session="
+"a="
+"=."

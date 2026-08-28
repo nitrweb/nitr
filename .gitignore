@@ -16,7 +16,7 @@
 **/*.zst
 **/*.out*
 **/*.perf*
-**/*empty*
+**/empty
 **/*.json
 **/*.csv
 **/*.db

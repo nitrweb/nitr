@@ -1,11 +1,21 @@
 name: fuzz
-# Short per-PR fuzzing of the parsers an attacker fully controls
-# (signed-cookie verification, Accept negotiation, lexical paths, the
-# JSON↔Lua boundary, multipart bodies, and Range headers).
-# A short run finds shallow bugs only — the corpus under fuzz/corpus is
-# retained across runs via the cache so depth accumulates over time, and
-# the committed seeds under fuzz/seeds keep a cold start (first run,
-# evicted cache) from beginning at zero coverage.
+# Short per-PR fuzzing of the parsers an attacker fully controls: signed
+# cookies and the Cookie header, Accept and Accept-Encoding negotiation,
+# conditional-request headers, lexical paths, static path resolution (the
+# traversal defense), the JSON↔Lua boundary, URL/query splitting, JWT
+# verification, the declarative validators, multipart bodies, and Range
+# headers.
+#
+# Two cadences. Per PR: 90 seconds a target, which finds shallow bugs and
+# keeps the check fast enough to gate a merge. Nightly: an hour a target,
+# which is where depth actually comes from — the per-PR corpus cache is
+# branch-scoped (a PR restores from the base branch but its own writes
+# stay with that PR), so accumulated depth on the PR path is weaker than
+# a cache alone suggests.
+#
+# The committed seeds under fuzz/seeds keep a cold start (first run,
+# evicted cache) from beginning at zero coverage, and fuzz/dicts gives
+# each target its grammar tokens.
 on:
   push:
     branches:
@@ -13,14 +23,24 @@ on:
     paths:
       - .github/workflows/fuzz.yml
       - Cargo.toml
+      - Cargo.lock
+      - Makefile
       - crates/**
       - fuzz/**
   pull_request:
     paths:
       - .github/workflows/fuzz.yml
       - Cargo.toml
+      - Cargo.lock
+      - Makefile
       - crates/**
       - fuzz/**
+  # A nightly deep run: 90 seconds per target catches shallow bugs only,
+  # and the per-PR corpus cache is branch-scoped, so depth never really
+  # accumulates on the PR path. This is where it does.
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -29,16 +49,44 @@ jobs:
   fuzz:
     name: Fuzz (${{ matrix.target }})
     runs-on: ubuntu-24.04
+    # `-max_total_time` bounds only the fuzzing loop: the nightly install,
+    # the cargo-fuzz fetch, the ASan build of vendored Lua, and cmin are
+    # all outside it, leaving GitHub's 360-minute default as the only cap.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - cookie_verify
-          - accept_negotiation
-          - path_lexical
-          - json_lua
-          - range_header
-          - multipart
+        include:
+          # `max_len` is per target: libFuzzer's 4096 default silently
+          # truncates the inputs that are bodies rather than headers, so
+          # multipart never reached multi-frame sizes and JSON never got
+          # deep enough to approach the 128-level depth guard.
+          - target: cookie_verify
+            max_len: 4096
+          - target: accept_negotiation
+            max_len: 4096
+          - target: path_lexical
+            max_len: 4096
+          - target: json_lua
+            max_len: 16384
+          - target: range_header
+            max_len: 4096
+          - target: multipart
+            max_len: 65536
+          - target: static_resolve
+            max_len: 4096
+          - target: url_lexical
+            max_len: 8192
+          - target: cookie_header
+            max_len: 4096
+          - target: accept_encoding
+            max_len: 4096
+          - target: jwt_verify
+            max_len: 8192
+          - target: validate_formats
+            max_len: 4096
+          - target: conditional_headers
+            max_len: 4096
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -55,9 +103,9 @@ jobs:
     # The corpus persists between runs, so every PR starts from the
     # deepest coverage reached so far instead of from scratch.
     - name: Restore the fuzz corpus
-      uses: actions/cache@v4
+      uses: actions/cache/restore@v4
       with:
-        path: fuzz/corpus
+        path: fuzz/corpus/${{ matrix.target }}
         key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
         restore-keys: |
           fuzz-corpus-${{ matrix.target }}-
@@ -74,12 +122,48 @@ jobs:
     # The target triple is pinned to the host: fuzzing needs the address
     # sanitizer, which is incompatible with statically linked (musl) libc,
     # so a `CARGO_BUILD_TARGET`/config default of musl must not leak in.
-    - name: Fuzz for 90 seconds
-      run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=90
+    #
+    # `-timeout` bounds ONE execution. Without it libFuzzer's default is
+    # 1200s, which can never fire inside a 90s run — so "this target never
+    # hangs" was an unfalsifiable claim. `-dict` feeds the target's
+    # grammar tokens when it has a dictionary.
+    - name: Fuzz
+      run: |
+        dict=""
+        if [ -f "fuzz/dicts/${{ matrix.target }}.dict" ]; then
+          dict="-dict=fuzz/dicts/${{ matrix.target }}.dict"
+        fi
+        cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- \
+          $dict \
+          -max_len=${{ matrix.max_len }} \
+          -timeout=25 \
+          -rss_limit_mb=4096 \
+          -max_total_time=${{ github.event_name == 'schedule' && 3600 || 90 }}
       env:
         CARGO_BUILD_TARGET: ""
 
+    # Without this a crash is unreproducible: fuzz/artifacts is
+    # gitignored and dies with the runner, leaving only a hex dump in the
+    # log. The reproducer is the whole value of a red fuzz job.
+    - name: Upload crash artifacts
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: fuzz-artifacts-${{ matrix.target }}
+        path: fuzz/artifacts/${{ matrix.target }}/
+        if-no-files-found: ignore
+        retention-days: 30
+
+    # cmin only on success: minimizing a corpus that contains a crashing
+    # input would just re-trigger the crash inside minimization.
     - name: Minimize the corpus
       run: cargo +nightly fuzz cmin --target x86_64-unknown-linux-gnu ${{ matrix.target }}
       env:
         CARGO_BUILD_TARGET: ""
+
+    - name: Save the fuzz corpus
+      if: always()
+      uses: actions/cache/save@v4
+      with:
+        path: fuzz/corpus/${{ matrix.target }}
+        key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
