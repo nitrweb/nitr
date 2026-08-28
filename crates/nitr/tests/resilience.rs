@@ -669,29 +669,56 @@ async fn an_oversized_header_block_is_rejected() {
     })
     .await;
 
-    let mut sock = tokio::net::TcpStream::connect(h.addr())
+    let sock = tokio::net::TcpStream::connect(h.addr())
         .await
         .expect("connect");
     // A single 64 KiB header value, four times the buffer.
     let mut req = b"GET /ok HTTP/1.1\r\nHost: localhost\r\nX-Big: ".to_vec();
     req.extend(std::iter::repeat_n(b'A', 64 * 1024));
     req.extend_from_slice(b"\r\n\r\n");
-    // The write may not fully land before the server hangs up — that is
-    // itself the guard firing, so the write is best-effort.
-    let _ = sock.write_all(&req).await;
 
+    // The server answers 431 after its 16 KiB buffer fills and hangs up
+    // with most of the block still unread in its receive queue — a close
+    // with unread data is an RST, not a FIN. What the client then sees is
+    // platform-dependent: Linux hands over data buffered before the RST,
+    // while macOS and the BSDs discard the receive queue, so the 431 can
+    // vanish and the read fail with ECONNRESET. Read concurrently with
+    // the write so the response is captured when it survives, and treat a
+    // reset as the refusal itself when it does not — the positive control
+    // below is what separates the limit firing from a server that died.
+    let (mut rd, mut wr) = sock.into_split();
+    let writer = tokio::spawn(async move {
+        // The write may not fully land before the server hangs up — that
+        // is itself the guard firing, so the write is best-effort.
+        let _ = wr.write_all(&req).await;
+    });
     let mut raw = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut raw))
+    let read = tokio::time::timeout(Duration::from_secs(5), rd.read_to_end(&mut raw))
         .await
-        .expect("the server must answer or close, not hang on the huge header")
-        .expect("read response");
+        .expect("the server must answer or close, not hang on the huge header");
+    writer.await.expect("writer task");
     let head = String::from_utf8_lossy(&raw).to_lowercase();
-    assert!(
-        head.starts_with("http/1.1 431"),
-        "an over-limit header block must answer 431: {head}"
-    );
-    assert!(head.contains("connection: close"), "got: {head}");
-    // `read_to_end` returning proves the close was real.
+    match read {
+        // Read-to-EOF: the whole response arrived, so hold it to the
+        // full contract.
+        Ok(_) => {
+            assert!(
+                head.starts_with("http/1.1 431"),
+                "an over-limit header block must answer 431: {head}"
+            );
+            assert!(head.contains("connection: close"), "got: {head}");
+        }
+        // The reset outran the read and took the receive queue with it.
+        // Anything that DID arrive first must still lead with the 431 —
+        // a reset is an acceptable spelling of refusal, a 200 is not.
+        Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+            assert!(
+                raw.is_empty() || head.starts_with("http/1.1 431"),
+                "data before the reset must lead with 431: {head}"
+            );
+        }
+        Err(err) => panic!("read response: {err}"),
+    }
 
     // The positive control: a header block just under the buffer is
     // ordinary traffic — the 431 above is the limit firing, not the
