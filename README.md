@@ -43,7 +43,7 @@ Nitr is both a **binary** (`nitr`, configured via `nitr.toml`) and a **library c
 - **Operable:** Rust-owned `/healthz` + `/readyz` probes (readiness flips before a drain can fail a request, optionally on a separate port), JSON log output (`[log] format = "json"`), pidfile + `nitr reload` for scripted zero-downtime reloads, and reference [systemd/Docker deployments](deploy/).
 - **One-file deploys:** `nitr build --output myapp` appends the whole application (config, Lua, templates, static files, migrations) to the binary — copy one executable; the database stays external.
 - **Dev mode (`--dev`)**: instant hot reload (a `notify` watcher rebuilds on save — scripts, `routes/`, templates) and error details in responses.
-- **Editor completion for everything:** `nitr init` writes generated LuaCATS type definitions (`nitr-types.lua`) covering the whole `nitr.*` surface — completion, signatures and inline docs in any editor with the Lua Language Server. Generated from the same [single API description](docs/nitr-api.md) as the reference docs; a test fails if an undocumented builtin ships.
+- **Editor completion for everything:** `nitr init` writes generated LuaCATS type definitions (`nitr-types.lua`) covering the whole `nitr.*` surface — completion, signatures and inline docs in any editor with the Lua Language Server. Generated from the same [single API description](resources/nitr-api.md) as the reference docs; a test fails if an undocumented builtin ships.
 - **A test framework worth using:** `nitr.test` gives `describe`/`it`/`expect` matchers, `before_each`/`after_each`, `t.request(..., { json = ... })` and `resp:json()`, `nitr test --filter <name>` — failures name the assertion, both values, and the file:line. Requests dispatch through the real router, middleware included.
 - **Extensible:** `ServerBuilder::module("name", ...)` mounts a Rust table at `nitr.ext.name` in every Lua state — user modules live under `nitr.ext.*`, one level below the std, so no future builtin can ever collide with them, third-party extension crates need no fork.
 
@@ -266,7 +266,7 @@ For lower-level embedding, `nitr::Runtime` exposes the Lua state, `register_modu
 
 ## Documentation
 
-Current references: the [`nitr.*` API](docs/nitr-api.md) (generated), the [error-handling guide](docs/errors.md), the [passwords and Basic auth guide](docs/passwords.md), the [stability policy](docs/stability.md) and the [threat model](docs/threat-model.md). The original proposal documents are archived in [.docs/](.docs/).
+Current references: the [`nitr.*` API](resources/nitr-api.md) (generated), the [error-handling guide](docs/errors.md), the [passwords and Basic auth guide](docs/passwords.md), the [stability policy](docs/stability.md) and the [threat model](docs/threat-model.md). The original proposal documents are archived in [.docs/](.docs/).
 
 ## Benchmarks
 

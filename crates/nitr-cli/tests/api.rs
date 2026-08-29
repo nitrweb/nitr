@@ -7,8 +7,8 @@
 //!
 //! - completeness: every entry registered on the `nitr` namespace must be
 //!   described, so adding a builtin without documenting it fails here;
-//! - drift: the checked-in generated files (`nitr-types.lua`,
-//!   `docs/nitr-api.md`) must match what the description generates.
+//! - drift: the checked-in generated files (`resources/nitr-types.lua`,
+//!   `resources/nitr-api.md`) must match what the description generates.
 //!   Regenerate with: NITR_API_REGEN=1 cargo test -p nitr-cli --test api
 //!
 //! The generator lives in the binary crate; tests reach it through the
@@ -110,10 +110,17 @@ fn every_registered_entry_is_described() {
 #[test]
 fn generated_files_are_current() {
     let api = apidef::parse().expect("parse nitr-api.toml");
+    // Both live under `resources/`: generated artifacts, not sources —
+    // nothing at runtime reads either (the scaffold regenerates the types
+    // file from the compiled-in description), they are checked in so the
+    // output is reviewable and greppable.
     let outputs = [
-        (repo_root().join("nitr-types.lua"), apidef::emit_types(&api)),
         (
-            repo_root().join("docs/nitr-api.md"),
+            repo_root().join("resources/nitr-types.lua"),
+            apidef::emit_types(&api),
+        ),
+        (
+            repo_root().join("resources/nitr-api.md"),
             apidef::emit_docs(&api),
         ),
     ];
@@ -130,13 +137,23 @@ fn generated_files_are_current() {
     }
 
     for (path, expected) in &outputs {
+        // A file absent from this checkout cannot drift — a packaged or
+        // sparse context may lack `resources/`. Only a clean not-found
+        // skips; a permission error must fail loudly, not read as an
+        // empty stale file.
+        let on_disk = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping {}: not part of this checkout", path.display());
+                continue;
+            }
+            Err(err) => panic!("cannot read {}: {err}", path.display()),
+        };
         // A Windows checkout may carry `\r\n` (git autocrlf) while the
         // generator emits `\n`: the comparison is about content, so line
         // endings are normalized away. `.gitattributes` pins the files to
         // LF, but a runner's existing checkout may predate that.
-        let on_disk = std::fs::read_to_string(path)
-            .unwrap_or_default()
-            .replace("\r\n", "\n");
+        let on_disk = on_disk.replace("\r\n", "\n");
         assert_eq!(
             &on_disk,
             expected,

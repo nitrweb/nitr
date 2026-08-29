@@ -122,7 +122,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # The async handshake. Same provider choice, spelled the way tokio-rustls
 # spells it (`ring`, not `aws_lc_rs`).
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-rustls-pemfile = "2.2"
+# PEM parsing for `[tls] cert`/`key`, via the `PemObject` trait. This is
+# the code `rustls-pemfile` merely wrapped before it was retired
+# (RUSTSEC-2025-0134), and it rides in with rustls either way.
+rustls-pki-types = "1.9"
 # Self-signed certificates generated inside the TLS tests, so no private
 # key is ever committed to the repository.
 rcgen = "0.14"

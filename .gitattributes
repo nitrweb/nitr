@@ -1,8 +1,8 @@
 # Generated files are compared byte-for-byte against the generator's
 # output (which emits LF) by the drift test, so git must never rewrite
 # their line endings on checkout.
-nitr-types.lua text eol=lf
-docs/nitr-api.md text eol=lf
+resources/nitr-types.lua text eol=lf
+resources/nitr-api.md text eol=lf
 crates/nitr-cli/src/nitr-api.toml text eol=lf
 # Lua sources are embedded via include_str! and shipped into scaffolds;
 # keep them LF everywhere too.

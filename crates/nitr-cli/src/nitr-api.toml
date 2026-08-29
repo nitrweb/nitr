@@ -6,7 +6,7 @@
 # The single source of truth for the `nitr.*` API surface.
 #
 # Everything generated — the LuaCATS type definitions (`nitr-types.lua`)
-# and the reference page (`docs/nitr-api.md`) — comes from this file, and a
+# and the reference page (`resources/nitr-api.md`) — comes from this file, and a
 # test walks the registered namespace to assert every entry is described
 # here: adding a builtin without documenting it fails the build.
 #

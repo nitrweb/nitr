@@ -202,7 +202,7 @@ fn feature_note(feature: &str) -> String {
     }
 }
 
-/// Generates the LuaCATS definitions file (`nitr-types.lua`).
+/// Generates the LuaCATS definitions file (`resources/nitr-types.lua`).
 pub fn emit_types(api: &Api) -> String {
     let mut out = String::from(
         "---@meta nitr\n\
@@ -324,7 +324,7 @@ fn signature(name: &str, params: &[Param], returns: &[Ret]) -> String {
     }
 }
 
-/// Generates the Markdown reference page (`docs/nitr-api.md`).
+/// Generates the Markdown reference page (`resources/nitr-api.md`).
 pub fn emit_docs(api: &Api) -> String {
     let mut out = String::from(
         "# The `nitr.*` API\n\n\

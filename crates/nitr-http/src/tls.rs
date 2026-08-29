@@ -23,7 +23,8 @@ use std::sync::Arc;
 
 use nitr_core::{Error, Result};
 use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::pem::PemObject as _;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem};
 
 use crate::config::TlsConfig;
 
@@ -140,9 +141,12 @@ fn protocol_versions(
 }
 
 /// Every `CERTIFICATE` block in the PEM, in file order (leaf first).
+///
+/// Parsed with `rustls-pki-types`' own PEM support (the `PemObject`
+/// trait), not the retired `rustls-pemfile` wrapper around the same code
+/// (RUSTSEC-2025-0134).
 fn parse_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
-    let mut reader = std::io::BufReader::new(pem);
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_slice_iter(pem)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|err| Error::Config(format!("the certificate PEM is malformed: {err}")))?;
     if certs.is_empty() {
@@ -157,17 +161,18 @@ fn parse_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
 
 /// The first private key in the PEM, in any of the three encodings
 /// openssl and the ACME clients emit (PKCS#8, PKCS#1, SEC1).
-fn parse_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
-    let mut reader = std::io::BufReader::new(pem);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|err| Error::Config(format!("the private key PEM is malformed: {err}")))?
-        .ok_or_else(|| {
-            Error::Config(
-                "the key file holds no private key block: expected PRIVATE KEY, RSA \
-                 PRIVATE KEY or EC PRIVATE KEY"
-                    .into(),
-            )
-        })
+fn parse_key(pem_bytes: &[u8]) -> Result<PrivateKeyDer<'static>> {
+    PrivateKeyDer::from_pem_slice(pem_bytes).map_err(|err| match err {
+        // Absence and malformedness get different messages: the first is
+        // the wrong file (a certificate passed twice), the second a
+        // damaged one, and the operator's next step differs.
+        pem::Error::NoItemsFound => Error::Config(
+            "the key file holds no private key block: expected PRIVATE KEY, RSA \
+             PRIVATE KEY or EC PRIVATE KEY"
+                .into(),
+        ),
+        err => Error::Config(format!("the private key PEM is malformed: {err}")),
+    })
 }
 
 fn require<'a>(path: Option<&'a Path>, key: &str) -> Result<&'a Path> {
