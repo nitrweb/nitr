@@ -388,6 +388,10 @@ function nitr.log.error(msg, fields) end
 ---Crypto primitives (RustCrypto): compose them; never reimplement them in Lua. (std feature: `crypto`)
 nitr.crypto = {}
 
+---The password cap (1024 bytes): password_hash raises above it, password_verify answers a plain false. Read it to size a registration field — `#pw > nitr.crypto.max_password_bytes` is the pre-check that turns password_hash's error into a 400.
+---@type integer
+nitr.crypto.max_password_bytes = nil
+
 ---SHA-256 digest, lowercase hex.
 ---@param data string
 ---@return string
@@ -410,16 +414,22 @@ function nitr.crypto.random_bytes(n) end
 ---@return boolean
 function nitr.crypto.constant_time_eq(a, b) end
 
----argon2id hash for storage.
----@param password string
+---argon2id hash for storage (m=19456, t=2, p=1). Also available as `nitr hash-password`.
+---@param password string At most 1024 bytes; longer is an error, never a silent truncation.
 ---@return string
 function nitr.crypto.password_hash(password) end
 
----Verifies a password against a stored hash.
+---Verifies a password against a stored hash. Total on login input: no password, whatever its size, makes it raise.
 ---@param password string
 ---@param hash string
----@return boolean
+---@return boolean _ Whether the password matches.
+---@return string|nil _ Set only when the *stored hash* is unusable (bcrypt, truncated, absurd parameters) — nil for an ordinary wrong password, including one over `max_password_bytes` (answered false before argon2 runs, never an error).
 function nitr.crypto.password_verify(password, hash) end
+
+---Spends one argon2 hash against a process-private decoy and returns false. Call it on the no-such-user branch of a login: skipping the hash there leaks your user list through response time.
+---@param password string
+---@return boolean _ Always false.
+function nitr.crypto.password_verify_dummy(password) end
 
 ---Authenticated encryption (XChaCha20-Poly1305); printable token.
 ---@param key string Exactly 32 bytes.

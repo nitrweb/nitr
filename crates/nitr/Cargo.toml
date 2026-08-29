@@ -38,6 +38,7 @@ all = [
     "fetch",
     "multipart",
     "template",
+    "tls",
 ]
 
 # `nitr.crypto` / `nitr.auth`: argon2 passwords, constant-time comparison.
@@ -54,6 +55,8 @@ template = ["nitr-http/template"]
 compression = ["nitr-http/compression"]
 # `req:multipart(fn)`: streaming file uploads.
 multipart = ["nitr-http/multipart"]
+# `[tls]`: inbound TLS termination with rustls over the `ring` provider.
+tls = ["nitr-http/tls"]
 
 # Explicit targets so `cargo test`/`cargo build --examples` skip whatever
 # the selected feature set cannot build, instead of failing. Everything not
@@ -66,6 +69,11 @@ path = "src/lib.rs"
 name = "async_db"
 path = "tests/async_db.rs"
 required-features = ["db", "fetch"]
+
+[[test]]
+name = "auth"
+path = "tests/auth.rs"
+required-features = ["crypto"]
 
 [[test]]
 name = "data_io"
@@ -87,10 +95,20 @@ name = "stdlib"
 path = "tests/stdlib.rs"
 required-features = ["crypto"]
 
+[[test]]
+name = "tls"
+path = "tests/tls.rs"
+required-features = ["tls"]
+
 [[example]]
 name = "aggregate"
 path = "examples/aggregate/main.rs"
 required-features = ["db", "fetch"]
+
+[[example]]
+name = "basic-auth"
+path = "examples/basic-auth/main.rs"
+required-features = ["crypto"]
 
 [[example]]
 name = "data-io"
@@ -106,6 +124,11 @@ required-features = ["compression", "multipart"]
 name = "stdlib"
 path = "examples/stdlib/main.rs"
 required-features = ["crypto", "fetch"]
+
+[[example]]
+name = "tls"
+path = "examples/tls/main.rs"
+required-features = ["tls"]
 
 # Benchmarks. `harness = false` because divan brings its own runner instead
 # of libtest's. The builtins each target needs are compiled in
@@ -140,10 +163,16 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 rusqlite = { workspace = true }
 mlua = { workspace = true }
+# The TLS example and the `tls` integration test mint their own
+# self-signed certificate at run time; no key material is committed.
+rcgen = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
+# Examples log through `tracing`, never `println!`, so their output goes
+# through the same subscriber the server's own diagnostics do.
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [package.metadata.docs.rs]

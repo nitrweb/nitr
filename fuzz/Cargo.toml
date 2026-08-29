@@ -24,7 +24,12 @@ libfuzzer-sys = "0.4"
 # reach an IP-range `match` whose URL parsing lives upstream in the `url`
 # crate, which is fuzzed by its own maintainers.
 nitr-std = { path = "../crates/nitr-std", features = ["crypto"] }
-nitr-http = { path = "../crates/nitr-http", features = ["multipart", "compression"] }
+nitr-http = { path = "../crates/nitr-http", features = ["multipart", "compression", "tls"] }
+# The `tls_pem` target needs one valid certificate/key pair as its
+# control — a fuzzer will never synthesize one, and committing a real one
+# would put private key material in the repository. It is minted once per
+# process instead.
+rcgen = "0.14"
 mlua = { version = "0.12", features = ["lua54", "vendored", "serialize", "send"] }
 tokio = { version = "1", features = ["rt", "fs"] }
 bytes = "1"
@@ -128,6 +133,20 @@ bench = false
 [[bin]]
 name = "conditional_headers"
 path = "fuzz_targets/conditional_headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls_pem"
+path = "fuzz_targets/tls_pem.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "basic_auth"
+path = "fuzz_targets/basic_auth.rs"
 test = false
 doc = false
 bench = false

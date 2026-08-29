@@ -71,6 +71,10 @@ pub struct TableEntry {
     /// Dot-style members (`nitr.time.now`).
     #[serde(default)]
     pub functions: Vec<Member>,
+    /// Plain data members (`nitr.crypto.max_password_bytes`): constants a
+    /// script reads rather than calls.
+    #[serde(default)]
+    pub fields: Vec<Field>,
 }
 
 #[derive(Deserialize)]
@@ -121,6 +125,9 @@ impl Api {
             out.insert(t.name.clone());
             for m in t.methods.iter().chain(&t.functions) {
                 out.insert(format!("{}.{}", t.name, m.name));
+            }
+            for field in &t.fields {
+                out.insert(format!("{}.{}", t.name, field.name));
             }
         }
         out
@@ -264,6 +271,15 @@ pub fn emit_types(api: &Api) -> String {
             feature_note(&t.feature),
             t.name
         ));
+        // Data members before the callables, the way a reader meets them.
+        // The placeholder value is never the point — `---@type` is what
+        // the language server reads; the real value lives server-side.
+        for field in &t.fields {
+            out.push_str(&format!(
+                "---{}\n---@type {}\n{}.{} = nil\n\n",
+                field.desc, field.ty, t.name, field.name
+            ));
+        }
         for m in &t.methods {
             emit_fn(&mut out, &t.name, m, ':');
         }
@@ -358,7 +374,13 @@ pub fn emit_docs(api: &Api) -> String {
                 m.desc
             ));
         }
-        if !t.methods.is_empty() || !t.functions.is_empty() {
+        for field in &t.fields {
+            out.push_str(&format!(
+                "- `{}.{}: {}` — {}\n",
+                t.name, field.name, field.ty, field.desc
+            ));
+        }
+        if !t.methods.is_empty() || !t.functions.is_empty() || !t.fields.is_empty() {
             out.push('\n');
         }
     }

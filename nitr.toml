@@ -112,6 +112,27 @@ path = "scripts/file.db"
                               # the server refuses to start if it is
 #max_age = 86400              # seconds a browser may cache the preflight
 
+# Inbound TLS termination (needs the `tls` Cargo feature; rustls over the
+# `ring` provider). Off by default and never inferred from a certificate
+# lying around: turning a port from plaintext to TLS is a decision.
+#
+# Both paths are required once `enabled = true`, and both are read exactly
+# once, at startup — a half-configured or mismatched pair refuses to boot
+# instead of failing every handshake on a port traffic already points at.
+# A renewed certificate therefore takes effect on restart; SIGHUP reloads
+# the Lua pool, not the certificate.
+#
+# The key path is NOT re-anchored by `nitr build`: a private key inside a
+# copyable one-file artifact is a private key that leaks with it. Keep it
+# external, like the database.
+#[tls]
+#enabled = true
+#cert = "/etc/nitr/tls/fullchain.pem"  # PEM: leaf first, then intermediates
+#key = "/etc/nitr/tls/privkey.pem"     # PEM: PKCS#8, PKCS#1 or SEC1
+#min_version = "1.2"          # "1.2" (default) or "1.3". 1.2 is the floor:
+                              # TLS 1.0/1.1 are deprecated (RFC 8996) and
+                              # cannot be selected under any spelling
+
 # Graceful shutdown. On SIGTERM/SIGINT the server stops accepting, stops
 # reporting ready, lets in-flight work finish, and only then exits. A drain
 # that runs out of time exits non-zero, because a cut request is not a clean

@@ -10,6 +10,8 @@
 //! Primitives, not a framework: everything is implemented in Rust
 //! (RustCrypto), and scripts compose them into their own auth flows.
 
+use std::sync::OnceLock;
+
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher as _, PasswordVerifier as _, SaltString};
 use base64::Engine as _;
@@ -25,6 +27,57 @@ use subtle::ConstantTimeEq as _;
 /// key/nonce/token, small enough that a script cannot use it as an
 /// allocation amplifier.
 const MAX_RANDOM_BYTES: usize = 64 * 1024;
+
+/// Upper bound on a password handed to `password_hash`/`password_verify`,
+/// in the same spirit as [`MAX_RANDOM_BYTES`]: a bound a real credential
+/// never notices and a hostile caller cannot step over.
+///
+/// Argon2 hashes its input in full, so without a cap any login form is a
+/// remote amplifier — one POST body of a few megabytes buys an attacker a
+/// worker thread pinned at 19 MiB of scratch memory plus a full pass over
+/// those megabytes, and nothing about it looks like an attack. The cap is
+/// checked *before* any argon2 work, so an oversized password costs a
+/// length comparison.
+///
+/// 1 KiB is deliberately generous. NIST SP 800-63B asks that verifiers
+/// accept passwords of at least 64 characters; a 1024-byte passphrase is
+/// an order of magnitude past that and still far below anything worth
+/// spending CPU on. (This is *not* a bcrypt-style truncation guard —
+/// bcrypt hashes cannot reach this verifier at all, since `$2b$`/`$2y$`
+/// fails PHC parsing. Nothing here silently shortens a password.)
+///
+/// The two sides of the cap answer differently, on purpose.
+/// `password_hash` raises — a credential that cannot be stored must fail
+/// loudly, at registration, where the user is present to be told.
+/// `password_verify` and the dummy verify answer a plain `false, nil` —
+/// no stored hash was ever minted from a password this long, so it is
+/// simply a credential that cannot match; raising there made every
+/// oversized login POST a 500 unless the handler pre-checked the length
+/// itself, and a *reason* there would hand strangers a log-spam lever
+/// through the `if problem then log` pattern. Scripts that want a
+/// pre-check anyway read the cap as `nitr.crypto.max_password_bytes`.
+const MAX_PASSWORD_BYTES: usize = 1024;
+
+/// Ceilings on the argon2 parameters Nitr honors in a *stored* hash.
+///
+/// A PHC hash is data, and it names the cost of its own verification:
+/// `$argon2id$v=19$m=4194304,t=2,p=1$…` asks the verifier for 4 GiB before
+/// it can answer "wrong password". The format's own limits are no help —
+/// `Params::MAX_M_COST` is `u32::MAX` KiB (4 TiB) and `MAX_T_COST` is
+/// `u32::MAX` — and the parameters come from the hash, not from
+/// `Argon2::default()`, so whatever is in the row is what runs.
+///
+/// Nitr's own hashes are m=19456, t=2, p=1. These ceilings are ~13x that
+/// memory and 4x that time — well past every OWASP-recommended argon2id
+/// configuration (the strongest is m=47104, t=1), so a deployment that
+/// migrates to stronger parameters still verifies — while bounding one
+/// verification at roughly 256 MiB and a few seconds instead of letting a
+/// database row decide. RFC 9106's 2 GiB variant is deliberately outside
+/// this: a per-request login check cannot afford it, and refusing it with
+/// a reason beats discovering it as an OOM.
+const MAX_HASH_MEMORY_KIB: u32 = 256 * 1024;
+const MAX_HASH_TIME_COST: u32 = 8;
+const MAX_HASH_LANES: u32 = 8;
 
 /// The RNG/password-hash error types have no `std::error::Error` impl
 /// here, so their `Display` is carried over manually.
@@ -92,16 +145,13 @@ pub fn create_crypto_table(lua: &Lua) -> mlua::Result<Table> {
 
     crypto.set(
         "password_hash",
-        lua.create_function(|_, password: LuaString| {
-            let mut salt = [0u8; 16];
-            getrandom::getrandom(&mut salt).map_err(rng_err)?;
-            let salt = SaltString::encode_b64(&salt).map_err(pw_err)?;
-            let hash = Argon2::default()
-                .hash_password(&password.as_bytes(), &salt)
-                .map_err(pw_err)?;
-            Ok(hash.to_string())
-        })?,
+        lua.create_function(|_, password: LuaString| hash_password(&password.as_bytes()))?,
     )?;
+
+    // The cap, as data, so a registration form can size its field with
+    // `#password > nitr.crypto.max_password_bytes` instead of copying a
+    // magic 1024 that would silently drift if the cap ever changed.
+    crypto.set("max_password_bytes", MAX_PASSWORD_BYTES)?;
 
     // AEAD (XChaCha20-Poly1305): authenticated encryption for data handed
     // to a client. `seal` returns a printable token; `open` returns nil on
@@ -167,16 +217,66 @@ pub fn create_crypto_table(lua: &Lua) -> mlua::Result<Table> {
 
     crypto.set("jwt", create_jwt_table(lua)?)?;
 
+    // password_verify(password, hash) -> ok, nil | false, reason
+    //
+    // The boolean is the answer a caller branches on and stays the same
+    // shape it always was. The second value is the diagnostic that was
+    // missing: `false, nil` is a wrong password, `false, reason` is a
+    // stored hash that can *never* verify — a bcrypt row pasted in during
+    // a migration, a truncated column, a parameter set that would
+    // allocate the machine away. Without it those are the same 401
+    // forever, with nothing anywhere saying why. Same precedent as
+    // `jwt.verify`: nil-plus-reason on the failure path.
     crypto.set(
         "password_verify",
-        lua.create_function(|_, (password, hash): (LuaString, String)| {
-            let Ok(parsed) = PasswordHash::new(&hash) else {
-                return Ok(false);
-            };
-            Ok(Argon2::default()
-                .verify_password(&password.as_bytes(), &parsed)
-                .is_ok())
+        lua.create_function(|lua, (password, hash): (LuaString, String)| {
+            let password = password.as_bytes();
+            // Over the cap is answered, not raised: no stored hash was
+            // ever minted from a password this long (`password_hash`
+            // refuses them), so it is a credential that cannot match —
+            // decided by a length comparison before argon2 ever runs,
+            // which is the DoS guard. Answering keeps the naive handler
+            // correct out of the box; raising here turned every oversized
+            // login POST into a 500 unless the handler pre-checked the
+            // length itself.
+            //
+            // `false, nil`, not `false, <reason>`: the reason channel's
+            // contract is "the stored row is at fault, log it" — a length
+            // overrun is attacker input, and a reason here would turn the
+            // taught `if problem then log` pattern into a free log-spam
+            // primitive. Debug tracing covers the one legitimate case (a
+            // user with a genuinely enormous passphrase) without giving
+            // strangers a lever.
+            if password.len() > MAX_PASSWORD_BYTES {
+                tracing::debug!(
+                    bytes = password.len(),
+                    "password_verify: over the {MAX_PASSWORD_BYTES}-byte cap, answered false \
+                     before hashing"
+                );
+                return Ok((false, Value::Nil));
+            }
+            match parse_stored_hash(&hash) {
+                Err(reason) => reject_hash(lua, &hash, reason),
+                Ok(parsed) => match Argon2::default().verify_password(&password, &parsed) {
+                    Ok(()) => Ok((true, Value::Nil)),
+                    // `Error::Password` is the one benign outcome: a
+                    // well-formed argon2 hash that this password does not
+                    // match. Everything else is the hash's fault, and the
+                    // guards above have already ruled out the cases the
+                    // verifier itself reports as `Password`.
+                    Err(argon2::password_hash::Error::Password) => Ok((false, Value::Nil)),
+                    Err(_) => reject_hash(lua, &hash, "unusable hash"),
+                },
+            }
         })?,
+    )?;
+
+    // The other half of a login: what to do when the *user* does not
+    // exist. See `dummy_verify` for why a handler that skips the hash
+    // comparison in that case leaks its user list.
+    crypto.set(
+        "password_verify_dummy",
+        lua.create_function(|_, password: LuaString| dummy_verify(&password.as_bytes()))?,
     )?;
 
     Ok(crypto)
@@ -199,6 +299,190 @@ fn aead_cipher(key: &LuaString) -> mlua::Result<XChaCha20Poly1305> {
     Ok(<XChaCha20Poly1305 as chacha20poly1305::KeyInit>::new(
         key.as_ref().into(),
     ))
+}
+
+/// Every reason `password_verify` can return as its second value. A
+/// closed set, like `jwt.verify`'s: a reason outside it means the failure
+/// path grew a case nobody wrote down. Re-exported through
+/// `nitr_std::fuzzing` so the fuzz target checks the real list rather
+/// than a copy of it.
+///
+/// Every entry means the *stored hash* can never verify anything — the
+/// contract of the reason channel is "the row is at fault; log it". An
+/// over-cap *submitted* password is deliberately NOT in this set: it
+/// answers a plain `false, nil` (see [`MAX_PASSWORD_BYTES`]), because a
+/// reason a stranger can trigger at will would turn the natural
+/// `if problem then log` handler into a log-spam primitive.
+pub const VERIFY_REASONS: &[&str] = &[
+    "unsupported hash format",
+    "incomplete hash",
+    "unsupported hash algorithm",
+    "hash parameters out of range",
+    "unusable hash",
+];
+
+/// Refuses a password past [`MAX_PASSWORD_BYTES`] before any argon2 work.
+///
+/// The *hash-side* guard: minting is the one place over-long must be an
+/// error, because silently truncating would weaken a credential nobody
+/// asked to weaken, and a `nil` would surface as a confusing failure two
+/// calls later. Registration handlers that would rather answer 400 than
+/// 500 pre-check against `nitr.crypto.max_password_bytes`. The verify
+/// side does not use this — see [`MAX_PASSWORD_BYTES`] for why it answers
+/// `false` instead.
+fn check_password_len(password: &[u8]) -> mlua::Result<()> {
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(mlua::Error::RuntimeError(format!(
+            "password must be at most {MAX_PASSWORD_BYTES} bytes, got {} — argon2 \
+             hashes the whole input, so check the field length (nitr.validate) \
+             before hashing and answer 400 instead of burning a worker",
+            password.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Hashes a password with `Argon2::default()`: argon2id, v19, m=19456 KiB,
+/// t=2, p=1, 32-byte output — OWASP's second recommended configuration.
+///
+/// The single place those parameters are chosen. `nitr hash-password`
+/// reaches this through the same Lua function a handler calls, so an
+/// operator-generated credential cannot drift from what the server
+/// verifies.
+fn hash_password(password: &[u8]) -> mlua::Result<String> {
+    check_password_len(password)?;
+    let mut salt = [0u8; 16];
+    getrandom::getrandom(&mut salt).map_err(rng_err)?;
+    let salt = SaltString::encode_b64(&salt).map_err(pw_err)?;
+    Ok(Argon2::default()
+        .hash_password(password, &salt)
+        .map_err(pw_err)?
+        .to_string())
+}
+
+/// Parses a stored hash, or names why it can never verify anything.
+///
+/// The checks the verifier does not do for us, in order:
+///
+/// * PHC parsing. bcrypt (`$2b$`, `$2y$`), md5crypt (`$1$`) and
+///   sha512crypt (`$6$`) all fail here — the exact case an operator hits
+///   mid-migration.
+/// * A missing salt or output segment. This one matters most: the
+///   `PasswordVerifier` blanket impl answers `Error::Password` for a hash
+///   with no output, so a truncated column would otherwise be reported as
+///   "wrong password" forever.
+/// * The algorithm identifier: a PHC string naming scrypt or pbkdf2
+///   parses fine and is not something this verifier can check.
+/// * The cost parameters, against the ceilings above.
+fn parse_stored_hash(hash: &str) -> Result<PasswordHash<'_>, &'static str> {
+    let parsed = PasswordHash::new(hash).map_err(|_| "unsupported hash format")?;
+    if parsed.salt.is_none() || parsed.hash.is_none() {
+        return Err("incomplete hash");
+    }
+    argon2::Algorithm::try_from(parsed.algorithm).map_err(|_| "unsupported hash algorithm")?;
+    let params = argon2::Params::try_from(&parsed).map_err(|_| "unusable hash")?;
+    if params.m_cost() > MAX_HASH_MEMORY_KIB
+        || params.t_cost() > MAX_HASH_TIME_COST
+        || params.p_cost() > MAX_HASH_LANES
+    {
+        return Err("hash parameters out of range");
+    }
+    Ok(parsed)
+}
+
+/// Logs an unusable stored hash and returns `false` plus its reason.
+///
+/// The hash never reaches the log — only its PHC algorithm identifier,
+/// which is public metadata (`2b`, `scrypt`, `argon2id`) and the one
+/// piece that tells an operator which migration left the row behind.
+fn reject_hash(lua: &Lua, hash: &str, reason: &'static str) -> mlua::Result<(bool, Value)> {
+    debug_assert!(
+        VERIFY_REASONS.contains(&reason),
+        "undeclared password_verify reason {reason:?}"
+    );
+    tracing::warn!(
+        reason,
+        algorithm = hash_ident(hash),
+        "password_verify: the stored hash cannot be verified, so this login can \
+         never succeed — re-hash the credential with nitr.crypto.password_hash \
+         (or `nitr hash-password`)"
+    );
+    Ok((false, Value::String(lua.create_string(reason)?)))
+}
+
+/// The PHC algorithm identifier of a stored hash, for the log line.
+/// Bounded and filtered: the value is whatever the database held, and a
+/// log field is not the place to find that out.
+fn hash_ident(hash: &str) -> &str {
+    match hash.split('$').nth(1) {
+        Some(ident)
+            if (1..=32).contains(&ident.len())
+                && ident
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-') =>
+        {
+            ident
+        }
+        _ => "unknown",
+    }
+}
+
+/// The decoy hash [`dummy_verify`] compares against.
+///
+/// Built once per process from OS entropy and never stored anywhere, so
+/// no caller can supply the password that matches it: the dummy verify is
+/// structurally incapable of returning true.
+static DECOY_HASH: OnceLock<String> = OnceLock::new();
+
+/// Spends the same argon2 work a real verification costs, and answers
+/// `false`.
+///
+/// This closes the user-enumeration oracle, which is compositional rather
+/// than a flaw in any primitive here. The natural handler —
+///
+/// ```lua
+/// local row = nitr.db:query_row("select ... where email = ?", { email })
+/// if not row then return unauthorized() end
+/// if not nitr.crypto.password_verify(pass, row.password_hash) then ... end
+/// ```
+///
+/// — answers in microseconds for an address nobody registered and in
+/// ~26 ms for one that exists. That thousandfold gap is measurable across
+/// a network by an unauthenticated client, and it turns a login form into
+/// a query interface over the user list. Calling this on the
+/// no-such-user path makes both branches cost one argon2 hash.
+///
+/// The *submitted* password is hashed, not a fixed placeholder: argon2's
+/// cost grows with the input, so hashing anything else would leave a
+/// smaller version of the same difference behind.
+///
+/// The decoy is built lazily, so the first unknown-user request in a
+/// process pays for two hashes instead of one. That is one sample of
+/// noise, not an oracle — and the alternative, an unconditional 26 ms at
+/// every state build, is a real cost for every deployment that never
+/// calls this.
+fn dummy_verify(password: &[u8]) -> mlua::Result<bool> {
+    // Symmetric with `password_verify`'s over-cap answer: `false` before
+    // any argon2 work. The short-circuit depends only on the submitted
+    // password's own length, and it fires identically on the known-user
+    // and no-such-user branches of a login, so it leaks nothing about
+    // which branch ran.
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Ok(false);
+    }
+    let decoy = match DECOY_HASH.get() {
+        Some(decoy) => decoy.as_str(),
+        None => {
+            let mut secret = [0u8; 32];
+            getrandom::getrandom(&mut secret).map_err(rng_err)?;
+            let hash = hash_password(&secret)?;
+            DECOY_HASH.get_or_init(|| hash).as_str()
+        }
+    };
+    let parsed = PasswordHash::new(decoy).map_err(pw_err)?;
+    // Always false: matching would mean guessing 32 bytes of OS entropy
+    // that never left this process.
+    Ok(Argon2::default().verify_password(password, &parsed).is_ok())
 }
 
 /// The HMAC algorithms `nitr.crypto.jwt` supports. Asymmetric algorithms
@@ -378,7 +662,7 @@ fn create_jwt_table(lua: &Lua) -> mlua::Result<Table> {
 /// Builds the `nitr.auth` table: `basic(req)` returns `user, pass` (or
 /// `nil`) and `bearer(req)` returns the token (or `nil`). Both accept the
 /// request object or the raw `Authorization` header value.
-pub(crate) fn create_auth_table(lua: &Lua) -> mlua::Result<Table> {
+pub fn create_auth_table(lua: &Lua) -> mlua::Result<Table> {
     let auth = lua.create_table()?;
 
     auth.set(
@@ -464,25 +748,212 @@ mod tests {
         assert_eq!(scheme_value("Basic abc", "bearer"), None);
     }
 
+    /// `password_hash`, `password_verify` and `password_verify_dummy` off
+    /// one crypto table, for the tests below.
+    fn password_fns(lua: &Lua) -> (mlua::Function, mlua::Function, mlua::Function) {
+        let crypto = create_crypto_table(lua).expect("crypto table");
+        (
+            crypto.get("password_hash").expect("password_hash"),
+            crypto.get("password_verify").expect("password_verify"),
+            crypto
+                .get("password_verify_dummy")
+                .expect("password_verify_dummy"),
+        )
+    }
+
     #[test]
     fn passwords_hash_and_verify() {
         let lua = Lua::new();
-        let crypto = create_crypto_table(&lua).expect("crypto table");
-        let hash: String = crypto
-            .get::<mlua::Function>("password_hash")
-            .expect("fn")
-            .call("hunter2")
-            .expect("hash");
+        let (hash_fn, verify, _) = password_fns(&lua);
+        let hash: String = hash_fn.call("hunter2").expect("hash");
         assert!(hash.starts_with("$argon2id$"), "got: {hash}");
 
-        let verify: mlua::Function = crypto.get("password_verify").expect("fn");
-        assert!(verify.call::<bool>(("hunter2", hash.clone())).expect("ok"));
-        assert!(!verify.call::<bool>(("wrong", hash)).expect("ok"));
-        assert!(
-            !verify
-                .call::<bool>(("hunter2", "not-a-hash".to_string()))
-                .expect("ok")
+        // A correct password verifies, with no reason attached.
+        let (ok, why): (bool, Option<String>) =
+            verify.call(("hunter2", hash.clone())).expect("verify");
+        assert!(ok);
+        assert_eq!(why, None);
+
+        // A wrong password against a usable hash is `false, nil`: the
+        // absent reason is what says "the hash was fine".
+        let (ok, why): (bool, Option<String>) = verify.call(("wrong", hash)).expect("verify");
+        assert!(!ok);
+        assert_eq!(why, None);
+
+        // The old single-value call shape still works — callers written
+        // against `local ok = password_verify(...)` must not break.
+        let hash: String = hash_fn.call("hunter2").expect("hash");
+        assert!(verify.call::<bool>(("hunter2", hash)).expect("verify"));
+    }
+
+    /// Every stored hash Nitr cannot verify names *why*, instead of being
+    /// reported as a wrong password forever. The bcrypt/md5crypt/
+    /// sha512crypt rows are the migration case that motivated this.
+    #[test]
+    fn an_unusable_stored_hash_is_distinguishable_from_a_wrong_password() {
+        let lua = Lua::new();
+        let (_, verify, _) = password_fns(&lua);
+
+        for (stored, expected) in [
+            // bcrypt: `$2b$`/`$2y$` never reach the argon2 verifier —
+            // PHC parsing rejects the salt segment first.
+            (
+                "$2b$12$K3JNi5tR9lHnKKfKzXBDUuJ7dK1nGVX8UEcqfQe5NRaTZY0aWkNSe",
+                "unsupported hash format",
+            ),
+            (
+                "$2y$10$abcdefghijklmnopqrstuv0123456789012345678901234567890",
+                "unsupported hash format",
+            ),
+            ("$1$salt$qJH7.N4xYta3aEG/dfqo/0", "unsupported hash format"),
+            (
+                "$6$salt$IxDD3jeSOb5eB1CX5LBsqZFVkJdido3OUILO5Ifz5iwMuTS4XMS130MTSuDDl3aCI6WouIL9AjRbLCelDCy.g.",
+                "unsupported hash format",
+            ),
+            ("not-a-hash", "unsupported hash format"),
+            ("", "unsupported hash format"),
+            // Parses as PHC, names an algorithm this verifier is not.
+            (
+                "$scrypt$ln=16,r=8,p=1$aM15713r3Xsvxbi31lqr1Q$nFNh2CVHVjNldFVKDHDlm4CmdRSCdEBsjjJxD+iCs5E",
+                "unsupported hash algorithm",
+            ),
+            // Well-formed argon2id, but the salt/output segments are gone.
+            // The blanket `PasswordVerifier` impl reports this as
+            // `Error::Password` — i.e. as a wrong password — which is
+            // exactly the silent dead end this check exists to stop.
+            ("$argon2id$v=19$m=19456,t=2,p=1", "incomplete hash"),
+            (
+                "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ",
+                "incomplete hash",
+            ),
+            // A row that would ask the verifier for 4 GiB before it could
+            // answer "wrong password".
+            (
+                "$argon2id$v=19$m=4194304,t=2,p=1$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG",
+                "hash parameters out of range",
+            ),
+            (
+                "$argon2id$v=19$m=19456,t=4294967295,p=1$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG",
+                "hash parameters out of range",
+            ),
+            // An unknown PHC parameter name, and an unknown version.
+            (
+                "$argon2id$v=19$m=19456,t=2,p=1,zz=9$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG",
+                "unusable hash",
+            ),
+            (
+                "$argon2id$v=99$m=19456,t=2,p=1$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG",
+                "unusable hash",
+            ),
+        ] {
+            let (ok, why): (bool, Option<String>) =
+                verify.call(("hunter2", stored)).expect("verify");
+            assert!(!ok, "{stored:?} verified");
+            assert_eq!(why.as_deref(), Some(expected), "for {stored:?}");
+            assert!(
+                VERIFY_REASONS.contains(&expected),
+                "{expected:?} is not in VERIFY_REASONS"
+            );
+        }
+
+        // The other side of the line: a *usable* argon2 hash at the
+        // format's minimum cost is a wrong password (`false, nil`), not a
+        // complaint about the hash. Weak parameters are a policy question
+        // for whoever wrote the row, not a verification failure — and the
+        // fuzz target leans on this entry to reach the KDF cheaply.
+        let (ok, why): (bool, Option<String>) = verify
+            .call((
+                "hunter2",
+                "$argon2id$v=19$m=8,t=1,p=1$mHVoGfzni7/d60QmEsVJlw$\
+                 7rFvapCGZeh96Zf4R2I/pEVmV2YRWxfl6xo5yGL3F6Q",
+            ))
+            .expect("verify");
+        assert!(!ok);
+        assert_eq!(why, None);
+
+        // The identifier that goes into the log line, and nothing else.
+        assert_eq!(
+            hash_ident("$argon2id$v=19$m=8,t=1,p=1$c2E$aGFzaA"),
+            "argon2id"
         );
+        assert_eq!(hash_ident("$2b$12$xxxx"), "2b");
+        assert_eq!(hash_ident("not-a-hash"), "unknown");
+        assert_eq!(hash_ident("$$empty"), "unknown");
+        assert_eq!(hash_ident(&format!("${}$x", "a".repeat(33))), "unknown");
+        assert_eq!(hash_ident("$argon2 id$x"), "unknown");
+    }
+
+    /// The cap exists so a login form cannot be used as a CPU/memory
+    /// amplifier. Checked at the boundary and one byte past it, on every
+    /// entry point that hashes.
+    #[test]
+    fn oversized_passwords_are_refused_before_any_argon2_work() {
+        let lua = Lua::new();
+        let (hash_fn, verify, dummy) = password_fns(&lua);
+
+        let at_cap = "x".repeat(MAX_PASSWORD_BYTES);
+        let over_cap = "x".repeat(MAX_PASSWORD_BYTES + 1);
+
+        let hash: String = hash_fn
+            .call(at_cap.clone())
+            .expect("a 1 KiB password hashes");
+        assert!(verify.call::<bool>((at_cap.clone(), hash)).expect("verify"));
+        assert!(!dummy.call::<bool>(at_cap).expect("dummy"));
+
+        let err = hash_fn
+            .call::<String>(over_cap.clone())
+            .expect_err("1 KiB + 1 byte must not hash");
+        assert!(
+            err.to_string().contains("at most 1024 bytes"),
+            "unhelpful error: {err}"
+        );
+        // Verification and the decoy verify are capped too — an attacker
+        // reaches those without ever registering — but they *answer*
+        // rather than raise, so the naive login handler is safe out of
+        // the box: an oversized POST is a 401, not a 500. And they answer
+        // `false, nil`, not a reason: the reason channel means "the row
+        // is at fault, log it", and this trigger is attacker input. The
+        // stored hash here is malformed on purpose — the length check
+        // must win, or an oversized password would still warn about the
+        // row.
+        let (ok, why): (bool, Option<String>) = verify
+            .call((over_cap.clone(), "$argon2id$"))
+            .expect("an over-cap password answers, it does not raise");
+        assert!(!ok);
+        assert_eq!(why, None, "an over-cap password is an ordinary miss");
+        assert!(!dummy.call::<bool>(over_cap).expect("dummy answers false"));
+
+        // The cap is data a script can read, and it matches the enforced
+        // constant — a drifted copy would send registration forms a 400
+        // at the wrong boundary.
+        let published: usize = create_crypto_table(&lua)
+            .expect("crypto table")
+            .get("max_password_bytes")
+            .expect("max_password_bytes");
+        assert_eq!(published, MAX_PASSWORD_BYTES);
+    }
+
+    /// The equal-cost unknown-user path. The value assertion is cheap; the
+    /// timing property it exists for is argued in `dummy_verify`'s docs
+    /// and demonstrated in `examples/basic-auth`.
+    #[test]
+    fn the_dummy_verify_is_always_false_and_costs_a_real_hash() {
+        let lua = Lua::new();
+        let (_, _, dummy) = password_fns(&lua);
+
+        for password in ["", "hunter2", "\0\u{feff}ñ", &"x".repeat(512)] {
+            assert!(!dummy.call::<bool>(password).expect("dummy"));
+        }
+
+        // The decoy is one process-wide hash with the same parameters a
+        // real credential gets — that identity is what makes the two login
+        // branches cost the same.
+        let decoy = DECOY_HASH.get().expect("built by the calls above");
+        assert!(
+            decoy.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
+            "{decoy}"
+        );
+        assert!(parse_stored_hash(decoy).is_ok());
     }
 
     #[test]
@@ -736,6 +1207,138 @@ mod tests {
         assert!(eq.call::<bool>(("same", "same")).expect("eq"));
         assert!(!eq.call::<bool>(("same", "diff")).expect("eq"));
         assert!(!eq.call::<bool>(("same", "longer-value")).expect("eq"));
+    }
+
+    proptest::proptest! {
+        // Eight cases, not the 48 the cheap properties use: every case
+        // runs argon2id three times at 19 MiB and ~26 ms each. The
+        // invariant is not statistical — one wrong answer would be a
+        // catastrophe, not a rare event — so what matters is that odd
+        // inputs (empty, NUL-bearing, non-UTF-8, at the cap) reach it at
+        // all. The fuzz target supplies the volume.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(8))]
+
+        /// Property: every password within the cap verifies against its
+        /// own hash and against no other password's, with no reason
+        /// attached either way — a reason means the *hash* was at fault,
+        /// and a hash this module just produced never is.
+        #[test]
+        fn prop_password_round_trips_and_rejects_every_other_password(
+            password in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..96),
+            other in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..96),
+        ) {
+            let lua = Lua::new();
+            let (hash_fn, verify, dummy) = password_fns(&lua);
+            let secret = lua.create_string(&password).expect("bytes");
+
+            let hash: String = hash_fn.call(&secret).expect("hash");
+            proptest::prop_assert!(hash.starts_with("$argon2id$"), "got: {}", hash);
+
+            let (ok, why): (bool, Option<String>) =
+                verify.call((&secret, hash.clone())).expect("verify");
+            proptest::prop_assert!(ok, "a password did not verify against its own hash");
+            proptest::prop_assert_eq!(why, None);
+
+            if other != password {
+                let wrong = lua.create_string(&other).expect("bytes");
+                let (ok, why): (bool, Option<String>) =
+                    verify.call((&wrong, hash)).expect("verify");
+                proptest::prop_assert!(!ok, "a different password verified");
+                proptest::prop_assert_eq!(why, None);
+            }
+
+            // The unknown-user path answers false for anything.
+            proptest::prop_assert!(!dummy.call::<bool>(&secret).expect("dummy"));
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(256))]
+
+        /// Property: a `Basic` header round-trips to exactly the
+        /// credentials it encodes, and every other scheme yields nothing
+        /// — the scheme is matched whole and case-insensitively, never as
+        /// a prefix.
+        #[test]
+        fn prop_basic_is_scheme_bound_and_round_trips(
+            scheme in proptest::sample::select(vec![
+                "Basic", "basic", "BASIC", "BaSiC",
+                "Bearer", "bearer", "Digest", "Negotiate", "", "Basicx", "asic",
+            ]),
+            user in "[^:\u{0}]{0,16}",
+            pass in "[ -~]{0,24}",
+            lead in proptest::sample::select(vec!["", " ", "  ", "\t"]),
+        ) {
+            let lua = Lua::new();
+            let auth = create_auth_table(&lua).expect("auth table");
+            let basic: mlua::Function = auth.get("basic").expect("basic");
+
+            let encoded = B64.encode(format!("{user}:{pass}"));
+            let header = format!("{lead}{scheme} {encoded}");
+            let (got_user, got_pass): (Option<String>, Option<String>) =
+                basic.call(header.as_str()).expect("basic never raises");
+
+            if scheme.eq_ignore_ascii_case("basic") {
+                proptest::prop_assert_eq!(got_user.as_deref(), Some(user.as_str()));
+                proptest::prop_assert_eq!(got_pass.as_deref(), Some(pass.as_str()));
+            } else {
+                proptest::prop_assert_eq!(got_user, None);
+                proptest::prop_assert_eq!(got_pass, None);
+            }
+        }
+
+        /// Property: `nitr.auth.basic` is total over arbitrary header
+        /// bytes — it never raises, never returns half a credential pair,
+        /// and whatever it does return really is the base64 the header
+        /// carried, under a scheme spelled `basic`.
+        #[test]
+        fn prop_arbitrary_authorization_headers_never_yield_credentials(
+            header in "[\u{0}-\u{7f}]{0,64}",
+        ) {
+            let lua = Lua::new();
+            let auth = create_auth_table(&lua).expect("auth table");
+            let basic: mlua::Function = auth.get("basic").expect("basic");
+            let bearer: mlua::Function = auth.get("bearer").expect("bearer");
+
+            let (user, pass): (Option<String>, Option<String>) = basic
+                .call(header.as_str())
+                .expect("basic never raises");
+            proptest::prop_assert_eq!(
+                user.is_some(),
+                pass.is_some(),
+                "half a credential pair for {:?}",
+                header
+            );
+
+            // The value a caller would have to trust, recomputed here:
+            // scheme split, trim, base64 decode, first-colon split.
+            let value = header
+                .trim()
+                .split_once(' ')
+                .filter(|(found, _)| found.eq_ignore_ascii_case("basic"))
+                .map(|(_, value)| value.trim());
+            if let (Some(user), Some(pass)) = (&user, &pass) {
+                let reencoded = B64.encode(format!("{user}:{pass}"));
+                proptest::prop_assert_eq!(
+                    value,
+                    Some(reencoded.as_str()),
+                    "credentials that are not the header's own base64: {:?}",
+                    header
+                );
+            }
+
+            // The sibling parser must not answer for a `Basic` header.
+            let token: Option<String> = bearer
+                .call(header.as_str())
+                .expect("bearer never raises");
+            if token.is_some() {
+                proptest::prop_assert!(
+                    header.trim().to_ascii_lowercase().starts_with("bearer "),
+                    "a bearer token out of {:?}",
+                    header
+                );
+            }
+        }
     }
 
     proptest::proptest! {

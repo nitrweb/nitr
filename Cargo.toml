@@ -108,6 +108,24 @@ reqwest = { version = "0.12.15", default-features = false, features = [
     "rustls-tls-native-roots",
 ] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# Inbound TLS termination (`[tls]`, the `tls` feature).
+#
+# `default-features = false` is what picks the crypto provider: rustls
+# 0.23 defaults to `aws-lc-rs`, whose build needs a C toolchain — and NASM
+# on Windows — which the release matrix cannot assume on every target it
+# cross-compiles for. `ring` builds from the same prebuilt assembly
+# everywhere and is already in the graph via reqwest's
+# `rustls-tls-native-roots`, so choosing it here costs no extra
+# dependency. The remaining defaults (`std`, `tls12`, `logging`) are
+# re-listed by hand since disabling the defaults dropped them too.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# The async handshake. Same provider choice, spelled the way tokio-rustls
+# spells it (`ring`, not `aws_lc_rs`).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pemfile = "2.2"
+# Self-signed certificates generated inside the TLS tests, so no private
+# key is ever committed to the repository.
+rcgen = "0.14"
 serde = { version = "1.0", features = ["derive"] }
 # `nitr build` bundles: the application archive appended to the binary.
 tar = "0.4"

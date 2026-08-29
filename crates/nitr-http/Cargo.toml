@@ -32,6 +32,7 @@ all = [
     "fetch",
     "multipart",
     "template",
+    "tls",
 ]
 
 # On-the-fly brotli/gzip response compression. Precompressed `.br`/`.gz`
@@ -39,6 +40,8 @@ all = [
 compression = ["dep:brotli", "dep:flate2"]
 # `req:multipart(fn)` file uploads.
 multipart = ["dep:multer"]
+# Inbound TLS termination (`[tls]`): rustls over the `ring` provider.
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
 
 # Pass-through to the standard library.
 crypto = ["nitr-std/crypto"]
@@ -78,9 +81,15 @@ uuid = { workspace = true }
 brotli = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 multer = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# The PEM tests build their certificates and keys at run time; no key
+# material is committed.
+rcgen = { workspace = true }
 # `test-util` enables `start_paused` so the body-timeout tests run on
 # virtual time instead of real-clock margins.
 tokio = { workspace = true, features = ["test-util"] }

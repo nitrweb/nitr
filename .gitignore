@@ -24,10 +24,8 @@
 release
 .vscode
 TODO
-docs/site
-docs/*/**.html
+docs
 */**/*.1
-docs/docs
 
 # SQLite WAL sidecars: enabling WAL makes a database three files.
 *.db-wal

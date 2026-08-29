@@ -66,6 +66,13 @@ pub struct Server {
     /// The shared `nitr.cache`, held here so a reload hands the new pool
     /// the same storage rather than starting cold.
     cache: Option<nitr_std::Cache>,
+    /// The TLS acceptor built from `[tls] cert`/`key`, or `None` on a
+    /// plaintext listener. Built once, in [`ServerBuilder::build`], so
+    /// every connection clones an `Arc` instead of reading the
+    /// filesystem — and so a broken pair fails the build rather than
+    /// every handshake on an already-bound port.
+    #[cfg(feature = "tls")]
+    tls: Option<tokio_rustls::TlsAcceptor>,
 }
 
 /// Refuses to start while a migration is pending.
@@ -199,6 +206,9 @@ impl Server {
     /// the listener stops accepting and in-flight requests get a grace
     /// period to complete.
     pub async fn serve_with_shutdown(mut self, shutdown: impl Future<Output = ()>) -> Result {
+        // Read once, at build time; here it is only an `Arc` to clone.
+        #[cfg(feature = "tls")]
+        let tls_acceptor = self.tls.clone();
         let listener = match self.listener.take() {
             // A pre-bound listener arrives blocking; tokio requires
             // non-blocking before it will adopt it.
@@ -249,8 +259,16 @@ impl Server {
         // The listener's own address, not `cfg.listen`: with a pre-bound
         // listener (or port 0) the config value is not where we serve.
         let bound = listener.local_addr().unwrap_or(self.cfg.listen);
+        // The scheme is part of what an operator checks this line for:
+        // saying `http://` on a TLS listener would send the first curl of
+        // every deployment to the wrong URL.
+        let scheme = if self.cfg.tls.enabled {
+            "https"
+        } else {
+            "http"
+        };
         tracing::info!(
-            "listening on http://{} with {} Lua state(s)",
+            "listening on {scheme}://{} with {} Lua state(s)",
             bound,
             current_pool(&self.pool).size()
         );
@@ -310,10 +328,22 @@ impl Server {
         let max_buf_size = self.cfg.limits.max_header_bytes.max(8 * 1024);
         // Complete-headers deadline (`[limits] header_read_ms`); `None`
         // disables it. Enforced by hyper per connection: an expired one
-        // is simply closed — no request exists yet to answer.
+        // is simply closed — no request exists yet to answer. Under TLS it
+        // also bounds the handshake: the same question ("how long may a
+        // client take to say what it wants?"), asked one layer down.
         let header_read = match self.cfg.limits.header_read_ms {
             0 => None,
             ms => Some(Duration::from_millis(ms)),
+        };
+        // Identical for every connection, so it is built once and cloned
+        // into each task rather than rebuilt per accept.
+        let http = {
+            let mut builder = http1::Builder::new();
+            builder
+                .timer(TokioTimer::new())
+                .header_read_timeout(header_read)
+                .max_buf_size(max_buf_size);
+            builder
         };
 
         loop {
@@ -351,16 +381,52 @@ impl Server {
                         main_health.clone(),
                         peer_addr,
                     );
-                    let conn = http1::Builder::new()
-                        .timer(TokioTimer::new())
-                        .header_read_timeout(header_read)
-                        .max_buf_size(max_buf_size)
-                        .serve_connection(TokioIo::new(stream), svc);
-                    let conn = graceful.watch(conn);
+                    let http = http.clone();
+                    // Subscribed here rather than inside the task:
+                    // `watcher()` takes its version at accept time, so a
+                    // drain that starts while a handshake is still running
+                    // is seen by this connection instead of arriving one
+                    // version late.
+                    let watcher = graceful.watcher();
+                    #[cfg(feature = "tls")]
+                    let acceptor = tls_acceptor.clone();
                     tokio::spawn(async move {
                         // Held until the connection closes.
                         let _permit = permit;
-                        if let Err(err) = conn.await {
+                        // The TLS handshake happens HERE, in the
+                        // connection's own task — never in the accept loop
+                        // above. A `ClientHello` that arrives one byte a
+                        // minute then costs this connection and nothing
+                        // else; handshaking before the spawn would let one
+                        // hostile client stall every other.
+                        #[cfg(feature = "tls")]
+                        if let Some(acceptor) = acceptor {
+                            let Some(stream) =
+                                tls_handshake(&acceptor, stream, header_read, peer_addr).await
+                            else {
+                                return;
+                            };
+                            let conn = http.serve_connection(TokioIo::new(stream), svc);
+                            if let Err(err) = watcher.watch(conn).await {
+                                // `debug`, not `error`, and the plaintext
+                                // arm below stays at `error` on purpose.
+                                // TLS adds a shutdown handshake that a
+                                // client is free to skip: curl and every
+                                // browser routinely close the socket
+                                // without a `close_notify`, which arrives
+                                // here as "error shutting down
+                                // connection". At `error` that is one log
+                                // line per request on a healthy server —
+                                // noise that buries the failures an
+                                // operator is actually looking for.
+                                tracing::debug!(
+                                    "TLS connection from {peer_addr} ended with: {err}"
+                                );
+                            }
+                            return;
+                        }
+                        let conn = http.serve_connection(TokioIo::new(stream), svc);
+                        if let Err(err) = watcher.watch(conn).await {
                             tracing::error!("error serving connection: {err}");
                         }
                     });
@@ -584,6 +650,14 @@ impl ServerBuilder {
             .max_streams
             .unwrap_or_else(|| cfg.workers.max(1).saturating_sub(1).max(1));
 
+        // The certificate and key are read exactly here: once, before a
+        // port exists, so a broken pair is a build failure (`nitr check`
+        // catches it) instead of a listener that accepts TCP and then
+        // fails every handshake — which from the outside is
+        // indistinguishable from a network fault.
+        #[cfg(feature = "tls")]
+        let tls = load_tls(&cfg.tls)?;
+
         Ok(Server {
             protection: Arc::new(Protection::new(&cfg)),
             cfg,
@@ -597,8 +671,33 @@ impl ServerBuilder {
             health_listener: self.health_listener,
             ready: Arc::new(AtomicBool::new(true)),
             cache,
+            #[cfg(feature = "tls")]
+            tls,
         })
     }
+}
+
+/// Builds the shared TLS acceptor from `[tls]`, or `None` when the
+/// listener is plaintext.
+///
+/// The whole certificate/key read happens in this one call, so every
+/// connection afterwards clones an `Arc` rather than touching the
+/// filesystem. The material is therefore fixed for the life of the
+/// process: a renewed certificate needs a restart, not a `SIGHUP` (which
+/// swaps the Lua pool and nothing else).
+#[cfg(feature = "tls")]
+fn load_tls(cfg: &crate::config::TlsConfig) -> Result<Option<tokio_rustls::TlsAcceptor>> {
+    if !cfg.enabled {
+        return Ok(None);
+    }
+    let loaded = crate::tls::load(cfg)?;
+    tracing::info!(
+        "TLS enabled: {} certificate(s), minimum version {}, ALPN {:?}",
+        loaded.certs,
+        cfg.min_version.as_deref().unwrap_or("1.2"),
+        crate::tls::ALPN_PROTOCOLS.map(String::from_utf8_lossy),
+    );
+    Ok(Some(tokio_rustls::TlsAcceptor::from(loaded.config)))
 }
 
 impl std::fmt::Debug for Server {
@@ -607,6 +706,45 @@ impl std::fmt::Debug for Server {
             .field("cfg", &self.cfg)
             .field("builtins", &self.builtins)
             .finish_non_exhaustive()
+    }
+}
+
+/// One connection's TLS handshake, run inside that connection's own task.
+///
+/// Returns `None` when the connection is finished with — the stream is
+/// dropped, closing it, and nothing else is affected. Failures are logged
+/// at `debug`, not `error`: on a public port a failed handshake is
+/// ordinary traffic (a plaintext client, a scanner, a client with no
+/// cipher suite in common), and an `error` per probe would drown the log
+/// an operator actually needs.
+///
+/// `deadline` is `[limits] header_read_ms`. Without it a client can hold a
+/// connection slot — and, during a drain, the graceful watcher — open
+/// forever by never finishing its `ClientHello`.
+#[cfg(feature = "tls")]
+async fn tls_handshake(
+    acceptor: &tokio_rustls::TlsAcceptor,
+    stream: tokio::net::TcpStream,
+    deadline: Option<Duration>,
+    peer: std::net::SocketAddr,
+) -> Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
+    let accepting = acceptor.accept(stream);
+    let handshake = match deadline {
+        Some(limit) => match tokio::time::timeout(limit, accepting).await {
+            Ok(handshake) => handshake,
+            Err(_) => {
+                tracing::debug!("TLS handshake from {peer} did not finish within {limit:?}");
+                return None;
+            }
+        },
+        None => accepting.await,
+    };
+    match handshake {
+        Ok(stream) => Some(stream),
+        Err(err) => {
+            tracing::debug!("TLS handshake from {peer} failed: {err}");
+            None
+        }
     }
 }
 

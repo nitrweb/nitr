@@ -463,6 +463,45 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// Inbound TLS termination (`[tls]` section), served by rustls over the
+/// `ring` crypto provider.
+///
+/// Off by default, and deliberately not inferred from the presence of a
+/// certificate: turning a port from plaintext to TLS is a decision an
+/// operator makes, not one a stray file makes for them. When it *is* on,
+/// both paths are required — a half-configured `[tls]` fails at startup
+/// rather than at the first connection, where the failure would look like
+/// a network problem.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TlsConfig {
+    /// Whether the listener speaks TLS.
+    pub enabled: bool,
+    /// PEM file holding the server certificate, leaf first, followed by
+    /// any intermediates a client needs to build the chain.
+    pub cert: Option<PathBuf>,
+    /// PEM file holding the matching private key (PKCS#8, PKCS#1 or
+    /// SEC1). Read once at startup and never again.
+    pub key: Option<PathBuf>,
+    /// Oldest protocol version accepted: `"1.2"` or `"1.3"`. Unset means
+    /// the floor, TLS 1.2, which is what a public endpoint wants;
+    /// `"1.3"` is for a closed set of clients known to speak it.
+    ///
+    /// The floor cannot be lowered. TLS 1.0 and 1.1 are deprecated
+    /// (RFC 8996) and are not settings this server offers under any
+    /// spelling — see [`TLS_MIN_VERSIONS`].
+    pub min_version: Option<String>,
+}
+
+/// Every protocol version `[tls] min_version` may name, weakest first.
+///
+/// `"1.2"` is the floor and the default: TLS 1.0 and 1.1 are deprecated
+/// by RFC 8996, rustls implements neither, and accepting the spelling
+/// would promise a downgrade no build here can — or should — keep. This
+/// list is the whole vocabulary; a name outside it is a startup refusal,
+/// not a silent fallback.
+pub(crate) const TLS_MIN_VERSIONS: [&str; 2] = ["1.2", "1.3"];
+
 /// Lua runtime settings (`[lua]` section).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]

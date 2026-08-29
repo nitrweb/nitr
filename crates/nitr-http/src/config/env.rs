@@ -54,8 +54,25 @@ impl Config {
     /// `NITR_TESTING_DIR`, `NITR_ENV_FILE`, `NITR_LUA_MEMORY_LIMIT`,
     /// `NITR_LUA_EXEC_TIMEOUT_MS`, `NITR_LIMITS_POOL_WAIT_MS`,
     /// `NITR_SHUTDOWN_GRACE`, `NITR_COMPRESSION_ENABLED`,
-    /// `NITR_LOG_FORMAT`, `NITR_LOG_LEVEL`.
+    /// `NITR_TLS_ENABLED`, `NITR_TLS_CERT`, `NITR_TLS_KEY`,
+    /// `NITR_TLS_MIN_VERSION`, `NITR_LOG_FORMAT`, `NITR_LOG_LEVEL`.
     pub fn apply_env(&mut self) -> Result {
+        self.apply_env_with(&|name| std::env::var(name).ok())
+    }
+
+    /// [`apply_env()`](Self::apply_env) against an arbitrary lookup.
+    ///
+    /// The process environment is global mutable state, and Rust 2024
+    /// made writing to it `unsafe` — which this workspace forbids
+    /// outright. Taking the lookup as a parameter is what lets the tests
+    /// exercise the layering (env beats TOML, an unparseable value names
+    /// its variable) over a table instead of a shared, order-dependent
+    /// process environment.
+    pub(crate) fn apply_env_with(&mut self, lookup: &dyn Fn(&str) -> Option<String>) -> Result {
+        // An empty value is treated as unset in exactly one place, so the
+        // rule holds for the real environment and for a test table alike:
+        // `NITR_WORKERS=` in a unit file means "I did not set this".
+        let env_var = |name: &str| lookup(name).filter(|v| !v.is_empty());
         // Superseded names are refused with the rename spelled out:
         // silently ignoring them would turn a stale deployment manifest
         // into a config mystery.
@@ -116,6 +133,18 @@ impl Config {
         }
         if let Some(v) = env_var("NITR_COMPRESSION_ENABLED") {
             self.compression.enabled = parse_env("NITR_COMPRESSION_ENABLED", &v)?;
+        }
+        if let Some(v) = env_var("NITR_TLS_ENABLED") {
+            self.tls.enabled = parse_env("NITR_TLS_ENABLED", &v)?;
+        }
+        if let Some(v) = env_var("NITR_TLS_CERT") {
+            self.tls.cert = Some(PathBuf::from(v));
+        }
+        if let Some(v) = env_var("NITR_TLS_KEY") {
+            self.tls.key = Some(PathBuf::from(v));
+        }
+        if let Some(v) = env_var("NITR_TLS_MIN_VERSION") {
+            self.tls.min_version = Some(v);
         }
         if let Some(v) = env_var("NITR_LOG_FORMAT") {
             self.log.format = match v.as_str() {

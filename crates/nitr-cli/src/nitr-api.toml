@@ -481,10 +481,14 @@ functions = [
   { name = "hmac_sha256", params = [{ name = "key", type = "string" }, { name = "data", type = "string" }], returns = [{ type = "string" }], desc = "HMAC-SHA256, lowercase hex." },
   { name = "random_bytes", params = [{ name = "n", type = "integer" }], returns = [{ type = "string" }], desc = "N random bytes from the OS (1..=65536)." },
   { name = "constant_time_eq", params = [{ name = "a", type = "string" }, { name = "b", type = "string" }], returns = [{ type = "boolean" }], desc = "Timing-safe comparison — what `==` on secrets is not." },
-  { name = "password_hash", params = [{ name = "password", type = "string" }], returns = [{ type = "string" }], desc = "argon2id hash for storage." },
-  { name = "password_verify", params = [{ name = "password", type = "string" }, { name = "hash", type = "string" }], returns = [{ type = "boolean" }], desc = "Verifies a password against a stored hash." },
+  { name = "password_hash", params = [{ name = "password", type = "string", desc = "At most 1024 bytes; longer is an error, never a silent truncation." }], returns = [{ type = "string" }], desc = "argon2id hash for storage (m=19456, t=2, p=1). Also available as `nitr hash-password`." },
+  { name = "password_verify", params = [{ name = "password", type = "string" }, { name = "hash", type = "string" }], returns = [{ type = "boolean", desc = "Whether the password matches." }, { type = "string|nil", desc = "Set only when the *stored hash* is unusable (bcrypt, truncated, absurd parameters) — nil for an ordinary wrong password, including one over `max_password_bytes` (answered false before argon2 runs, never an error)." }], desc = "Verifies a password against a stored hash. Total on login input: no password, whatever its size, makes it raise." },
+  { name = "password_verify_dummy", params = [{ name = "password", type = "string" }], returns = [{ type = "boolean", desc = "Always false." }], desc = "Spends one argon2 hash against a process-private decoy and returns false. Call it on the no-such-user branch of a login: skipping the hash there leaks your user list through response time." },
   { name = "seal", params = [{ name = "key", type = "string", desc = "Exactly 32 bytes." }, { name = "plaintext", type = "string" }, { name = "aad", type = "string?" }], returns = [{ type = "string" }], desc = "Authenticated encryption (XChaCha20-Poly1305); printable token." },
   { name = "open", params = [{ name = "key", type = "string" }, { name = "sealed", type = "string" }, { name = "aad", type = "string?" }], returns = [{ type = "string|nil" }], desc = "Opens a sealed token; nil on any tampering." },
+]
+fields = [
+  { name = "max_password_bytes", type = "integer", desc = "The password cap (1024 bytes): password_hash raises above it, password_verify answers a plain false. Read it to size a registration field — `#pw > nitr.crypto.max_password_bytes` is the pre-check that turns password_hash's error into a 400." },
 ]
 
 [[table]]

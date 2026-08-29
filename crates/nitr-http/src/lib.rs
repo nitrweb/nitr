@@ -27,6 +27,8 @@ pub(crate) mod request;
 pub(crate) mod server;
 pub(crate) mod static_files;
 pub(crate) mod stream;
+#[cfg(feature = "tls")]
+pub(crate) mod tls;
 pub(crate) mod watch;
 
 pub mod testing;
@@ -43,6 +45,8 @@ pub mod fuzzing {
     };
     pub use crate::request::is_fresh;
     pub use crate::static_files::{StaticMount, resolve_for_fuzzing as resolve_static};
+    #[cfg(feature = "tls")]
+    pub use crate::tls::{ALPN_PROTOCOLS, Loaded as TlsLoaded, build as build_tls};
 }
 
 /// The hyper `Service` dispatching requests to the Lua pool.
@@ -51,6 +55,6 @@ pub mod service;
 pub use config::{
     CacheConfig, CompressionConfig, Config, CorsConfig, DatabaseConfig, FetchConfig, HealthConfig,
     LimitsConfig, LogConfig, LogFormat, LuaConfig, RateLimitConfig, ShutdownConfig, StaticConfig,
-    StdConfig,
+    StdConfig, TlsConfig,
 };
 pub use server::{Server, ServerBuilder};

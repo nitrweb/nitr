@@ -56,7 +56,7 @@ pub use utils::error_lua_value;
 #[doc(hidden)]
 pub mod fuzzing {
     #[cfg(feature = "crypto")]
-    pub use crate::crypto::create_crypto_table;
+    pub use crate::crypto::{VERIFY_REASONS, create_auth_table, create_crypto_table};
     pub use crate::http::{sign, verify};
     pub use crate::json::create_json_fn;
     pub use crate::path::{

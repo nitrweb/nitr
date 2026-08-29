@@ -3,8 +3,10 @@ name: fuzz
 # cookies and the Cookie header, Accept and Accept-Encoding negotiation,
 # conditional-request headers, lexical paths, static path resolution (the
 # traversal defense), the JSON↔Lua boundary, URL/query splitting, JWT
-# verification, the declarative validators, multipart bodies, and Range
-# headers.
+# verification, the Basic-auth credential path (header plus stored hash),
+# the declarative validators, multipart bodies, Range headers, and the
+# TLS certificate/key PEM the server loads at startup from files an ACME
+# client or a mounted secret writes.
 #
 # Two cadences. Per PR: 90 seconds a target, which finds shallow bugs and
 # keeps the check fast enough to gate a merge. Nightly: an hour a target,
@@ -87,6 +89,14 @@ jobs:
             max_len: 4096
           - target: conditional_headers
             max_len: 4096
+          # Headers and PHC hash strings, both well under the default.
+          - target: basic_auth
+            max_len: 4096
+          # PEM files, not headers: a certificate chain with a couple of
+          # intermediates already runs past 4096, and truncating one would
+          # keep the parser from ever seeing a multi-block chain.
+          - target: tls_pem
+            max_len: 16384
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4

@@ -7,5 +7,6 @@
 //! argument parsing, configuration loading, and dispatch.
 
 pub(crate) mod check;
+pub(crate) mod hash_password;
 pub(crate) mod migrate;
 pub(crate) mod test;

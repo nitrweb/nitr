@@ -17,7 +17,7 @@ export RUSTFLAGS
 FUZZ_TARGETS := cookie_verify accept_negotiation path_lexical json_lua \
                 range_header multipart static_resolve url_lexical \
                 cookie_header accept_encoding jwt_verify validate_formats \
-                conditional_headers
+                conditional_headers basic_auth tls_pem
 # Per-target fuzz time in seconds (CI uses 90).
 FUZZ_TIME ?= 60
 # A hang is a bug: bound one execution well under the run itself, since
@@ -97,7 +97,7 @@ fuzz:
 	for target in $(FUZZ_TARGETS); do \
 		case $$target in \
 			multipart) max_len=65536 ;; \
-			json_lua) max_len=16384 ;; \
+			json_lua|tls_pem) max_len=16384 ;; \
 			jwt_verify|url_lexical) max_len=8192 ;; \
 			*) max_len=4096 ;; \
 		esac; \

@@ -1,0 +1,357 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// This file is part of Nitr.
+// See https://nitrweb.com/ for more information
+// Copyright (C) 2024-present Jose Quintana <joseluisq.net>
+
+//! End-to-end TLS: a real handshake against a real listener, and the two
+//! failure modes that matter operationally — a plaintext client hitting a
+//! TLS port, and a client that does not trust the certificate.
+//!
+//! The certificate is minted here, at run time, by `rcgen`. Nothing in
+//! the repository is key material, and nothing depends on the host's
+//! trust store: the test hands its own certificate to its own client as
+//! that client's only root.
+
+// Each test binary uses a subset of the shared harness.
+#![allow(dead_code)]
+
+mod harness;
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use harness::{TestDir, reserve_addr, wait_until_listening};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// How long the plaintext probe waits for the server to say something
+/// before concluding it said nothing. Generous: the point is that no HTTP
+/// response ever arrives, and a slow CI box must not turn that into a
+/// pass for the wrong reason.
+const PROBE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// A freshly minted self-signed identity, valid for `localhost` and
+/// `127.0.0.1`, written into the test's own directory.
+struct Identity {
+    cert_pem: String,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+}
+
+fn mint(dir: &TestDir) -> Identity {
+    let generated =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("generate a self-signed certificate");
+    let cert_pem = generated.cert.pem();
+    Identity {
+        cert_path: dir.write("cert.pem", &cert_pem),
+        key_path: dir.write("key.pem", generated.signing_key.serialize_pem()),
+        cert_pem,
+    }
+}
+
+/// A running TLS server plus the material a client needs to talk to it.
+struct TlsServer {
+    addr: SocketAddr,
+    identity: Identity,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    served: Option<tokio::task::JoinHandle<nitr::Result>>,
+    dir: TestDir,
+}
+
+impl TlsServer {
+    /// Spawns a TLS server on a reserved port. `tune` gets the config
+    /// after `[tls]` has been filled in, for tests that need to break it.
+    async fn spawn(label: &str, tune: impl FnOnce(&mut nitr::Config)) -> Self {
+        let dir = TestDir::new(label);
+        let identity = mint(&dir);
+        let handler = dir.write(
+            "app.lua",
+            r#"
+            local app = nitr.app()
+            app:get("/hello", function(req)
+                return {
+                    status = 200,
+                    headers = { ["Content-Type"] = "text/plain" },
+                    body = "over tls: " .. req.path,
+                }
+            end)
+            return app
+            "#,
+        );
+
+        // Port 0, kept bound: nothing can take it between choosing it and
+        // serving on it — the same rule the plaintext harness follows.
+        let (listener, addr) = reserve_addr();
+        let mut cfg = nitr::Config {
+            listen: addr,
+            handler_script: handler,
+            workers: 1,
+            tls: nitr::TlsConfig {
+                enabled: true,
+                cert: Some(identity.cert_path.clone()),
+                key: Some(identity.key_path.clone()),
+                min_version: None,
+            },
+            ..nitr::Config::default()
+        };
+        // Prompt teardown: a drain deadline that fails the test rather
+        // than the CI job, and no extra budget for streams there are none
+        // of.
+        cfg.shutdown.grace = 5;
+        cfg.shutdown.stream_grace = 0;
+        tune(&mut cfg);
+
+        let server = nitr::Server::builder()
+            .config(cfg)
+            .listener(listener)
+            .build()
+            .await
+            .expect("build a TLS server");
+        let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let served = tokio::spawn(server.serve_with_shutdown(async {
+            let _ = stop_rx.await;
+        }));
+        wait_until_listening(addr).await;
+
+        Self {
+            addr,
+            identity,
+            stop: Some(stop),
+            served: Some(served),
+            dir,
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("https://{}{path}", self.addr)
+    }
+
+    /// A client whose only trust anchor is this server's certificate.
+    /// Explicitly *without* the platform roots: a test that trusted the
+    /// host's CA store would be testing the host.
+    fn client(&self) -> reqwest::Client {
+        let root = reqwest::Certificate::from_pem(self.identity.cert_pem.as_bytes())
+            .expect("parse the test certificate");
+        reqwest::Client::builder()
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(root)
+            .build()
+            .expect("client")
+    }
+
+    async fn stop(&mut self) {
+        let _ = self.stop.take().expect("not stopped").send(());
+        let served = self.served.take().expect("not stopped");
+        match tokio::time::timeout(Duration::from_secs(10), served).await {
+            Ok(task) => task.expect("server task").expect("clean shutdown"),
+            Err(_) => panic!("the TLS server did not shut down within 10s"),
+        }
+    }
+}
+
+impl Drop for TlsServer {
+    fn drop(&mut self) {
+        if let Some(served) = self.served.take() {
+            served.abort();
+        }
+    }
+}
+
+/// The whole point: a real handshake, a real request, a real answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serves_a_real_request_over_tls() {
+    let mut server = TlsServer::spawn("tls-e2e", |_| {}).await;
+
+    let resp = server
+        .client()
+        .get(server.url("/hello"))
+        .send()
+        .await
+        .expect("a TLS request must succeed");
+    assert_eq!(resp.status(), 200);
+    // ALPN advertises `http/1.1` and nothing else, because `http1` is the
+    // only connection type the server builds. A negotiated `h2` would
+    // have failed after a successful handshake.
+    assert_eq!(resp.version(), reqwest::Version::HTTP_11);
+    assert_eq!(resp.text().await.expect("body"), "over tls: /hello");
+
+    // Keep-alive over the same TLS connection: the second request proves
+    // the stream survives past the first response rather than the
+    // connection being rebuilt behind our back.
+    let client = server.client();
+    for _ in 0..2 {
+        let resp = client
+            .get(server.url("/hello"))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), 200);
+    }
+
+    server.stop().await;
+}
+
+/// A plaintext HTTP request to a TLS port must be *refused*, not
+/// mis-served. The failure this rules out is a listener that falls back
+/// to cleartext when the handshake fails: that would answer a `GET` over
+/// an unencrypted socket while every operator believes the port is
+/// encrypted.
+///
+/// It also pins the blast radius: the connection that failed is the only
+/// one affected, which the surviving TLS request afterwards asserts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plaintext_request_to_a_tls_port_is_refused_not_served() {
+    let mut server = TlsServer::spawn("tls-plaintext", |_| {}).await;
+
+    let mut socket = tokio::net::TcpStream::connect(server.addr)
+        .await
+        .expect("connect");
+    socket
+        .write_all(b"GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write a plaintext request");
+
+    let mut answer = Vec::new();
+    // The server answers a bad `ClientHello` with a TLS alert and closes;
+    // some platforms reset instead, which surfaces here as a read error.
+    // Either is a refusal — what matters is that no HTTP response comes
+    // back.
+    let _ = tokio::time::timeout(PROBE_DEADLINE, socket.read_to_end(&mut answer))
+        .await
+        .expect("the server must close the connection rather than hold it open");
+
+    assert!(
+        !answer.starts_with(b"HTTP/"),
+        "a plaintext request was served over cleartext on a TLS port: {:?}",
+        String::from_utf8_lossy(&answer)
+    );
+    // `GET /hello` is not a valid record, so nothing that comes back may
+    // contain the handler's output either.
+    assert!(
+        !answer.windows(8).any(|w| w == b"over tls"),
+        "the handler ran for a plaintext client: {:?}",
+        String::from_utf8_lossy(&answer)
+    );
+
+    // One dropped connection, and only one: the server is still serving.
+    let resp = server
+        .client()
+        .get(server.url("/hello"))
+        .send()
+        .await
+        .expect("the server must survive a failed handshake");
+    assert_eq!(resp.status(), 200);
+
+    server.stop().await;
+}
+
+/// The control for [`serves_a_real_request_over_tls`]: without the
+/// certificate as a trust anchor the request must fail. If this passed,
+/// the end-to-end test above would prove nothing — it could be talking
+/// cleartext.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_does_not_trust_the_certificate_is_rejected() {
+    let mut server = TlsServer::spawn("tls-untrusted", |_| {}).await;
+
+    let stranger = reqwest::Client::builder()
+        .tls_built_in_root_certs(false)
+        .build()
+        .expect("client");
+    let err = stranger
+        .get(server.url("/hello"))
+        .send()
+        .await
+        .expect_err("an untrusted self-signed certificate must not verify");
+    assert!(
+        err.to_string().to_ascii_lowercase().contains("certificate")
+            || err.is_connect()
+            || err.is_request(),
+        "expected a certificate failure, got: {err}"
+    );
+
+    // A plain HTTP request to the same port is refused the same way.
+    let err = stranger
+        .get(format!("http://{}/hello", server.addr))
+        .send()
+        .await
+        .expect_err("http:// against a TLS port must not succeed");
+    assert!(!err.is_status(), "expected no HTTP response at all: {err}");
+
+    server.stop().await;
+}
+
+/// Half a `[tls]` section must fail the *build*, before anything is
+/// bound. Discovering it at the first handshake would mean a port that
+/// accepts TCP and fails every connection, which is indistinguishable
+/// from a network fault — and by then traffic has already been shifted
+/// onto it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_half_configured_tls_section_refuses_to_build() {
+    let dir = TestDir::new("tls-halfconfig");
+    let identity = mint(&dir);
+    let handler = dir.write(
+        "app.lua",
+        "local app = nitr.app()\n\
+         app:get('/', function(req) return { status = 200, body = 'ok' } end)\n\
+         return app\n",
+    );
+
+    let base = |tune: fn(&mut nitr::Config)| {
+        let mut cfg = nitr::Config {
+            handler_script: handler.clone(),
+            workers: 1,
+            tls: nitr::TlsConfig {
+                enabled: true,
+                cert: Some(identity.cert_path.clone()),
+                key: Some(identity.key_path.clone()),
+                min_version: None,
+            },
+            ..nitr::Config::default()
+        };
+        tune(&mut cfg);
+        cfg
+    };
+
+    // The control: the complete section builds.
+    nitr::Server::builder()
+        .config(base(|_| {}))
+        .build()
+        .await
+        .expect("a complete [tls] section builds");
+
+    for (what, tune) in [
+        (
+            "key",
+            (|cfg: &mut nitr::Config| cfg.tls.key = None) as fn(&mut nitr::Config),
+        ),
+        ("cert", |cfg: &mut nitr::Config| cfg.tls.cert = None),
+    ] {
+        let err = nitr::Server::builder()
+            .config(base(tune))
+            .build()
+            .await
+            .expect_err("a half-configured [tls] must not build");
+        assert!(
+            err.to_string().contains(what),
+            "the refusal must name the missing key `{what}`, got: {err}"
+        );
+    }
+
+    // Two valid files that do not belong together: the pair is checked at
+    // startup, not left to fail every handshake.
+    let other =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("second identity");
+    let stray = dir.write("stray.key", other.signing_key.serialize_pem());
+    let mut cfg = base(|_| {});
+    cfg.tls.key = Some(stray);
+    let err = nitr::Server::builder()
+        .config(cfg)
+        .build()
+        .await
+        .expect_err("a mismatched pair must not build");
+    assert!(
+        err.to_string().to_ascii_lowercase().contains("mismatch"),
+        "the refusal must say the key does not match the certificate, got: {err}"
+    );
+}

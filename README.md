@@ -38,6 +38,7 @@ Nitr is both a **binary** (`nitr`, configured via `nitr.toml`) and a **library c
 - **Rust-side routing (`nitr.app()`):** path parameters, middleware chains composed once at load, per-app error handler, 404/405 answered without entering Lua.
 - **HTTP correctness:** binary-safe request/response bodies, multi-value headers (`Set-Cookie`), parsed query strings, `HEAD`/`OPTIONS` answered without a route, conditional requests, graceful shutdown, no Lua tracebacks leaked to clients (unless dev mode).
 - **The rest of HTTP, in Rust:** range requests (`206`/`416`, `If-Range`), response compression (brotli/gzip plus precompressed `.br`/`.gz` sidecars), CORS policy with preflights answered before Lua runs, `req:form()` for urlencoded bodies, and `req:multipart()` uploads that stream to disk without ever entering the Lua heap.
+- **TLS without a proxy in front:** three lines of `[tls]` terminate HTTPS in-process with rustls (`ring` provider, TLS 1.2 floor, ALPN pinned to what the server actually speaks). The certificate and key are read once at startup, so a broken or mismatched pair refuses to boot rather than failing every handshake; the handshake itself runs in the connection's own task, so a stalled `ClientHello` costs one connection and not the accept loop.
 - **Easy configuration:** `nitr.toml` configuration with `NITR_*` environment overrides and CLI flags; unknown keys, contradictions, and missing paths refuse to start, and `nitr check --print-config` prints the effective result of the layering.
 - **Operable:** Rust-owned `/healthz` + `/readyz` probes (readiness flips before a drain can fail a request, optionally on a separate port), JSON log output (`[log] format = "json"`), pidfile + `nitr reload` for scripted zero-downtime reloads, and reference [systemd/Docker deployments](deploy/).
 - **One-file deploys:** `nitr build --output myapp` appends the whole application (config, Lua, templates, static files, migrations) to the binary — copy one executable; the database stays external.
@@ -61,6 +62,7 @@ every builtin to be there.
 | `crypto` | `nitr.crypto`, `nitr.auth` | `argon2` |
 | `compression` | on-the-fly brotli/gzip responses | `brotli`, `flate2` |
 | `multipart` | `req:multipart(fn)` file uploads | `multer` |
+| `tls` | inbound TLS termination (`[tls]`) | `rustls` (the `ring` provider) |
 | `all` | every feature above | — |
 
 `json`, `http`, `log`, `cache`, `dbg`, `time`, `validate`, `base64`,
@@ -215,6 +217,12 @@ path = "scripts/file.db"                # enables `nitr.db`
 [templating]
 dir = "scripts/templates"               # enables `nitr.template`
 
+[tls]                                   # needs the `tls` Cargo feature
+enabled = true
+cert = "/etc/nitr/tls/fullchain.pem"    # leaf first, then intermediates
+key = "/etc/nitr/tls/privkey.pem"       # PKCS#8, PKCS#1 or SEC1
+# min_version = "1.2"                   # "1.2" (default) or "1.3"
+
 [std]
 # `nitr.*` standard library features; default: ["json", "http", "log",
 # "time", "validate", "base64", "path", "url"]
@@ -258,7 +266,7 @@ For lower-level embedding, `nitr::Runtime` exposes the Lua state, `register_modu
 
 ## Documentation
 
-Current references: the [`nitr.*` API](docs/nitr-api.md) (generated), the [error-handling guide](docs/errors.md), the [stability policy](docs/stability.md) and the [threat model](docs/threat-model.md). The original proposal documents are archived in [.docs/](.docs/).
+Current references: the [`nitr.*` API](docs/nitr-api.md) (generated), the [error-handling guide](docs/errors.md), the [passwords and Basic auth guide](docs/passwords.md), the [stability policy](docs/stability.md) and the [threat model](docs/threat-model.md). The original proposal documents are archived in [.docs/](.docs/).
 
 ## Benchmarks
 
@@ -285,7 +293,9 @@ the `Cookie` header, `Accept` and `Accept-Encoding` negotiation,
 conditional-request headers, `Range` headers, multipart bodies, the
 JSON-Lua boundary and its depth guard, lexical paths, static path
 resolution (the traversal defense), URL and query splitting, JWT
-verification, and the declarative validators.
+verification, the declarative validators, and the TLS certificate/key PEM
+the server loads at startup from whatever an ACME client or a mounted
+secret wrote.
 
 Targets assert behavior, not just absence of crashes — round-trips,
 idempotence, tamper rejection, and the bounds a caller depends on (a

@@ -86,6 +86,8 @@ enum Command {
     },
     /// Ask a running server (found via its `pidfile`) to reload.
     Reload,
+    /// Print an argon2id hash for a password, read from a prompt or stdin.
+    HashPassword,
 }
 
 fn load_config(cli: &Cli) -> anyhow::Result<Config> {
@@ -256,6 +258,13 @@ async fn run_main() -> anyhow::Result<()> {
         init_logging(None, cli.dev);
         return scaffold::init(dir.as_deref().unwrap_or(Path::new(".")), *minimal);
     }
+    // `hash-password` needs no application at all: it is the one command
+    // an operator runs *before* there is a working nitr.toml, and a
+    // broken one must not stand between them and a credential.
+    if let Some(Command::HashPassword) = &cli.command {
+        init_logging(None, cli.dev);
+        return cmd::hash_password::hash_password();
+    }
 
     let cfg = match load_config(&cli) {
         Ok(cfg) => {
@@ -269,7 +278,7 @@ async fn run_main() -> anyhow::Result<()> {
     };
 
     match cli.command.unwrap_or(Command::Run) {
-        Command::Init { .. } => unreachable!("handled above"),
+        Command::Init { .. } | Command::HashPassword => unreachable!("handled above"),
         Command::Run | Command::Dev => {
             let pidfile_path = cfg.pidfile.clone();
             let server = Server::builder().config(cfg).build().await?;

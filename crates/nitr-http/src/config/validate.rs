@@ -78,6 +78,7 @@ impl Config {
                 self.lua.exec_timeout_ms
             );
         }
+        self.validate_tls()?;
         if self.health.enabled {
             for (name, path) in [
                 ("liveness", &self.health.liveness),
@@ -98,6 +99,62 @@ impl Config {
             }
         }
         self.validate_paths()
+    }
+
+    /// Rejects a `[tls]` section that cannot terminate a connection.
+    ///
+    /// Every check here fires at startup rather than at the first
+    /// handshake: a listener that accepts TCP and then fails every
+    /// connection is indistinguishable, from the outside, from a network
+    /// fault, and it fails *after* a deployment has already shifted
+    /// traffic onto it.
+    fn validate_tls(&self) -> Result {
+        if !self.tls.enabled {
+            // An unused section is not held to its own rules — the same
+            // way `[health]` skips its path checks when disabled — so a
+            // half-written `[tls]` block can sit in a file until the day
+            // somebody turns it on.
+            return Ok(());
+        }
+        // `cfg!` rather than `#[cfg]` so the checks below are compiled —
+        // and tested — in both feature configurations; only the refusal
+        // is conditional.
+        if cfg!(not(feature = "tls")) {
+            return Err(Error::Config(
+                "[tls] enabled = true, but this binary was built without the `tls` \
+                 feature: rebuild with `--features tls` (or `all`)"
+                    .into(),
+            ));
+        }
+        for (key, what) in [("cert", "certificate chain"), ("key", "private key")] {
+            let path = match key {
+                "cert" => &self.tls.cert,
+                _ => &self.tls.key,
+            };
+            let Some(path) = path else {
+                return Err(Error::Config(format!(
+                    "[tls] enabled = true requires `{key}`: set [tls] {key} to the PEM \
+                     file holding the server {what}"
+                )));
+            };
+            if !path.is_file() {
+                return Err(Error::Config(format!(
+                    "[tls] {key} points at {}, which is not a readable file",
+                    path.display()
+                )));
+            }
+        }
+        if let Some(version) = &self.tls.min_version
+            && !super::sections::TLS_MIN_VERSIONS.contains(&version.as_str())
+        {
+            return Err(Error::Config(format!(
+                "unknown [tls] min_version `{version}`: expected {}",
+                super::sections::TLS_MIN_VERSIONS
+                    .map(|v| format!("\"{v}\""))
+                    .join(" or ")
+            )));
+        }
+        Ok(())
     }
 
     /// Rejects paths that cannot work before any of them is opened, so a
@@ -163,7 +220,9 @@ impl Config {
     /// and static files live in the extraction directory, while the
     /// database path is deliberately left alone, it is mutable state and
     /// stays external to the artifact, resolving against the working
-    /// directory as usual.
+    /// directory as usual. `[tls] cert`/`key` are left alone for the
+    /// stronger version of the same reason: a private key inside a
+    /// copyable one-file artifact is a private key that leaks with it.
     pub fn rebase(&mut self, root: &Path) {
         let anchor = |path: &mut PathBuf| {
             if path.is_relative() {

@@ -34,7 +34,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 default = ["all"]
 # The CLI's own feature names must come on too: `nitr migrate` is gated on
 # *this* crate's `db` feature, not the library's.
-all = ["compression", "crypto", "db", "fetch", "multipart", "template"]
+all = ["compression", "crypto", "db", "fetch", "multipart", "template", "tls"]
 
 compression = ["nitr/compression"]
 crypto = ["nitr/crypto"]
@@ -42,6 +42,7 @@ db = ["nitr/db"]
 fetch = ["nitr/fetch"]
 multipart = ["nitr/multipart"]
 template = ["nitr/template"]
+tls = ["nitr/tls"]
 
 [dependencies]
 nitr = { workspace = true }
