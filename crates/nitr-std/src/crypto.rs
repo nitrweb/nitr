@@ -1342,21 +1342,20 @@ mod tests {
             sha256.call::<String>("abc").expect("digest"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-        // The empty input, whose digest is the one every implementation
-        // publishes — a nibble table is exactly where an off-by-one hides,
-        // and this is the known answer that catches one.
+        // The empty input, whose digest every implementation publishes —
+        // a nibble table is exactly where an off-by-one hides, and this is
+        // the known answer that catches one.
         assert_eq!(
             sha256.call::<String>("").expect("digest"),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
-        // A single byte, chosen so both nibbles differ and neither is
+        // A single byte, chosen so both its nibbles differ and neither is
         // zero: `0x61` must render as "61", not "16", "6" or "061".
         assert_eq!(
             sha256.call::<String>("a").expect("digest"),
             "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
         );
-        // Every nibble value appears across those three, and each digest
-        // is exactly two characters per byte.
+        // Two characters per byte, lowercase, nothing else.
         for input in ["", "a", "abc"] {
             let digest = sha256.call::<String>(input).expect("digest");
             assert_eq!(digest.len(), 64, "sha256 of {input:?} is 32 bytes");

@@ -98,6 +98,34 @@ const MAX_CAUSE_DEPTH: usize = 5;
 /// timeout rather than a script bug.
 pub(crate) const EXEC_BUDGET_MSG: &str = "handler execution exceeded its time budget";
 
+/// What Lua raises when an asynchronous builtin is called somewhere it
+/// cannot suspend.
+///
+/// Every builtin that awaits — `nitr.fetch`, the `nitr.db` methods,
+/// `nitr.crypto.password_hash` and its two siblings, `req:multipart`,
+/// `req:text` — is a Lua function that yields, and a yield needs a
+/// coroutine the async executor is driving. Two places do not have one: the
+/// **top level** of a handler or config script (evaluated once at startup,
+/// outside the executor) and a bare `coroutine.resume`/`wrap` the
+/// application drives itself.
+///
+/// The VM's own words for that are `attempt to yield from outside a
+/// coroutine`, which names neither the builtin nor the fix. Classification
+/// replaces it — see [`ASYNC_OUTSIDE_HINT`].
+const LUA_YIELD_OUTSIDE: &str = "attempt to yield from outside a coroutine";
+
+/// The explanation that replaces [`LUA_YIELD_OUTSIDE`].
+///
+/// Prefixed with the builtin's name when the traceback names it, or with a
+/// generic phrase when it does not.
+const ASYNC_OUTSIDE_HINT: &str = "is asynchronous and cannot be called here. A script's top \
+     level runs once at startup, outside the async executor, and a \
+     coroutine your own code resumes is not driven by it either — neither \
+     has anything to suspend into. Call it from inside a handler or a \
+     middleware instead. A value the script needs at load time has to be \
+     computed without an async builtin: `nitr hash-password` mints a \
+     password hash to paste into a table, for instance";
+
 /// A classified view of an [`Error`]: what broke, where, and why, as
 /// separate fields instead of one interpolated string.
 ///
@@ -232,6 +260,59 @@ impl ErrorInfo {
         Self::from_text(kind, module, traceback, cause, &text)
     }
 
+    /// The builtin a `yield outside a coroutine` traceback was raised from.
+    ///
+    /// mlua's async trampoline reports itself as an anonymous `[string "?"]`
+    /// chunk, and that frame — the first one below `coroutine.yield` —
+    /// carries the name the script called the builtin by:
+    ///
+    /// ```text
+    /// [C]: in function 'coroutine.yield'
+    /// [string "?"]:28: in field 'password_hash'   <- this one
+    /// app.lua:5: in main chunk
+    /// ```
+    ///
+    /// Only that frame is consulted. Every deeper frame is a *caller* of
+    /// the builtin, and naming one would blame the script's own function
+    /// for being asynchronous. An aliased call (`local h =
+    /// nitr.crypto.password_hash`) is named by its alias — `in local 'h'` —
+    /// which is the name the script knows the builtin by.
+    ///
+    /// Returns the bare name (`password_hash`), never a guessed path: the
+    /// traceback carries the reference the call resolved through and not
+    /// the table it hung off, so prefixing `nitr.` would print
+    /// `nitr.password_hash` for what the script wrote as
+    /// `nitr.crypto.password_hash`. `None` when the traceback has been
+    /// truncated past that frame or its shape changes — the caller falls
+    /// back to a generic phrase rather than inventing one.
+    fn async_callee(traceback: &str) -> Option<String> {
+        // Past `coroutine.yield` and any other `[C]` frames, the next frame
+        // is the trampoline's own; requiring its anonymous-chunk source
+        // makes a reshaped traceback yield nothing instead of a caller.
+        let frame = traceback
+            .lines()
+            .map(str::trim_start)
+            .skip_while(|frame| !frame.contains("coroutine.yield"))
+            .find(|frame| !frame.starts_with("[C]"))
+            .filter(|frame| frame.starts_with("[string"))?;
+        // Every way Lua names a call site: a table field or method, a plain
+        // function, or the local/upvalue/global an alias was bound to.
+        let rest = [
+            "in field '",
+            "in method '",
+            "in function '",
+            "in local '",
+            "in upvalue '",
+            "in global '",
+        ]
+        .into_iter()
+        .find_map(|pattern| frame.split_once(pattern))?
+        .1;
+        let name = rest.split_once('\'')?.0;
+        // A dotted name is a VM-qualified frame, not what the script wrote.
+        (!name.is_empty() && !name.contains('.')).then(|| name.to_string())
+    }
+
     /// Classifies an error that arrives as bare text: what a Lua `pcall`
     /// catches from an `error()` or a runtime failure (`app.lua:21:
     /// attempt to call a nil value ...`, possibly with an appended
@@ -299,9 +380,31 @@ impl ErrorInfo {
             }
         }
 
+        // An async builtin called where it cannot suspend. Translated last
+        // because naming the builtin needs the resolved traceback, and the
+        // VM's own wording ("attempt to yield from outside a coroutine")
+        // names neither what was called nor what to do instead. A script
+        // that *raises* the same words through `error()` keeps them: its
+        // traceback shows the `error` call where the genuine failure's
+        // shows the yield. Without a traceback the two cannot be told
+        // apart, and the genuine failure is the one that occurs.
+        let mut message = message.to_string();
+        if message == LUA_YIELD_OUTSIDE
+            && traceback
+                .as_deref()
+                .is_none_or(|tb| tb.contains("coroutine.yield"))
+        {
+            let what = traceback
+                .as_deref()
+                .and_then(Self::async_callee)
+                .map_or_else(|| "this builtin".to_string(), |name| format!("`{name}`"));
+            message = format!("{what} {ASYNC_OUTSIDE_HINT}");
+            kind = "nitr";
+        }
+
         Self {
             kind,
-            message: message.to_string(),
+            message,
             source,
             line,
             module,
@@ -499,6 +602,106 @@ mod tests {
 
         let shallow = "\n\tframe 0\n\tframe 1";
         assert_eq!(bound_traceback(shallow), "\tframe 0\n\tframe 1");
+    }
+
+    /// The VM's `attempt to yield from outside a coroutine` is replaced
+    /// with an explanation that names the builtin, the reason and the
+    /// remedy — the migration surface for every async builtin, not just
+    /// the argon2 ones that made it reachable.
+    #[test]
+    fn a_yield_outside_a_coroutine_names_the_builtin_and_the_remedy() {
+        let err = Error::Lua(mlua::Error::RuntimeError(format!(
+            "app.lua:3: {LUA_YIELD_OUTSIDE}\nstack traceback:\n\t[C]: in ?\n\t\
+             [C]: in function 'coroutine.yield'\n\t[string \"?\"]:28: in field \
+             'password_hash'\n\tapp.lua:3: in main chunk"
+        )));
+        let info = ErrorInfo::from_error(&err);
+
+        assert_eq!(info.kind, "nitr", "not the script author's bug");
+        assert!(
+            !info.message.contains(LUA_YIELD_OUTSIDE),
+            "the raw VM wording must not survive: {}",
+            info.message
+        );
+        // The frame below `coroutine.yield` names the call, and the name is
+        // used bare: the traceback knows the field, not the table it hung
+        // off, so `nitr.crypto.password_hash` cannot be reconstructed.
+        assert!(
+            info.message.starts_with("`password_hash`"),
+            "{}",
+            info.message
+        );
+        assert!(
+            !info.message.contains("nitr.password_hash"),
+            "{}",
+            info.message
+        );
+        for expected in ["asynchronous", "top level", "handler", "nitr hash-password"] {
+            assert!(
+                info.message.contains(expected),
+                "missing `{expected}`: {}",
+                info.message
+            );
+        }
+        // Position and traceback survive the rewrite.
+        assert_eq!(info.source.as_deref(), Some("app.lua"));
+        assert_eq!(info.line, Some(3));
+
+        // With the naming frame gone (a truncated traceback, or a shape
+        // change in a future mlua) the explanation still lands, generically
+        // rather than by guessing a name.
+        let err = Error::Lua(mlua::Error::RuntimeError(format!(
+            "app.lua:3: {LUA_YIELD_OUTSIDE}"
+        )));
+        let info = ErrorInfo::from_error(&err);
+        assert!(info.message.starts_with("this builtin"), "{}", info.message);
+        assert!(info.message.contains("asynchronous"), "{}", info.message);
+    }
+
+    /// Only the trampoline's own frame may name the builtin. An aliased
+    /// call is named by its alias — the name the script knows it by — and
+    /// when that frame carries no name at all, the explanation stays
+    /// generic instead of blaming the nearest named *caller* for being
+    /// asynchronous.
+    #[test]
+    fn an_async_callee_comes_from_the_trampoline_frame_never_a_caller() {
+        // `local h = nitr.crypto.password_hash` called inside `helper`:
+        // the trampoline frame reads `in local 'h'`.
+        let err = Error::Lua(mlua::Error::RuntimeError(format!(
+            "app.lua:2: {LUA_YIELD_OUTSIDE}\nstack traceback:\n\t\
+             [C]: in function 'coroutine.yield'\n\t\
+             [string \"?\"]:28: in local 'h'\n\t\
+             app.lua:2: in function 'helper'\n\tapp.lua:8: in main chunk"
+        )));
+        let info = ErrorInfo::from_error(&err);
+        assert!(info.message.starts_with("`h`"), "{}", info.message);
+
+        // An anonymous trampoline frame: `helper` below it called the
+        // builtin, it is not the builtin, and must not be named.
+        let err = Error::Lua(mlua::Error::RuntimeError(format!(
+            "app.lua:2: {LUA_YIELD_OUTSIDE}\nstack traceback:\n\t\
+             [C]: in function 'coroutine.yield'\n\t\
+             [string \"?\"]:28: in function <[string \"?\"]:1>\n\t\
+             app.lua:2: in function 'helper'\n\tapp.lua:8: in main chunk"
+        )));
+        let info = ErrorInfo::from_error(&err);
+        assert!(info.message.starts_with("this builtin"), "{}", info.message);
+        assert!(!info.message.contains("helper"), "{}", info.message);
+    }
+
+    /// A script that raises the VM's own wording through `error()` is a
+    /// script error like any other: its traceback shows the `error` call,
+    /// not a yield, so the message is left alone and the kind stays the
+    /// script author's.
+    #[test]
+    fn a_raised_lookalike_is_not_rewritten() {
+        let err = Error::Lua(mlua::Error::RuntimeError(format!(
+            "app.lua:7: {LUA_YIELD_OUTSIDE}\nstack traceback:\n\t\
+             [C]: in function 'error'\n\tapp.lua:7: in main chunk"
+        )));
+        let info = ErrorInfo::from_error(&err);
+        assert_eq!(info.kind, "lua", "a raised string is the script's own");
+        assert_eq!(info.message, LUA_YIELD_OUTSIDE);
     }
 
     #[test]

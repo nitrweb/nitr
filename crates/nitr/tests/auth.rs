@@ -83,10 +83,12 @@ local app = nitr.app()
 
 -- Stored hashes, not hashes computed here. `password_hash` offloads
 -- argon2 to the blocking pool and is therefore async, which means it
--- cannot run in this chunk: the handler script's top level is evaluated
--- outside the async executor, so a yield here has no coroutine to yield
--- to. That is the right shape anyway — a real deployment stores hashes
--- minted by `nitr hash-password`, it does not burn argon2 per boot.
+-- cannot run in this chunk: a script's top level is evaluated outside the
+-- async executor, so there is nothing to suspend into. That is the right
+-- shape anyway — a real deployment stores hashes minted by
+-- `nitr hash-password` rather than burning argon2 per boot. The refusal
+-- and its wording are pinned by `a_top_level_async_call_explains_itself`
+-- below; the change record is docs-feat/stability.md.
 local users = {
     -- `nitr hash-password` for "lovelace".
     ada = "$argon2id$v=19$m=19456,t=2,p=1$vMXfHutNUW2TKOAlXkcjhw$4inB2KB+UGSwuLVU21BPzcYITNSqQ7Hs39S0/v8g6Pw",
@@ -333,9 +335,23 @@ return app
 "#,
         )
         .builtins(nitr::Builtins::JSON | nitr::Builtins::CRYPTO)
-        // More workers than executor threads, so every worker can be busy
-        // hashing while the executor still has to answer the probe.
-        .config(|cfg| cfg.workers = 4)
+        .config(|cfg| {
+            // More states than executor threads, so every executor thread
+            // can be busy hashing while the probe still has to be answered.
+            cfg.workers = 4;
+            // Never shed: this test is about executor responsiveness, not
+            // about the pool-wait budget. On a slow or emulated target
+            // (`cross test --target=s390x-...` runs argon2 an order of
+            // magnitude slower) a queued request would otherwise pass the
+            // 5 s default and come back 503, failing the test for a reason
+            // it does not measure. `0` waits instead of shedding.
+            cfg.limits.pool_wait_ms = 0;
+            // Same reasoning for the execution budget: one emulated argon2
+            // can run for many seconds, and a handler timeout here would
+            // again be the wrong signal. The bounds that matter are all
+            // relative to `one_hash` below.
+            cfg.lua.exec_timeout_ms = 0;
+        })
         .spawn()
         .await;
 
@@ -348,9 +364,11 @@ return app
     assert_eq!(warm.expect("warm-up hash").status(), 200);
     let one_hash = started.elapsed();
 
-    // Saturate every pooled state.
+    // Saturate every pooled state — one hash per state, so the whole
+    // window is a single round rather than a queue. Anything more only
+    // adds wall-clock, and on an emulated target that is minutes.
     let mut hashes = Vec::new();
-    for _ in 0..8 {
+    for _ in 0..4 {
         let client = server.client().clone();
         let url = server.url("/hash");
         hashes.push(tokio::spawn(async move {
@@ -407,4 +425,64 @@ return app
     );
 
     server.stop().await;
+}
+
+/// Calling an async builtin from a script's top level is refused with an
+/// explanation, not with the VM's `attempt to yield from outside a
+/// coroutine`.
+///
+/// This is the migration surface for the argon2 offload: the functions
+/// became asynchronous, so the one shape that used to work and no longer
+/// does is hashing at load time. What the author sees has to name the
+/// builtin, say why the call cannot work there, and give the alternative —
+/// otherwise the change reads as a VM bug.
+///
+/// The translation lives in `nitr-core`'s error classification rather than
+/// in the crypto builtin, so `nitr.fetch`, the `nitr.db` methods and the
+/// request-body readers all report the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_top_level_async_call_explains_itself() {
+    let mut builder = TestServer::builder("auth-toplevel")
+        .handler(
+            r#"
+local app = nitr.app()
+local users = { ada = nitr.crypto.password_hash("lovelace") }
+app:get("/", function(req) return nitr.json(users) end)
+return app
+"#,
+        )
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::CRYPTO)
+        .config(|cfg| cfg.workers = 1);
+
+    let err = builder
+        .try_build()
+        .await
+        .expect_err("hashing at the top level must be refused")
+        .to_string();
+
+    // The VM's wording must not survive: it names neither the call nor the
+    // remedy, which is the whole reason this translation exists.
+    assert!(
+        !err.contains("attempt to yield from outside a coroutine"),
+        "the raw VM message reached the author: {err}"
+    );
+    // What the message owes the reader.
+    for expected in [
+        // which call failed…
+        "password_hash",
+        // …why it cannot work there…
+        "asynchronous",
+        "top level",
+        // …and what to do instead.
+        "handler",
+        "nitr hash-password",
+    ] {
+        assert!(
+            err.contains(expected),
+            "the explanation must mention `{expected}`: {err}"
+        );
+    }
+    // And it still points at the offending line, like every other script
+    // error.
+    assert!(err.contains("app.lua:3"), "no position in: {err}");
 }
