@@ -18,11 +18,43 @@
 //! reaper and a disk-space policy. Streaming each part as it arrives needs
 //! neither, at the cost of the handler seeing parts in the order the client
 //! sent them.
+//!
+//! # Where a saved file may land
+//!
+//! `part:save(path)` is the only filesystem *write* Lua can reach, and
+//! both of its inputs are attacker-influenced: the path is a Lua string
+//! built by the handler, and `part.filename` is a header the client chose.
+//! So the path is resolved against the configured `[multipart]
+//! upload_dir` and never escapes it — the lexical rule is shared with
+//! static serving ([`crate::safe_path`]), and the parent is canonicalized
+//! so a symlinked directory cannot lead out either. With no `upload_dir`
+//! configured, `save` is unavailable rather than unconstrained.
+//!
+//! Two residuals are documented rather than closed. Both need an
+//! attacker who *already* has write access inside the upload root — a
+//! separate local process, not an HTTP client — so they are a hardening
+//! gap, not a way in:
+//!
+//! - **A symlink swapped between check and open.** `symlink_metadata`
+//!   runs before `File::create`, and nothing holds the directory still in
+//!   between. `O_NOFOLLOW` (or `FILE_FLAG_OPEN_REPARSE_POINT`) would close
+//!   it, which means a `libc`/`rustix` dependency the workspace does not
+//!   carry.
+//! - **A pre-existing hardlink.** A hardlink inside the root pointing at
+//!   an inode outside it reports as an ordinary regular file — there is
+//!   nothing in its metadata to distinguish it — so it passes the
+//!   `is_file` check and `File::create` truncates through it. Note this
+//!   one is *not* covered by `O_NOFOLLOW`: closing it needs writing to a
+//!   fresh temporary name and renaming into place, or an `st_nlink`/
+//!   `st_dev` check on the opened descriptor.
 
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use hyper::body::Bytes;
 use mlua::{ExternalResult as _, UserData, UserDataFields, UserDataMethods};
+
+use crate::safe_path::{Rejected, safe_join};
 
 /// A `multipart/form-data` part handed to the Lua callback.
 ///
@@ -31,11 +63,15 @@ use mlua::{ExternalResult as _, UserData, UserDataFields, UserDataMethods};
 pub(crate) struct LuaPart {
     name: String,
     filename: Option<String>,
+    safe_filename: Option<String>,
     content_type: Option<String>,
     /// `None` once the part has been consumed by `text`/`save`/draining.
     field: Mutex<Option<multer::Field<'static>>>,
     max_field_bytes: u64,
     max_file_bytes: u64,
+    /// The configured `[multipart] upload_dir`; `None` leaves `save`
+    /// unavailable.
+    upload_root: Option<Arc<PathBuf>>,
 }
 
 impl LuaPart {
@@ -43,17 +79,124 @@ impl LuaPart {
         field: multer::Field<'static>,
         max_field_bytes: u64,
         max_file_bytes: u64,
+        upload_root: Option<Arc<PathBuf>>,
     ) -> Self {
+        let filename = field.file_name().map(str::to_string);
         Self {
             name: field.name().unwrap_or_default().to_string(),
-            filename: field.file_name().map(str::to_string),
+            safe_filename: filename.as_deref().map(safe_filename),
+            filename,
             content_type: field.content_type().map(|m| m.to_string()),
             field: Mutex::new(Some(field)),
             max_field_bytes,
             max_file_bytes,
+            upload_root,
         }
     }
 
+    /// Resolves a Lua-supplied path to the file `save` may open, or
+    /// refuses it by name.
+    ///
+    /// Runs *before* the field is taken, so a rejected path leaves the
+    /// part unconsumed: the handler can catch the error and still
+    /// `discard()` it or retry with `safe_filename`.
+    async fn resolve_target(&self, rel: &str) -> mlua::Result<PathBuf> {
+        let Some(root) = &self.upload_root else {
+            return Err(mlua::Error::RuntimeError(
+                "part:save() requires an upload directory: set [multipart] upload_dir in \
+                 nitr.toml to the root every saved file must land inside"
+                    .into(),
+            ));
+        };
+        resolve_upload_path(root, rel).await
+    }
+}
+
+/// The whole containment rule for `part:save`, as a free function so the
+/// `upload_resolve` fuzz target can drive it without a live multipart
+/// field — and so the one invariant that matters ("every path this
+/// returns is inside the canonicalized root") has a single home to state
+/// it in.
+#[doc(hidden)]
+pub async fn resolve_upload_path(root: &std::path::Path, rel: &str) -> mlua::Result<PathBuf> {
+    let joined = safe_join(root, rel).map_err(|why| {
+        let detail = match why {
+            Rejected::Traversal => "it climbs out of the upload directory",
+            Rejected::Absolute => {
+                "it is an absolute path, and paths are relative to the upload directory"
+            }
+            Rejected::Nul => "it contains a NUL byte",
+        };
+        mlua::Error::RuntimeError(format!(
+            "part:save() refused `{rel}`: {detail} ({})",
+            root.display()
+        ))
+    })?;
+    if joined == root {
+        return Err(mlua::Error::RuntimeError(format!(
+            "part:save() refused `{rel}`: it names the upload directory itself, not a \
+             file inside it"
+        )));
+    }
+
+    // The file does not exist yet, so the containment check
+    // canonicalizes its *parent* — which does — and re-checks the
+    // prefix there. This is what catches a symlinked intermediate
+    // directory pointing out of the root, which the lexical rule
+    // alone cannot see.
+    let (parent, name) = match (joined.parent(), joined.file_name()) {
+        (Some(parent), Some(name)) => (parent, name.to_os_string()),
+        _ => {
+            return Err(mlua::Error::RuntimeError(format!(
+                "part:save() refused `{rel}`: it is not a file name"
+            )));
+        }
+    };
+    let canonical_root = tokio::fs::canonicalize(root).await.map_err(|err| {
+        mlua::Error::RuntimeError(format!(
+            "part:save() cannot resolve the upload directory {}: {err}",
+            root.display()
+        ))
+    })?;
+    // Missing intermediate directories are an error, not an implicit
+    // `create_dir_all`: deciding the on-disk shape of an upload tree
+    // is the application's job, and materializing directories from
+    // attacker-influenced strings is not a favour.
+    let canonical_parent = tokio::fs::canonicalize(parent).await.map_err(|err| {
+        mlua::Error::RuntimeError(format!(
+            "part:save() cannot write `{rel}`: its directory is not usable: {err}"
+        ))
+    })?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(mlua::Error::RuntimeError(format!(
+            "part:save() refused `{rel}`: its directory resolves outside the upload \
+             directory {}",
+            root.display()
+        )));
+    }
+
+    // The final component is checked with `symlink_metadata` (which
+    // does not follow) *before* the open, because `File::create`
+    // truncates whatever it lands on: a link checked afterwards has
+    // already been written through.
+    let target = canonical_parent.join(&name);
+    match tokio::fs::symlink_metadata(&target).await {
+        Ok(meta) if meta.file_type().is_symlink() => Err(mlua::Error::RuntimeError(format!(
+            "part:save() refused `{rel}`: it is a symlink, and following one would write \
+             through the upload directory"
+        ))),
+        Ok(meta) if !meta.is_file() => Err(mlua::Error::RuntimeError(format!(
+            "part:save() refused `{rel}`: it already exists and is not a regular file"
+        ))),
+        Ok(_) => Ok(target),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(target),
+        Err(err) => Err(mlua::Error::RuntimeError(format!(
+            "part:save() cannot inspect `{rel}`: {err}"
+        ))),
+    }
+}
+
+impl LuaPart {
     /// Takes the field out, leaving the part consumed.
     fn take(&self) -> mlua::Result<multer::Field<'static>> {
         self.field
@@ -82,6 +225,11 @@ impl UserData for LuaPart {
         // `nil` for an ordinary field; a string for a file upload. This is
         // the documented way to tell the two apart.
         fields.add_field_method_get("filename", |_, part| Ok(part.filename.clone()));
+        // The same name reduced to something that can only ever name a
+        // file directly inside the upload root: `nil` exactly when
+        // `filename` is, so `if part.safe_filename then` remains the same
+        // "is this a file?" test.
+        fields.add_field_method_get("safe_filename", |_, part| Ok(part.safe_filename.clone()));
         fields.add_field_method_get("content_type", |_, part| Ok(part.content_type.clone()));
     }
 
@@ -103,12 +251,18 @@ impl UserData for LuaPart {
         });
 
         // part:save(path) — streams the part to disk without it ever
-        // entering the Lua heap. Returns the number of bytes written.
-        methods.add_async_method("save", |_, part, path: String| async move {
+        // entering the Lua heap. `path` is relative to
+        // `[multipart] upload_dir` and cannot escape it. Returns the
+        // number of bytes written.
+        methods.add_async_method("save", |_, part, rel: String| async move {
+            // Containment first: a refused path must not consume the part
+            // and must not have created anything.
+            let target = part.resolve_target(&rel).await?;
+            let path = target.display().to_string();
             let mut field = part.take()?;
             let limit = part.max_file_bytes;
-            let mut file = tokio::fs::File::create(&path).await.map_err(|err| {
-                mlua::Error::RuntimeError(format!("failed to create `{path}`: {err}"))
+            let mut file = tokio::fs::File::create(&target).await.map_err(|err| {
+                mlua::Error::RuntimeError(format!("failed to create `{rel}`: {err}"))
             })?;
 
             let mut written: u64 = 0;
@@ -125,10 +279,12 @@ impl UserData for LuaPart {
             .await;
 
             if let Err(err) = result {
-                // A rejected or failed upload must not leave a truncated
-                // file behind for the application to trip over later.
+                // A failed upload must not leave a truncated file behind
+                // for the application to trip over later. This runs only
+                // for a path that already passed containment, so the
+                // unlink cannot reach outside the upload root.
                 drop(file);
-                let _ = tokio::fs::remove_file(&path).await;
+                let _ = tokio::fs::remove_file(&target).await;
                 return Err(err);
             }
             Ok(written)
@@ -145,6 +301,53 @@ impl UserData for LuaPart {
             Ok(skipped)
         });
     }
+}
+
+/// The longest a single path component may be on the filesystems Nitr
+/// targets (`NAME_MAX`).
+const NAME_MAX: usize = 255;
+
+/// The fallback when nothing survives sanitizing.
+///
+/// A fixed string rather than `nil`: an empty or absent name would push an
+/// emptiness check into every handler, which is the same "the application
+/// must remember" failure the raw filename already is.
+const FALLBACK_NAME: &str = "upload";
+
+/// Reduces a client-sent filename to something that can only ever name a
+/// file directly inside the upload root.
+///
+/// `part.filename` stays raw on purpose — it is what the client sent, and
+/// applications legitimately record it — so this is a second value, not a
+/// replacement. By construction the result contains no path separator, so
+/// `part:save(part.safe_filename)` is safe on its own and the upload root
+/// is a backstop rather than the only defense.
+#[doc(hidden)]
+pub fn safe_filename(raw: &str) -> String {
+    // Only the last segment is a name; a client may send a whole path,
+    // and both separators count because the sender's OS is not ours.
+    let last = raw.rsplit(['/', '\\']).next().unwrap_or_default();
+    // C0/C1 controls and NUL: a name the OS would refuse opaquely, or
+    // that would truncate a log line.
+    let cleaned: String = last.chars().filter(|c| !c.is_control()).collect();
+    // Leading dots hide the file; trailing dots and spaces are silently
+    // dropped by some filesystems, which makes two names collide. Both
+    // classes are trimmed in one pass rather than chained — `". . "`
+    // alternates, so `trim().trim_matches('.').trim()` leaves a dot
+    // behind on the second alternation.
+    let trimmed = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
+
+    let mut out = String::new();
+    for ch in trimmed.chars() {
+        if out.len() + ch.len_utf8() > NAME_MAX {
+            break;
+        }
+        out.push(ch);
+    }
+    if out.is_empty() || out == "." || out == ".." {
+        return FALLBACK_NAME.to_string();
+    }
+    out
 }
 
 fn too_large(name: &str, kind: &str, limit: u64) -> mlua::Error {
@@ -259,6 +462,120 @@ pub(crate) fn boundary(content_type: Option<&str>) -> mlua::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `safe_filename`'s whole contract: whatever the client sent, the
+    /// result names a plain file and nothing else. The upload root is the
+    /// backstop for `part:save(anything)`; this is what makes
+    /// `part:save(part.safe_filename)` safe on its own.
+    #[test]
+    fn safe_filename_always_yields_a_plain_name() {
+        // The ordinary case is left alone.
+        assert_eq!(safe_filename("report.pdf"), "report.pdf");
+        // Only the last segment survives, for both separators — the
+        // sender's OS is not necessarily ours.
+        assert_eq!(safe_filename("../../etc/passwd"), "passwd");
+        assert_eq!(safe_filename("C:\\Windows\\evil.exe"), "evil.exe");
+        assert_eq!(safe_filename("/absolute/name.txt"), "name.txt");
+        // Control characters and NUL cannot survive into a path.
+        assert_eq!(safe_filename("a\0b\u{7}c.txt"), "abc.txt");
+        // Leading dots (hidden files) and trailing dots/spaces (silently
+        // dropped by some filesystems, so two names would collide).
+        assert_eq!(safe_filename(".hidden"), "hidden");
+        assert_eq!(safe_filename("name.txt. . "), "name.txt");
+        // Nothing survives: a fixed name, never an empty string, because
+        // an empty name is a write to the directory itself.
+        for empty in ["", "   ", "...", "..", ".", "/", "\\", "\0"] {
+            assert_eq!(safe_filename(empty), FALLBACK_NAME, "input: {empty:?}");
+        }
+        // Truncated to NAME_MAX on a character boundary, never mid-glyph.
+        let long = safe_filename(&"é".repeat(500));
+        assert!(long.len() <= NAME_MAX, "{} bytes", long.len());
+        assert!(
+            std::str::from_utf8(long.as_bytes()).is_ok(),
+            "truncation split a character"
+        );
+        // The invariant every caller leans on.
+        for raw in [
+            "../../etc/passwd",
+            "C:\\Windows\\evil.exe",
+            "a\0b",
+            "...",
+            "sub/dir/file",
+        ] {
+            let safe = safe_filename(raw);
+            assert!(!safe.contains('/') && !safe.contains('\\'), "{safe:?}");
+            assert!(!safe.is_empty(), "{raw:?} produced an empty name");
+        }
+    }
+
+    /// The containment rule, against a real directory: every shape from
+    /// the phase's decision table, each refused for its own stated reason.
+    #[tokio::test]
+    async fn upload_paths_resolve_inside_the_root_or_are_refused() {
+        let root = std::env::temp_dir().join(format!("nitr-upload-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("img")).expect("mkdir");
+        let canonical = root.canonicalize().expect("canonicalize");
+
+        // Accepted: a plain name, and a nested one whose directory exists.
+        for ok in ["a.png", "img/a.png", "./img/a.png"] {
+            let resolved = resolve_upload_path(&root, ok)
+                .await
+                .unwrap_or_else(|err| panic!("`{ok}` must resolve: {err}"));
+            assert!(
+                resolved.starts_with(&canonical),
+                "`{ok}` resolved outside the root: {}",
+                resolved.display()
+            );
+        }
+
+        // Refused, each naming the rule it hit.
+        for (bad, expected) in [
+            ("../../etc/cron.d/x", "climbs out"),
+            ("img/../../x", "climbs out"),
+            ("/etc/cron.d/x", "absolute path"),
+            ("a\0b", "NUL byte"),
+            ("", "names the upload directory itself"),
+            (".", "names the upload directory itself"),
+            ("..", "climbs out"),
+            ("missing/a.png", "directory is not usable"),
+            ("img", "not a regular file"),
+        ] {
+            let err = resolve_upload_path(&root, bad)
+                .await
+                .expect_err(&format!("`{bad}` must be refused"));
+            assert!(
+                err.to_string().contains(expected),
+                "`{bad}` must be refused as `{expected}`, got: {err}"
+            );
+        }
+
+        // A symlink out of the root is refused as the final component and
+        // as an intermediate directory: the lexical rule cannot see
+        // either, only the canonicalized checks can.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside =
+                std::env::temp_dir().join(format!("nitr-upload-out-{}", std::process::id()));
+            std::fs::create_dir_all(&outside).expect("mkdir outside");
+            symlink(&outside, root.join("link-dir")).expect("symlink dir");
+            symlink(outside.join("target.txt"), root.join("link-file")).expect("symlink file");
+
+            let err = resolve_upload_path(&root, "link-file")
+                .await
+                .expect_err("a symlinked final component must be refused");
+            assert!(err.to_string().contains("symlink"), "got: {err}");
+
+            let err = resolve_upload_path(&root, "link-dir/a.png")
+                .await
+                .expect_err("a symlinked parent must be refused");
+            assert!(err.to_string().contains("outside the upload"), "got: {err}");
+            let _ = std::fs::remove_dir_all(&outside);
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn boundary_extracts_and_rejects() {

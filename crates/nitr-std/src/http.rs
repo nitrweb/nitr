@@ -128,7 +128,7 @@ pub(crate) fn register(lua: &Lua, nitr: &Table) -> mlua::Result<()> {
                 // A table body renders as JSON, e.g. `{ code = "NOT_FOUND" }`.
                 Some(Value::Table(t)) => {
                     let t = Value::Table(t);
-                    crate::utils::check_json_depth(&t)?;
+                    crate::utils::check_json_bounds(&t)?;
                     let body = serde_json::to_string(&t).into_lua_err()?;
                     set_content_type(&table, "application/json")?;
                     table.set("body", body)?;
@@ -159,7 +159,7 @@ pub(crate) fn register(lua: &Lua, nitr: &Table) -> mlua::Result<()> {
                 Value::Integer(n) => n.to_string().into_bytes(),
                 Value::Number(n) => n.to_string().into_bytes(),
                 other => {
-                    crate::utils::check_json_depth(other)?;
+                    crate::utils::check_json_bounds(other)?;
                     serde_json::to_vec(other).into_lua_err()?
                 }
             };
@@ -186,7 +186,7 @@ fn format_event(event: &str, data: Value) -> mlua::Result<String> {
     let data = match data {
         Value::String(s) => s.to_string_lossy().to_string(),
         other => {
-            crate::utils::check_json_depth(&other)?;
+            crate::utils::check_json_bounds(&other)?;
             serde_json::to_string(&other).into_lua_err()?
         }
     };

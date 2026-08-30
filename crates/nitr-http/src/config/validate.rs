@@ -116,6 +116,25 @@ impl Config {
                 self.limits.body_read_ms, self.lua.exec_timeout_ms
             ));
         }
+        // An upload root under the static root means uploaded bytes are
+        // served straight back to browsers. That is a real deployment
+        // shape (user avatars), so it warns rather than refuses — but it
+        // turns every upload into hosted content, which the operator has
+        // to have chosen on purpose. Contrast the `package_dir` overlap,
+        // which `validate_paths` refuses outright: there is no version of
+        // that one an operator wants.
+        if let (Some(upload), Some(static_dir)) =
+            (&self.multipart.upload_dir, &self.static_files.dir)
+            && let (Ok(upload), Ok(static_dir)) = (upload.canonicalize(), static_dir.canonicalize())
+            && upload.starts_with(&static_dir)
+        {
+            out.push(format!(
+                "[multipart] upload_dir {} is inside [static] dir {}: every uploaded file \
+                 is served back over HTTP",
+                upload.display(),
+                static_dir.display()
+            ));
+        }
         // `"debug"` is deliberately *not* warned about here: it is refused
         // outright by `LuaConfig::parse_stdlib`, because mlua's safe
         // constructor cannot load it at all. A warning would only precede a
@@ -183,11 +202,16 @@ impl Config {
     /// typo'd path is a startup error naming the setting, not a confusing
     /// failure minutes later.
     fn validate_paths(&self) -> Result {
-        let checks: [(&str, Option<&PathBuf>, bool); 4] = [
+        let checks: [(&str, Option<&PathBuf>, bool); 5] = [
             ("handler_script", Some(&self.handler_script), false),
             ("config_script", self.config_script.as_ref(), false),
             ("[templating] dir", self.templating.dir.as_ref(), true),
             ("[static] dir", self.static_files.dir.as_ref(), true),
+            (
+                "[multipart] upload_dir",
+                self.multipart.upload_dir.as_ref(),
+                true,
+            ),
         ];
         for (name, path, want_dir) in checks {
             let Some(path) = path else { continue };
@@ -220,6 +244,44 @@ impl Config {
                 dir.display()
             )));
         }
+        // Uploads are the one thing Lua can write, so the root has to be
+        // writable *now* rather than at the first upload, when the only
+        // symptom is a 500 on a request nobody can reproduce. Existence
+        // is not writability: a mis-owned or read-only-mounted directory
+        // passes every check above.
+        if let Some(dir) = &self.multipart.upload_dir {
+            let probe = dir.join(format!(".nitr-write-probe-{}", std::process::id()));
+            match std::fs::File::create(&probe) {
+                Ok(file) => {
+                    drop(file);
+                    let _ = std::fs::remove_file(&probe);
+                }
+                Err(err) => {
+                    return Err(Error::Config(format!(
+                        "[multipart] upload_dir {} exists but cannot be written to: {err}",
+                        dir.display()
+                    )));
+                }
+            }
+        }
+        // An upload root inside the handler's own directory is the
+        // upload-to-RCE chain written in configuration: `require`'s search
+        // path is pinned there, so an uploaded `.lua` file becomes a
+        // module the handler can load — and in dev mode the watcher may
+        // reload it without being asked.
+        if let Some(dir) = &self.multipart.upload_dir
+            && let (Ok(upload), Ok(package)) =
+                (dir.canonicalize(), self.package_dir().canonicalize())
+            && upload.starts_with(&package)
+        {
+            return Err(Error::Config(format!(
+                "[multipart] upload_dir {} is inside the handler script's directory {}: \
+                 `require` is pinned there, so an uploaded file would be a loadable Lua \
+                 module. Put the upload root outside it.",
+                upload.display(),
+                package.display()
+            )));
+        }
         // The database file itself may not exist yet (SQLite creates it),
         // but its parent directory must, SQLite will not create that.
         if let Some(db) = &self.database
@@ -242,9 +304,13 @@ impl Config {
     /// and static files live in the extraction directory, while the
     /// database path is deliberately left alone, it is mutable state and
     /// stays external to the artifact, resolving against the working
-    /// directory as usual. `[tls] cert`/`key` are left alone for the
-    /// stronger version of the same reason: a private key inside a
-    /// copyable one-file artifact is a private key that leaks with it.
+    /// directory as usual. `[multipart] upload_dir` is left alone for the
+    /// same reason — uploads outlive the bundle they were received by, and
+    /// re-anchoring them inside a `nitr build` extraction directory would
+    /// make them vanish on the next deploy. `[tls] cert`/`key` are left
+    /// alone for the stronger version of the same reason: a private key
+    /// inside a copyable one-file artifact is a private key that leaks
+    /// with it.
     pub fn rebase(&mut self, root: &Path) {
         let anchor = |path: &mut PathBuf| {
             if path.is_relative() {

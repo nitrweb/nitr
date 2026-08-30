@@ -14,7 +14,7 @@
 //! canonicalized root — so symlinks cannot escape the mount either.
 
 use std::convert::Infallible;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use http_body_util::{BodyExt as _, Empty, Full, StreamBody};
@@ -161,19 +161,17 @@ pub async fn resolve_for_fuzzing(mount: &StaticMount, url_path: &str) -> Option<
 /// (unsafe path, missing file, unreadable metadata). Directories resolve
 /// to their `index.html`.
 async fn resolve(dir: &Path, rel: &str) -> Option<PathBuf> {
-    let mut path = dir.to_path_buf();
-    for part in rel.split('/') {
-        if part.is_empty() || part == "." {
-            continue;
-        }
-        // Reject traversal and any non-normal component (`..`, drive
-        // prefixes, absolute segments).
-        match Path::new(part).components().next() {
-            Some(Component::Normal(component)) if component == part => path.push(part),
-            None => continue,
-            _ => return None,
-        }
-    }
+    // The lexical rule (`..`, absolute segments, drive prefixes, NUL) is
+    // shared with `part:save`'s upload root — see `crate::safe_path`. The
+    // canonicalized containment check below is this caller's half.
+    //
+    // Leading separators are stripped first because a URL path always has
+    // one and `StaticMount::relative` only removes it for some mounts:
+    // `/assets//a.txt` comes back as `/a.txt`, which is rooted. That is
+    // *not* an absolute filesystem path, it is a URL with a doubled
+    // separator, and it served `<dir>/a.txt` before this rule was shared.
+    // `relative`'s own root-mount branch trims exactly this way.
+    let mut path = crate::safe_path::safe_join(dir, rel.trim_start_matches('/')).ok()?;
 
     let meta = fs_ok(tokio::fs::metadata(&path).await, &path)?;
     if meta.is_dir() {

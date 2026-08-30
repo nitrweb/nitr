@@ -216,7 +216,7 @@ pub(crate) struct LuaRequest {
 /// Only multipart reads these today, so a build without that feature
 /// carries the values without using them; keeping the struct whole means
 /// `[limits]` parses identically either way.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct FormLimits {
     #[cfg_attr(not(feature = "multipart"), allow(dead_code))]
     pub(crate) max_parts: usize,
@@ -224,6 +224,11 @@ pub(crate) struct FormLimits {
     pub(crate) max_field_bytes: u64,
     #[cfg_attr(not(feature = "multipart"), allow(dead_code))]
     pub(crate) max_file_bytes: u64,
+    /// `[multipart] upload_dir`: the root every `part:save` resolves
+    /// inside. `None` leaves `save` unavailable. Shared rather than
+    /// cloned per request — it is set once at startup and never changes.
+    #[cfg_attr(not(feature = "multipart"), allow(dead_code))]
+    pub(crate) upload_root: Option<std::sync::Arc<std::path::PathBuf>>,
 }
 
 impl Default for FormLimits {
@@ -233,6 +238,7 @@ impl Default for FormLimits {
             max_parts: defaults.max_form_parts,
             max_field_bytes: defaults.max_field_bytes,
             max_file_bytes: defaults.max_file_bytes,
+            upload_root: None,
         }
     }
 }
@@ -439,7 +445,7 @@ impl UserData for LuaRequest {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
             let boundary = crate::multipart::boundary(content_type.as_deref())?;
-            let limits = req.limits;
+            let limits = req.limits.clone();
 
             let body = std::mem::take(req.req.body_mut());
             let mut parser = multer::Multipart::new(body.into_data_stream(), boundary);
@@ -460,6 +466,7 @@ impl UserData for LuaRequest {
                     field,
                     limits.max_field_bytes,
                     limits.max_file_bytes,
+                    limits.upload_root.clone(),
                 ))?;
                 let outcome = cb.call_async::<()>(&part).await;
 

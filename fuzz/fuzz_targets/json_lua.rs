@@ -86,11 +86,13 @@ use libfuzzer_sys::fuzz_target;
 use mlua::{AnyUserData, Function, Lua, LuaString, ObjectLike as _, Value};
 use nitr_fuzz::Input;
 
-/// Every error class `encode` is allowed to fail with. Two come from the
-/// crate (`check_json_depth`) and two from `serde_json`'s map-key
-/// serializer; anything else means the failure path grew a case.
+/// Every error class `encode` is allowed to fail with. Three come from the
+/// crate (`check_json_bounds`: the depth bound, and the node budget a
+/// shared subtree trips) and two from `serde_json`'s map-key serializer;
+/// anything else means the failure path grew a case.
 const ENCODE_ERRORS: &[&str] = &[
     "nested deeper than 128 levels",
+    "expands to more than",
     "key must be a string",
     "float key must be finite",
     "cannot serialize",

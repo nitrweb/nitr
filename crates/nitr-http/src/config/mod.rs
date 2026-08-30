@@ -80,6 +80,8 @@ pub struct Config {
     pub static_files: StaticConfig,
     /// Template rendering (`[templating]` section).
     pub templating: TemplatingConfig,
+    /// Filesystem policy for multipart uploads (`[multipart]` section).
+    pub multipart: MultipartConfig,
     /// Test runner settings (`[testing]` section).
     pub testing: TestingConfig,
     /// Environment access for the `nitr.env` builtin (`[env]` section).
@@ -118,6 +120,7 @@ impl Default for Config {
             cache: CacheConfig::default(),
             static_files: StaticConfig::default(),
             templating: TemplatingConfig::default(),
+            multipart: MultipartConfig::default(),
             testing: TestingConfig::default(),
             env: EnvConfig::default(),
             lua: LuaConfig::default(),
@@ -198,16 +201,29 @@ impl Config {
         Ok(builtins)
     }
 
+    /// The directory `require` is pinned to: the one containing the
+    /// handler script.
+    ///
+    /// A bare `handler_script = "app.lua"` has `parent()` of `Some("")`,
+    /// which names nothing — the script is in the working directory, so
+    /// that is what `require` gets. Every caller must derive the root
+    /// *here* rather than re-deriving it: `validate_paths` refuses an
+    /// upload directory inside this root, and a second copy of the
+    /// expression that disagreed with this one is exactly how that
+    /// refusal was once skipped for a bare filename while `require` was
+    /// still pinned to the working directory.
+    pub(crate) fn package_dir(&self) -> &Path {
+        self.handler_script
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    }
+
     /// Builds the [`RuntimeOpts`] derived from this configuration.
     pub fn runtime_opts(&self) -> Result<RuntimeOpts> {
         // Lua module loading (`require`) is confined to the directory
         // containing the handler script.
-        let package_dir = self
-            .handler_script
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
+        let package_dir = self.package_dir().to_path_buf();
         Ok(RuntimeOpts {
             libs: self.lua.parse_stdlib()?,
             memory_limit: self.lua.memory_limit,
@@ -320,6 +336,217 @@ mod tests {
         assert!(
             msg.contains("[lua] stdlib") && msg.contains("debug"),
             "the refusal must name the setting and the library: {msg}"
+        );
+    }
+
+    /// A config laid out the way a deployment is: the handler script in
+    /// its own `scripts/` directory, with `uploads/` a sibling rather than
+    /// a child.
+    ///
+    /// [`valid_base`] cannot serve here — it writes the handler straight
+    /// into the system temp directory, which would make `require`'s root
+    /// `/tmp` and every upload directory on the machine "inside" it. The
+    /// layout is load-bearing, not incidental.
+    fn upload_base(label: &str) -> (Config, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("nitr-up-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let scripts = base.join("scripts");
+        let uploads = base.join("uploads");
+        std::fs::create_dir_all(&scripts).expect("mkdir scripts");
+        std::fs::create_dir_all(&uploads).expect("mkdir uploads");
+        std::fs::write(scripts.join("app.lua"), "-- test handler").expect("write handler");
+        let cfg = Config {
+            handler_script: scripts.join("app.lua"),
+            ..Config::default()
+        };
+        (cfg, base, uploads)
+    }
+
+    /// `[multipart] upload_dir` must exist, be a directory, and be
+    /// writable — checked at startup, because the alternative is a 500 on
+    /// the first upload that nobody can reproduce.
+    #[test]
+    fn the_upload_directory_is_validated_at_startup() {
+        let (mut cfg, base, uploads) = upload_base("validated");
+
+        // The sibling layout validates.
+        cfg.multipart.upload_dir = Some(uploads.clone());
+        cfg.validate().expect("a writable upload dir validates");
+
+        // Missing entirely.
+        cfg.multipart.upload_dir = Some(base.join("nope"));
+        let err = cfg.validate().expect_err("a missing upload dir");
+        let msg = err.to_string();
+        assert!(msg.contains("[multipart] upload_dir"), "got: {msg}");
+        assert!(msg.contains("does not exist"), "got: {msg}");
+
+        // A file where a directory belongs.
+        cfg.multipart.upload_dir = Some(cfg.handler_script.clone());
+        let err = cfg.validate().expect_err("a file, not a directory");
+        assert!(
+            err.to_string().contains("must be a directory"),
+            "got: {err}"
+        );
+
+        // Present but unwritable: existence is not writability, and the
+        // refusal has to name the setting.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let locked = base.join("locked");
+            std::fs::create_dir_all(&locked).expect("mkdir locked");
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500))
+                .expect("chmod");
+            cfg.multipart.upload_dir = Some(locked.clone());
+            // Running as root defeats the permission bits entirely, so the
+            // assertion only holds where the mode is actually enforced.
+            if std::fs::File::create(locked.join(".probe")).is_err() {
+                let err = cfg.validate().expect_err("an unwritable upload dir");
+                let msg = err.to_string();
+                assert!(msg.contains("[multipart] upload_dir"), "got: {msg}");
+                assert!(msg.contains("cannot be written to"), "got: {msg}");
+            }
+            let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700));
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An upload root under the handler script's directory is the
+    /// upload-to-RCE chain spelled out in TOML: `require` is pinned there,
+    /// so an uploaded `.lua` file becomes a loadable module. It refuses to
+    /// boot rather than warning.
+    #[test]
+    fn an_upload_directory_inside_the_require_root_refuses_to_boot() {
+        let (mut cfg, base, _) = upload_base("rce-chain");
+        // Inside `scripts/`, where `require` is pinned — an uploaded
+        // `evil.lua` here is `require("evil")`.
+        let inside = base.join("scripts").join("uploads");
+        std::fs::create_dir_all(&inside).expect("mkdir");
+        cfg.multipart.upload_dir = Some(inside);
+
+        let err = cfg
+            .validate()
+            .expect_err("an upload dir inside package_dir");
+        let msg = err.to_string();
+        assert!(msg.contains("[multipart] upload_dir"), "got: {msg}");
+        assert!(
+            msg.contains("loadable Lua module"),
+            "the refusal must say why it matters: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The same refusal, for a handler script named without any
+    /// directory at all.
+    ///
+    /// This is the shape that once slipped through: `"app.lua".parent()`
+    /// is `Some("")`, which fails to canonicalize, so a guard that
+    /// canonicalized the raw parent silently skipped itself — while
+    /// `runtime_opts` resolved the same empty parent to `.` and pinned
+    /// `require` to the working directory. The check and the runtime
+    /// disagreed about where modules load from, and the disagreement
+    /// favoured the attacker. Both now go through
+    /// [`Config::package_dir`].
+    #[test]
+    fn a_bare_handler_script_still_refuses_an_upload_dir_beside_it() {
+        let base = std::env::temp_dir().join(format!("nitr-up-bare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("uploads")).expect("mkdir uploads");
+        std::fs::write(base.join("app.lua"), "-- handler").expect("write handler");
+
+        // The working directory *is* the require root for a bare name, so
+        // the test has to run from `base` for the layout to be the real
+        // one rather than a path-string coincidence.
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&base).expect("chdir");
+
+        let cfg = Config {
+            handler_script: PathBuf::from("app.lua"),
+            multipart: MultipartConfig {
+                upload_dir: Some(PathBuf::from("uploads")),
+            },
+            ..Config::default()
+        };
+        let result = cfg.validate();
+
+        std::env::set_current_dir(&previous).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(&base);
+
+        let err = result.expect_err("a bare handler name must not skip the check");
+        assert!(
+            err.to_string().contains("loadable Lua module"),
+            "got: {err}"
+        );
+    }
+
+    /// [`Config::package_dir`] is the single source of the `require` root,
+    /// and it must agree with what `runtime_opts` actually hands the
+    /// runtime for every way a handler path can be spelled.
+    #[test]
+    fn the_require_root_is_derived_identically_everywhere() {
+        for (script, expected) in [
+            ("app.lua", "."),
+            ("./app.lua", "."),
+            ("scripts/app.lua", "scripts"),
+            ("/srv/app/scripts/app.lua", "/srv/app/scripts"),
+        ] {
+            let cfg = Config {
+                handler_script: PathBuf::from(script),
+                ..Config::default()
+            };
+            assert_eq!(
+                cfg.package_dir(),
+                Path::new(expected),
+                "package_dir for {script}"
+            );
+            let opts = cfg.runtime_opts().expect("runtime opts");
+            assert_eq!(
+                opts.package_dir.as_deref(),
+                Some(Path::new(expected)),
+                "runtime_opts must pin `require` to the same root for {script}"
+            );
+        }
+    }
+
+    /// An upload root under `[static] dir` serves uploaded bytes back to
+    /// browsers. A real deployment shape, so it warns and still boots —
+    /// the contrast with the `package_dir` case, which refuses.
+    #[test]
+    fn an_upload_directory_inside_the_static_root_only_warns() {
+        let (mut cfg, base, _) = upload_base("static-overlap");
+        // `public/uploads` — served, and written by uploads.
+        let public = base.join("public");
+        let uploads = public.join("uploads");
+        std::fs::create_dir_all(&uploads).expect("mkdir");
+        cfg.static_files.dir = Some(public);
+        cfg.multipart.upload_dir = Some(uploads);
+
+        let warnings = cfg.warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("served back over HTTP")),
+            "the overlap must be reported: {warnings:?}"
+        );
+        cfg.validate().expect("a warning is never a refusal");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The `[multipart]` section parses in every build, including one
+    /// without the `multipart` feature — a config file that stops being
+    /// readable depending on compilation flags is not portable. Plain
+    /// `cargo test -p nitr-http` *is* that build (`default = []`).
+    #[test]
+    fn the_multipart_section_parses_without_the_multipart_feature() {
+        let toml = r#"
+            handler_script = "app.lua"
+            [multipart]
+            upload_dir = "uploads"
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("[multipart] must always parse");
+        assert_eq!(
+            cfg.multipart.upload_dir,
+            Some(PathBuf::from("uploads")),
+            "the value must survive the parse, not just the section"
         );
     }
 

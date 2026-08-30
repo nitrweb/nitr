@@ -67,6 +67,7 @@ impl Protection {
                 max_parts: cfg.limits.max_form_parts.max(1),
                 max_field_bytes: cfg.limits.max_field_bytes,
                 max_file_bytes: cfg.limits.max_file_bytes,
+                upload_root: cfg.multipart.upload_dir.clone().map(std::sync::Arc::new),
             },
             cors: crate::cors::Cors::new(&cfg.cors),
             compression: crate::compress::Compression::new(&cfg.compression),
@@ -85,7 +86,7 @@ impl Protection {
 
     /// Body-parsing bounds handed to each request.
     pub(crate) fn form_limits(&self) -> crate::request::FormLimits {
-        self.form
+        self.form.clone()
     }
 
     /// Whether error responses may carry internal detail.

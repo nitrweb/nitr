@@ -15,9 +15,9 @@ export RUSTFLAGS
 
 # The libfuzzer targets, same list as .github/workflows/fuzz.yml.
 FUZZ_TARGETS := cookie_verify accept_negotiation path_lexical json_lua \
-                range_header multipart static_resolve url_lexical \
-                cookie_header accept_encoding jwt_verify validate_formats \
-                conditional_headers basic_auth tls_pem
+                range_header multipart static_resolve upload_resolve \
+                url_lexical cookie_header accept_encoding jwt_verify \
+                validate_formats conditional_headers basic_auth tls_pem
 # Per-target fuzz time in seconds (CI uses 90).
 FUZZ_TIME ?= 60
 # A hang is a bug: bound one execution well under the run itself, since
@@ -49,6 +49,12 @@ lint: fuzz-check
 # is pure text comparison (no nightly, no cargo-fuzz, instant), so it
 # rides along with `lint` where drift gets caught by every contributor
 # rather than by a silently missing CI leg.
+#
+# It also guards the seed corpora against the mistake that is easy to make
+# and invisible afterwards: one `cargo fuzz run <target> fuzz/seeds/<target>`
+# turns the curated seed directory into libFuzzer's working corpus and
+# fills it with thousands of SHA-1-named inputs, and the good seeds are
+# then indistinguishable from the noise by eye.
 fuzz-check:
 	@bins=$$(sed -n 's/^name = "\([a-z_][a-z_]*\)"$$/\1/p' fuzz/Cargo.toml \
 		| grep -vx 'nitr_fuzz' | sort | tr '\n' ' '); \
@@ -68,8 +74,24 @@ fuzz-check:
 		echo "  fuzz.yml:   $$ci"; \
 		fail=1; \
 	fi; \
+	stray=$$(find fuzz/seeds -type f -regextype posix-extended \
+		-regex '.*/[0-9a-f]{40}$$' 2>/dev/null | sort); \
+	if [ -n "$$stray" ]; then \
+		echo "generated corpus inputs found under fuzz/seeds/:"; \
+		echo "$$stray" | sed 's/^/  /'; \
+		echo "libFuzzer names files by the SHA-1 of their contents and writes"; \
+		echo "them into its FIRST corpus directory. Passing a seed directory on"; \
+		echo "the command line makes that directory the corpus, which buries the"; \
+		echo "curated seeds in thousands of generated ones."; \
+		echo "Run \`make fuzz\` (it copies seeds into fuzz/corpus/ first), or:"; \
+		echo "  cargo +nightly fuzz run <target> -- -max_total_time=60"; \
+		echo "Never: cargo fuzz run <target> fuzz/seeds/<target>"; \
+		echo "To recover: mv the listed files into fuzz/corpus/<target>/"; \
+		fail=1; \
+	fi; \
 	if [ $$fail -ne 0 ]; then exit 1; fi; \
-	echo "fuzz targets agree across Cargo.toml, Makefile and fuzz.yml"
+	echo "fuzz targets agree across Cargo.toml, Makefile and fuzz.yml"; \
+	echo "fuzz seeds carry no generated inputs"
 
 # The test suite in both feature configurations, plus the resilience
 # suite under the shipped release profile (its own CI job: overflow

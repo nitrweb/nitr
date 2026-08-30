@@ -368,7 +368,7 @@ fn parse_spec(method: String, url: String, arg: Option<Table>) -> mlua::Result<R
                 }
             }
             if let Some(value) = table.get::<Option<Value>>("json")? {
-                crate::utils::check_json_depth(&value)?;
+                crate::utils::check_json_bounds(&value)?;
                 let bytes = serde_json::to_vec(&value).into_lua_err()?;
                 headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
                 body = Some(Bytes::from(bytes));

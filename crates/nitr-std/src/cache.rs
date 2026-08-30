@@ -228,7 +228,7 @@ impl UserData for Cache {
                     Some(opts) => opts.get::<Option<u64>>("ttl")?,
                     None => None,
                 };
-                crate::utils::check_json_depth(&value)?;
+                crate::utils::check_json_bounds(&value)?;
                 let bytes = serde_json::to_vec(&value).map_err(|err| {
                     mlua::Error::RuntimeError(format!(
                         "cache values must be plain data (a table, string, number or \
@@ -292,7 +292,7 @@ impl UserData for Cache {
                 if value.is_nil() {
                     return Ok(Value::Nil);
                 }
-                crate::utils::check_json_depth(&value)?;
+                crate::utils::check_json_bounds(&value)?;
                 let bytes = serde_json::to_vec(&value).map_err(|err| {
                     mlua::Error::RuntimeError(format!(
                         "cache:remember value for `{key}` is not serializable: {err}"

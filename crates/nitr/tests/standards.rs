@@ -49,11 +49,15 @@ app:post("/upload", function(req)
     local fields, files = {}, {}
     req:multipart(function(part)
         if part.filename then
-            local dest = nitr.cfg.upload_dir .. "/" .. part.filename
-            local size = part:save(dest)
+            -- `safe_filename` is the client's name reduced to something
+            -- that can only ever be a plain file directly inside
+            -- `[multipart] upload_dir`; the raw `filename` is still
+            -- reported, because that is what the client actually sent.
+            local size = part:save(part.safe_filename)
             files[#files + 1] = {
                 name = part.name,
                 filename = part.filename,
+                safe_filename = part.safe_filename,
                 content_type = part.content_type,
                 size = size,
             }
@@ -96,16 +100,11 @@ return app
 /// The standard app on two workers with an upload directory wired through
 /// the configuration script, the way any deployment setting reaches Lua.
 fn builder() -> harness::Builder {
-    let b = TestServer::builder("standards")
+    TestServer::builder("standards")
         .handler(APP_SCRIPT)
         .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
-        .config(|cfg| cfg.workers = 2);
-    let uploads = b.dir().join("uploads");
-    std::fs::create_dir_all(&uploads).expect("uploads dir");
-    b.config_script(format!(
-        "return {{ upload_dir = {:?} }}",
-        uploads.to_string_lossy()
-    ))
+        .config(|cfg| cfg.workers = 2)
+        .upload_dir()
 }
 
 /// Writes a static tree with a precompressed sidecar into the builder's
@@ -473,6 +472,213 @@ async fn form_and_multipart_bodies_are_parsed_in_rust() {
     srv.stop().await;
 }
 
+/// `part:save` is the only filesystem write Lua can reach, and both of its
+/// inputs are attacker-influenced. This is the audit's own attack replay:
+/// the traversal arrives once in a Lua string literal and once in
+/// `Content-Disposition`, concatenated the idiomatic way — the two
+/// independent entry points, because refusing only one is a partial fix.
+///
+/// Deleting the `resolve_target` call in `nitr-http/src/multipart.rs` must
+/// make this fail, and it does: without it both writes land outside the
+/// upload root.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uploads_cannot_escape_the_upload_directory() {
+    let b = TestServer::builder("standards-upload-escape")
+        .handler(
+            r#"
+local app = nitr.app()
+
+app:post("/upload", function(req)
+    local out = {}
+    req:multipart(function(part)
+        if part.filename then
+            -- (1) the traversal is in the Lua string.
+            local ok1, err1 = pcall(function()
+                return part:save("../nitr-pwned.lua")
+            end)
+            -- (2) the traversal rides in on the header, concatenated the
+            -- way an application would naturally write it.
+            local ok2, err2 = pcall(function()
+                return part:save("up/" .. part.filename)
+            end)
+            -- (3) absolute paths are refused, never silently re-rooted.
+            local ok3, err3 = pcall(function()
+                return part:save("/tmp/nitr-pwned-absolute")
+            end)
+            -- (4) a NUL byte is named, not an opaque OS failure.
+            local ok4, err4 = pcall(function()
+                return part:save("a\0/../../x")
+            end)
+            out[#out + 1] = { ok = ok1, err = tostring(err1) }
+            out[#out + 1] = { ok = ok2, err = tostring(err2) }
+            out[#out + 1] = { ok = ok3, err = tostring(err3) }
+            out[#out + 1] = { ok = ok4, err = tostring(err4) }
+            -- A rejected save must consume nothing, so this still works.
+            out[#out + 1] = { discarded = part:discard() }
+            -- …and the sanitized name still saves, inside the root.
+            out[#out + 1] = { safe = part.safe_filename }
+        end
+    end)
+    return nitr.json(out)
+end)
+
+return app
+"#,
+        )
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
+        .config(|cfg| cfg.workers = 1)
+        .upload_dir();
+
+    // `..` resolves through *real* directories, so the target of probe (2)
+    // has to exist or the pre-fix write would fail with ENOENT and prove
+    // nothing.
+    let uploads = b.dir().join("uploads");
+    std::fs::create_dir_all(uploads.join("up")).expect("uploads/up");
+    let mut srv = b.spawn().await;
+
+    let boundary = "----nitrescapeboundary";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"f\"; \
+             filename=\"../../pwned-by-name\"\r\nContent-Type: text/plain\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(b"os.execute('id')");
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let resp = srv
+        .client()
+        .post(srv.url("/upload"))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .await
+        .expect("upload");
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await);
+    let out: serde_json::Value = resp.json().await.expect("json");
+
+    // Every one of the four shapes is refused, and each says why rather
+    // than failing opaquely.
+    for (i, expected) in [
+        (0, "climbs out"),
+        (1, "climbs out"),
+        (2, "absolute path"),
+        (3, "NUL byte"),
+    ] {
+        assert_eq!(out[i]["ok"], false, "probe {i} must be refused: {out:?}");
+        let err = out[i]["err"].as_str().unwrap_or_default();
+        assert!(
+            err.contains(expected),
+            "probe {i} must name the rule it hit ({expected}): {err}"
+        );
+    }
+    // A refused save consumes nothing, so the part is still drainable.
+    assert!(out[4]["discarded"].is_number(), "{out:?}");
+    // The sanitized name keeps no separator and never comes back empty.
+    let safe = out[5]["safe"].as_str().expect("safe_filename");
+    assert_eq!(safe, "pwned-by-name", "got: {safe}");
+
+    // Nothing landed outside the upload root. The locations checked here
+    // are the ones an *unpatched* build actually writes to, which is not
+    // the obvious one: before the fix the path went to `File::create`
+    // verbatim, so it resolved against the server process's working
+    // directory rather than against any upload root. Reverting
+    // `resolve_target` and running this test drops `os.execute('id')` into
+    // the repository's own `crates/` directory — so that is where the
+    // assertion has to look, alongside the test tree and the absolute
+    // target.
+    let cwd = std::env::current_dir().expect("cwd");
+    let escapes = [
+        cwd.join("../nitr-pwned.lua"),
+        cwd.join("nitr-pwned.lua"),
+        srv.dir().join("nitr-pwned.lua"),
+        srv.dir().join("pwned-by-name"),
+        PathBuf::from("/tmp/nitr-pwned-absolute"),
+    ];
+    for path in &escapes {
+        assert!(
+            !path.exists(),
+            "a save escaped the upload root and created {}",
+            path.display()
+        );
+    }
+    // The upload root holds only what the sanitized name allows: the
+    // pre-created `up/` directory and nothing named by a traversal.
+    assert!(
+        !srv.dir()
+            .join("uploads")
+            .join("up")
+            .join("..")
+            .join("..")
+            .join("pwned-by-name")
+            .exists(),
+        "a traversal resolved inside the upload root"
+    );
+
+    srv.stop().await;
+}
+
+/// With no `[multipart] upload_dir` configured, `part:save` is
+/// unavailable — a clear configuration error, not the unconstrained write
+/// it used to be. A fail-open default here is the finding itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn saving_without_an_upload_directory_is_a_configuration_error() {
+    let mut srv = TestServer::builder("standards-upload-unset")
+        .handler(
+            r#"
+local app = nitr.app()
+
+app:post("/upload", function(req)
+    local caught
+    req:multipart(function(part)
+        if part.filename then
+            local ok, err = pcall(function() return part:save("a.txt") end)
+            caught = tostring(err)
+            part:discard()
+        end
+    end)
+    return nitr.json({ err = caught })
+end)
+
+return app
+"#,
+        )
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
+        .config(|cfg| cfg.workers = 1)
+        .spawn()
+        .await;
+
+    let boundary = "----nitrunsetboundary";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"f\"; \
+         filename=\"a.txt\"\r\n\r\nhello\r\n--{boundary}--\r\n"
+    );
+    let resp = srv
+        .client()
+        .post(srv.url("/upload"))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(body)
+        .send()
+        .await
+        .expect("upload");
+    let out: serde_json::Value = resp.json().await.expect("json");
+    let err = out["err"].as_str().expect("an error");
+    assert!(
+        err.contains("[multipart] upload_dir"),
+        "the refusal must name the setting to configure: {err}"
+    );
+
+    srv.stop().await;
+}
+
 /// `[limits] max_field_bytes` and `max_file_bytes`, end to end — the
 /// guards standing between an upload and the 8 MiB Lua state limit had no
 /// test firing them. An oversized *field* is refused while `part:text()`
@@ -492,7 +698,7 @@ app:post("/upload", function(req)
     local ok, err = pcall(function()
         req:multipart(function(part)
             if part.filename then
-                part:save(nitr.cfg.upload_dir .. "/" .. part.filename)
+                part:save(part.safe_filename)
             else
                 part:text()
             end
@@ -509,16 +715,10 @@ return app
             cfg.workers = 1;
             cfg.limits.max_field_bytes = 64;
             cfg.limits.max_file_bytes = 1024;
-        });
+        })
+        .upload_dir();
     let uploads = b.dir().join("uploads");
-    std::fs::create_dir_all(&uploads).expect("uploads dir");
-    let mut srv = b
-        .config_script(format!(
-            "return {{ upload_dir = {:?} }}",
-            uploads.to_string_lossy()
-        ))
-        .spawn()
-        .await;
+    let mut srv = b.spawn().await;
 
     let boundary = "----nitrlimitboundary";
     let multipart = |parts: &[(&str, Option<&str>, Vec<u8>)]| {

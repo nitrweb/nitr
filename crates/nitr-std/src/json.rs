@@ -15,7 +15,7 @@ pub(crate) struct LuaJson;
 impl UserData for LuaJson {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method_mut("encode", |lua, _, input: Value| {
-            crate::utils::check_json_depth(&input)?;
+            crate::utils::check_json_bounds(&input)?;
             let s = serde_json::to_string(&input).into_lua_err()?;
             lua.to_value(&s)
         });
@@ -38,7 +38,7 @@ impl UserData for LuaJson {
         methods.add_meta_method(
             MetaMethod::Call,
             |lua, _, (value, status): (Value, Option<u16>)| {
-                crate::utils::check_json_depth(&value)?;
+                crate::utils::check_json_bounds(&value)?;
                 let body = serde_json::to_string(&value).into_lua_err()?;
                 let table = crate::http::response_table(lua, status.unwrap_or(200))?;
                 table
@@ -200,6 +200,35 @@ mod tests {
                 proptest::prop_assert!(
                     err.to_string().contains("nested deeper than 128 levels"),
                     "depth {}: {}", depth, err
+                );
+            }
+        }
+
+    }
+
+    // Its own block so it can carry its own case count. Cost here is
+    // dominated by the top of the range — each high-level case walks the
+    // full million-visit budget — and at proptest's default 256 cases
+    // this single property ran for 63 seconds, long enough that proptest
+    // logs a "running for over 60 seconds" warning and long enough to
+    // make `cargo test` look hung. 32 cases still straddles the boundary
+    // in both directions, which is what the property is about.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(32))]
+
+        /// Property: a shared-subtree value — shallow, but exponential in
+        /// the work a tree walk does — either encodes or is refused by the
+        /// node budget, never anything else and never a hang. The depth
+        /// bound cannot be what refuses these: 22 levels is far inside it.
+        #[test]
+        fn prop_encode_shared_subtrees_are_total(levels in 1usize..=21) {
+            let lua = Lua::new();
+            let json = create_json_fn(&lua).expect("json");
+            let result = json.call_method::<String>("encode", crate::utils::dag_table(&lua, levels));
+            if let Err(err) = result {
+                proptest::prop_assert!(
+                    err.to_string().contains("expands to more than"),
+                    "levels {}: {}", levels, err
                 );
             }
         }

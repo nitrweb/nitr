@@ -86,6 +86,37 @@ A seed that decodes to nothing costs nothing at runtime, which is exactly
 why a broken one can sit unnoticed for a year. When in doubt, add a
 temporary `eprintln!` of the decoded fields, confirm, and remove it.
 
+### Never pass a seed *directory* on the command line
+
+Note that the command above names a single **file**. That is safe:
+libFuzzer runs a file argument as one input and writes nothing.
+
+A **directory** argument is a different thing entirely — it becomes
+libFuzzer's working corpus, and every interesting input it discovers is
+written *into it*, named by the SHA-1 of its contents:
+
+```sh
+# SAFE: one file, executed once, nothing written.
+cargo +nightly fuzz run json_lua seeds/json_lua/object -- -runs=1
+
+# SAFE: no directory argument, so the default fuzz/corpus/<target> is used.
+cargo +nightly fuzz run json_lua -- -max_total_time=60
+
+# WRONG: this makes the curated seed directory the corpus. One 60-second
+# run buried these seeds under 800 generated files.
+cargo +nightly fuzz run json_lua fuzz/seeds/json_lua
+```
+
+`make fuzz` does the right thing already: it `cp -n`s the seeds into
+`fuzz/corpus/<target>/` and then runs with no directory argument, so the
+seeds are used without being written to.
+
+`make fuzz-check` (which `make lint` runs, so every contributor hits it)
+fails if any file under `fuzz/seeds/` has a 40-character hex name, because
+nothing here is ever legitimately named that way. If it fires, the fix is
+to move the listed files into `fuzz/corpus/<target>/` rather than delete
+them — they are real coverage, just filed in the wrong place.
+
 ### Landing in the right field is only half of it
 
 The fields can decode perfectly and the seed still exercise nothing,

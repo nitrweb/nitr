@@ -64,6 +64,28 @@ dev_mode = true
                              # `max_body_bytes` too — it bounds the whole
                              # request, uploads included.
 
+# Filesystem policy for multipart uploads. The byte caps above stay in
+# [limits] with every other byte cap; a directory belongs here, beside
+# [static] dir and [templating] dir.
+#[multipart]
+# Root that every `part:save(path)` resolves inside. Paths passed to
+# `part:save` are RELATIVE to it: absolute paths and anything climbing out
+# with `..` are refused rather than re-rooted, so where a file lands always
+# follows from the source. Unset leaves `part:save` unavailable — there is
+# no safe directory to guess, the same call [templating] dir makes.
+# Must exist and be writable at startup.
+#
+# It must NOT sit inside the handler script's own directory: `require` is
+# pinned there, so an uploaded `.lua` file would be a loadable module.
+# That combination refuses to boot. Inside [static] dir only warns, since
+# serving uploads back is a real choice — just one to make deliberately.
+#
+# Prefer `part.safe_filename` over the raw `part.filename` when building
+# the path: it is the client's name reduced to a plain file name (no
+# separators, no control characters, never empty), so it cannot escape
+# on its own. `part.filename` stays exactly as the client sent it.
+#upload_dir = "uploads"
+
 # SQLite database for the `nitr.db` builtin. Optional: without this
 # section the `nitr.db` builtin is unavailable. `path` is the only
 # required key; the pragma defaults below are already applied.

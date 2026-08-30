@@ -33,14 +33,13 @@ app:post("/api/upload", function(req)
     local fields, files = {}, {}
     req:multipart(function(part)
         if part.filename then
-            -- The filename is client-controlled, so keep only the last
-            -- path segment and refuse anything that is not a plain name.
-            local name = part.filename:match("[^/\\]+$") or ""
-            if name == "" or name:find("%.%.") then
-                return part:discard()
-            end
-            local dest = nitr.cfg.upload_dir .. "/" .. name
-            files[#files + 1] = { name = name, size = part:save(dest) }
+            -- `part.filename` is whatever the client sent — a path, a
+            -- traversal, control characters. `part.safe_filename` is that
+            -- name reduced to a plain file name, and `part:save` resolves
+            -- it inside `[multipart] upload_dir` either way, so neither
+            -- the sanitizing nor the containment is this script's job.
+            local name = part.safe_filename
+            files[#files + 1] = { name = name, size = part:save(name) }
         else
             fields[part.name] = part:text()
         end

@@ -142,6 +142,9 @@ pub struct Builder {
     dir: TestDir,
     cfg: nitr::Config,
     handler: Option<String>,
+    /// Subdirectory the handler script is written into, when a test needs
+    /// the `require` root to be narrower than the whole test directory.
+    handler_subdir: Option<PathBuf>,
     config_script: Option<String>,
     builtins: Option<nitr::Builtins>,
     modules: Vec<(String, ModuleFn)>,
@@ -165,6 +168,7 @@ impl TestServer {
             dir: TestDir::new(label),
             cfg,
             handler: None,
+            handler_subdir: None,
             config_script: None,
             builtins: None,
             modules: Vec::new(),
@@ -193,6 +197,29 @@ impl Builder {
     /// A `config.lua` content whose returned table becomes `nitr.cfg`.
     pub fn config_script(mut self, script: impl Into<String>) -> Self {
         self.config_script = Some(script.into());
+        self
+    }
+
+    /// Configures `[multipart] upload_dir`, and moves the handler script
+    /// into a `scripts/` subdirectory so the two are siblings.
+    ///
+    /// The layout is the point, not a detail. `require` is pinned to the
+    /// handler script's own directory, so an upload root anywhere beneath
+    /// it would make every uploaded file a loadable Lua module — which
+    /// `Config::validate` refuses to boot. The flat default layout of this
+    /// harness (`app.lua` at the root of the test directory) is exactly
+    /// that shape, so a test that wants uploads has to say where the
+    /// scripts live, the same way a real deployment does:
+    ///
+    /// ```text
+    /// <test dir>/scripts/app.lua   handler, and the `require` root
+    /// <test dir>/uploads/          upload root, outside it
+    /// ```
+    pub fn upload_dir(mut self) -> Self {
+        self.handler_subdir = Some("scripts".into());
+        let uploads = self.dir.join("uploads");
+        std::fs::create_dir_all(&uploads).expect("create the upload dir");
+        self.cfg.multipart.upload_dir = Some(uploads);
         self
     }
 
@@ -278,9 +305,13 @@ impl Builder {
     /// Writes scripts and seeds the database, then hands back the
     /// finished [`nitr::Server`] builder — shared by spawn and try_build.
     fn prepare(&mut self) -> nitr::ServerBuilder {
+        let script_path = match &self.handler_subdir {
+            Some(sub) => sub.join("app.lua"),
+            None => PathBuf::from("app.lua"),
+        };
         let handler = self
             .dir
-            .write("app.lua", self.handler.as_deref().unwrap_or_default());
+            .write(script_path, self.handler.as_deref().unwrap_or_default());
         self.cfg.handler_script = handler;
         if let Some(script) = &self.config_script {
             let path = self.dir.write("config.lua", script);

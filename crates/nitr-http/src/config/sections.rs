@@ -311,6 +311,33 @@ pub struct TemplatingConfig {
     pub dir: Option<PathBuf>,
 }
 
+/// Filesystem policy for multipart uploads (`[multipart]` section).
+///
+/// The byte caps stay in [`LimitsConfig`] with every other byte cap; a
+/// directory belongs beside `[static] dir` and `[templating] dir`.
+///
+/// Parsed in every build, including one without the `multipart` feature —
+/// the same reason `FormLimits` carries its values there. A configuration
+/// file that stops being readable depending on how the binary was compiled
+/// is not portable.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MultipartConfig {
+    /// Root directory that every `part:save(path)` resolves inside.
+    ///
+    /// Unset leaves `part:save` unavailable, the same call `[templating]
+    /// dir` makes: there is no safe directory to guess, and an upload
+    /// written somewhere nobody chose is worse than a startup error.
+    /// Relative paths resolve against the working directory. Must exist
+    /// and be writable at startup.
+    ///
+    /// Paths handed to `part:save` are relative to this directory;
+    /// absolute paths and anything climbing out with `..` are refused
+    /// rather than re-rooted, so the on-disk location always follows from
+    /// the source.
+    pub upload_dir: Option<PathBuf>,
+}
+
 /// Test runner settings (`[testing]` section).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]

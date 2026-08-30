@@ -73,7 +73,7 @@ fn serialize(session: &Table) -> mlua::Result<String> {
         }
     }
     let session = Value::Table(session.clone());
-    crate::utils::check_json_depth(&session)?;
+    crate::utils::check_json_bounds(&session)?;
     let json = serde_json::to_string(&session).map_err(|err| {
         mlua::Error::RuntimeError(format!(
             "session values must be JSON-serializable (strings, numbers, booleans, tables): {err}"

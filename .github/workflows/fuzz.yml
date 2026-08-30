@@ -77,6 +77,10 @@ jobs:
             max_len: 65536
           - target: static_resolve
             max_len: 4096
+          # Upload paths are Lua strings, not URLs, and a file name is
+          # bounded by NAME_MAX — the default length is ample.
+          - target: upload_resolve
+            max_len: 4096
           - target: url_lexical
             max_len: 8192
           - target: cookie_header

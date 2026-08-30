@@ -24,6 +24,7 @@ pub(crate) mod multipart;
 pub(crate) mod protect;
 pub(crate) mod range;
 pub(crate) mod request;
+pub(crate) mod safe_path;
 pub(crate) mod server;
 pub(crate) mod static_files;
 pub(crate) mod stream;
@@ -39,7 +40,10 @@ pub mod testing;
 pub mod fuzzing {
     pub use crate::compress::{Compression, Encoding, parse_accept_encoding};
     #[cfg(feature = "multipart")]
-    pub use crate::multipart::consume_for_fuzzing as consume_multipart;
+    pub use crate::multipart::{
+        consume_for_fuzzing as consume_multipart, resolve_upload_path as resolve_upload,
+        safe_filename,
+    };
     pub use crate::range::{
         Resolved, if_range_matches, parse as parse_range, resolve as resolve_range,
     };
@@ -54,7 +58,7 @@ pub mod service;
 
 pub use config::{
     CacheConfig, CompressionConfig, Config, CorsConfig, DatabaseConfig, FetchConfig, HealthConfig,
-    LimitsConfig, LogConfig, LogFormat, LuaConfig, RateLimitConfig, ShutdownConfig, StaticConfig,
-    StdConfig, TlsConfig,
+    LimitsConfig, LogConfig, LogFormat, LuaConfig, MultipartConfig, RateLimitConfig,
+    ShutdownConfig, StaticConfig, StdConfig, TlsConfig,
 };
 pub use server::{Server, ServerBuilder};

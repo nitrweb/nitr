@@ -96,6 +96,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "upload_resolve"
+path = "fuzz_targets/upload_resolve.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "url_lexical"
 path = "fuzz_targets/url_lexical.rs"
 test = false
