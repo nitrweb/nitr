@@ -97,9 +97,10 @@ pub struct RuntimeOpts {
     /// instruction-count hook (CPU-bound loops) and an outer async timeout
     /// (slow I/O). `None` disables both.
     pub exec_timeout: Option<Duration>,
-    /// Directory `require` is confined to: `package.path` is pinned to it
-    /// and `package.cpath` is cleared (no native modules). `None` leaves the
-    /// Lua defaults untouched.
+    /// Directory `require` is confined to: `package.path` is pinned to it.
+    /// `None` skips only the pinning — every `package`-bearing state has
+    /// `package.loadlib` removed and `package.cpath` emptied regardless, so
+    /// native modules can never load.
     pub package_dir: Option<PathBuf>,
 }
 
@@ -107,16 +108,26 @@ impl Runtime {
     /// It creates a new Lua runtime with default options.
     ///
     /// Such as some **built-in** libraries loaded and a default memory limit.
+    ///
+    /// `package` is not among them, so `require` is unavailable: confinement
+    /// needs a directory to pin to, and this constructor takes no arguments to
+    /// name one. Embedders that want module loading call [`Runtime::new_with`]
+    /// with both [`StdLib::PACKAGE`] and a
+    /// [`package_dir`](RuntimeOpts::package_dir).
     pub fn new() -> Result<Self> {
         // `io` and `os` are deliberately excluded from the defaults: they
         // give scripts ambient filesystem/process access. Opt in via
         // `RuntimeOpts::libs` when needed.
+        //
+        // `package` is excluded for a different reason: its confinement is
+        // conditional on `package_dir`, which this constructor cannot supply,
+        // so enabling it here would hand out a stock `package.path`. A default
+        // that is safe but less capable is the right default for a library.
         Runtime::new_with(RuntimeOpts {
             libs: StdLib::NONE
                 | StdLib::MATH
                 | StdLib::TABLE
                 | StdLib::STRING
-                | StdLib::PACKAGE
                 | StdLib::UTF8
                 | StdLib::COROUTINE,
             memory_limit: MEMORY_LIMIT,
@@ -130,6 +141,12 @@ impl Runtime {
     ///
     /// For example, it allows for customizing the Lua standard libraries to load
     /// like `io`, `math`, `os`, etc as well as the memory limits.
+    ///
+    /// Some scrubbing applies to every state, whatever the options:
+    /// `collectgarbage` is always removed (the memory limit is enforced by
+    /// the allocator, not the collector), and `package`-bearing states can
+    /// never load native modules — see
+    /// [`package_dir`](RuntimeOpts::package_dir).
     pub fn new_with(opts: RuntimeOpts) -> Result<Self> {
         let lua = Lua::new_with(opts.libs, LuaOptions::default())?;
         lua.set_memory_limit(opts.memory_limit)?;
@@ -144,15 +161,32 @@ impl Runtime {
             globals.set("loadfile", Value::Nil)?;
         }
 
-        // Confine `require` to the configured directory and forbid loading
-        // native modules.
-        if opts.libs.contains(StdLib::PACKAGE)
-            && let Some(dir) = &opts.package_dir
-        {
-            let dir = dir.to_string_lossy();
+        // Not a confinement escape: the memory limit is enforced by the
+        // allocator, not the collector, so `collectgarbage("stop")` only
+        // reaches that limit sooner and poisons the state. It goes because no
+        // Nitr script has business pacing the collector, and `("count")` is a
+        // heap oracle.
+        lua.globals().set("collectgarbage", Value::Nil)?;
+
+        // Forbid loading native modules in every `package`-bearing state,
+        // not only the confined ones. mlua's safe constructor already stubs
+        // `package.loadlib` and the C-library searchers (`searchers[3]` is
+        // replaced, `[4]` removed — see mlua's `disable_c_modules`), so this
+        // is defense-in-depth over that guarantee, not the load-bearing
+        // layer: it is the scrub Nitr owns and tests, and the one that would
+        // survive if the state were ever built another way.
+        if opts.libs.contains(StdLib::PACKAGE) {
             let package: Table = lua.globals().get("package")?;
-            package.set("path", format!("{dir}/?.lua;{dir}/?/init.lua"))?;
+            package.set("loadlib", Value::Nil)?;
             package.set("cpath", "")?;
+
+            // Confine `require`'s search path to the configured directory.
+            // Only the pinning is conditional: without a directory there is
+            // nothing to pin to.
+            if let Some(dir) = &opts.package_dir {
+                let dir = dir.to_string_lossy();
+                package.set("path", format!("{dir}/?.lua;{dir}/?/init.lua"))?;
+            }
         }
 
         let deadline = Arc::new(AtomicU64::new(u64::MAX));

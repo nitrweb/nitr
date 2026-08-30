@@ -15,7 +15,7 @@ mod common;
 
 use common::{tokio_runtime, write_file};
 use mlua::Value;
-use nitr::{Builtins, Runtime, Server};
+use nitr::{Builtins, Config, Runtime, Server};
 
 fn main() {
     divan::main();
@@ -57,12 +57,25 @@ end)
 return app
 "#;
 
+/// The state the server actually pools: the default `[lua] stdlib` set —
+/// including `package`, with the `loadlib`/`cpath` scrub and the `require`
+/// pinning that come with it — plus the default memory limit and execution
+/// budget, derived through the same `Config::runtime_opts()` the server
+/// uses. `Runtime::new()` would be cheaper to build (its default set omits
+/// `package`), and a benchmark of the pooled state must not measure that.
+fn server_shaped_state() -> Runtime {
+    let opts = Config::default()
+        .runtime_opts()
+        .expect("derive the default runtime options");
+    Runtime::new_with(opts).expect("create a Lua runtime")
+}
+
 /// Creating a sandboxed state: standard library selection, the memory
 /// limiter, and the instruction-count hook. Paid once per pool worker, and
 /// again for every state a poisoned request forces the pool to rebuild.
 #[divan::bench]
 fn new_state(bencher: divan::Bencher<'_, '_>) {
-    bencher.bench_local(|| divan::black_box(Runtime::new().expect("create a Lua runtime")));
+    bencher.bench_local(|| divan::black_box(server_shaped_state()));
 }
 
 /// Checking a state out of the pool and returning it: the per-request
@@ -70,7 +83,7 @@ fn new_state(bencher: divan::Bencher<'_, '_>) {
 #[divan::bench]
 fn pool_checkout(bencher: divan::Bencher<'_, '_>) {
     let rt = tokio_runtime();
-    let pool = nitr::RuntimePool::new(vec![Runtime::new().expect("create a Lua runtime")]);
+    let pool = nitr::RuntimePool::new(vec![server_shaped_state()]);
     bencher.bench_local(|| {
         rt.block_on(async {
             divan::black_box(pool.get().await);

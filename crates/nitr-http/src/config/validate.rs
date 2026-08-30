@@ -62,21 +62,11 @@ impl Config {
                 self.limits.pool_wait_ms, self.lua.exec_timeout_ms
             )));
         }
-        // A warning, not an error: the stall bound still protects handlers
-        // that read the body incrementally past the compute budget — but
-        // for the common buffered read (`req:text()`, `req:form()`) the
-        // execution timeout fires first, turning what should be a clear
-        // 408 into a timeout-kind 500 that blames the handler.
-        if self.limits.body_read_ms > self.lua.exec_timeout_ms
-            && self.limits.body_read_ms != 0
-            && self.lua.exec_timeout_ms != 0
-        {
-            tracing::warn!(
-                "[limits] body_read_ms = {} exceeds [lua] exec_timeout_ms = {}: a stalled \
-                 buffered body read will surface as a handler timeout instead of a 408",
-                self.limits.body_read_ms,
-                self.lua.exec_timeout_ms
-            );
+        // Drained before the remaining hard checks, where the old inline
+        // `warn!` sat: a config refused by a TLS or health error below still
+        // logs its warnings, so the operator sees every problem in one boot.
+        for warning in self.warnings() {
+            tracing::warn!("{warning}");
         }
         self.validate_tls()?;
         if self.health.enabled {
@@ -99,6 +89,38 @@ impl Config {
             }
         }
         self.validate_paths()
+    }
+
+    /// Configurations that are legal but suspicious, as values.
+    ///
+    /// Collected rather than logged in place so each one can be asserted in
+    /// an ordinary unit test — a `tracing::warn!` is invisible to the
+    /// `Result`-shaped assertions the rest of this module is tested with,
+    /// and capturing it would cost a subscriber in `[dev-dependencies]`
+    /// purely to read back log text. [`Config::validate`] drains this list
+    /// through `tracing::warn!` at startup, so the boot output is unchanged.
+    pub(crate) fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        // The stall bound still protects handlers that read the body
+        // incrementally past the compute budget — but for the common
+        // buffered read (`req:text()`, `req:form()`) the execution timeout
+        // fires first, turning what should be a clear 408 into a
+        // timeout-kind 500 that blames the handler.
+        if self.limits.body_read_ms > self.lua.exec_timeout_ms
+            && self.limits.body_read_ms != 0
+            && self.lua.exec_timeout_ms != 0
+        {
+            out.push(format!(
+                "[limits] body_read_ms = {} exceeds [lua] exec_timeout_ms = {}: a stalled \
+                 buffered body read will surface as a handler timeout instead of a 408",
+                self.limits.body_read_ms, self.lua.exec_timeout_ms
+            ));
+        }
+        // `"debug"` is deliberately *not* warned about here: it is refused
+        // outright by `LuaConfig::parse_stdlib`, because mlua's safe
+        // constructor cannot load it at all. A warning would only precede a
+        // failure.
+        out
     }
 
     /// Rejects a `[tls]` section that cannot terminate a connection.

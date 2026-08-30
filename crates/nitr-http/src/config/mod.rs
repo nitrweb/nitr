@@ -278,6 +278,51 @@ mod tests {
         }
     }
 
+    /// Legal-but-suspicious combinations are reported as values rather than
+    /// logged in place, so they can be asserted without a capturing
+    /// subscriber.
+    #[test]
+    fn suspicious_settings_are_reported_as_warnings() {
+        let clean = valid_base();
+        assert!(
+            clean.warnings().is_empty(),
+            "the default config must warn about nothing, got: {:?}",
+            clean.warnings()
+        );
+
+        // Above the execution budget, but the pool wait stays under it — the
+        // pool-wait contradiction is a hard refusal and would mask this.
+        let mut cfg = valid_base();
+        cfg.lua.exec_timeout_ms = 5_000;
+        cfg.limits.pool_wait_ms = 4_000;
+        cfg.limits.body_read_ms = 9_000;
+        let warnings = cfg.warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("body_read_ms")),
+            "the body-read/exec-budget warning must survive the move: {warnings:?}"
+        );
+        cfg.validate().expect("a warning is never a refusal");
+    }
+
+    /// `"debug"` parses as a name but can never produce a state: mlua's safe
+    /// constructor refuses `StdLib::DEBUG` outright, so accepting it only
+    /// defers the failure to boot and reports it in terms of an internal
+    /// Rust constructor. It is refused where the names are mapped, with a
+    /// message an operator editing `nitr.toml` can act on.
+    #[test]
+    fn the_debug_library_is_refused_by_name() {
+        let mut lua = LuaConfig::default();
+        lua.stdlib.push("debug".into());
+        let err = lua
+            .parse_stdlib()
+            .expect_err("`debug` must not map to a StdLib flag");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[lua] stdlib") && msg.contains("debug"),
+            "the refusal must name the setting and the library: {msg}"
+        );
+    }
+
     #[test]
     fn contradictions_are_startup_errors() {
         let ok = valid_base();
@@ -349,15 +394,14 @@ mod tests {
                 "utf8",
                 "math",
                 "package",
-                "debug",
             ]
             .map(String::from)
             .to_vec(),
             ..LuaConfig::default()
         };
-        let libs = all.parse_stdlib().expect("all known names");
+        let libs = all.parse_stdlib().expect("all loadable names");
         assert!(libs.contains(mlua::StdLib::IO));
-        assert!(libs.contains(mlua::StdLib::DEBUG));
+        assert!(libs.contains(mlua::StdLib::PACKAGE));
     }
 
     #[test]

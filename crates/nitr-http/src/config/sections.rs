@@ -507,6 +507,14 @@ pub(crate) const TLS_MIN_VERSIONS: [&str; 2] = ["1.2", "1.3"];
 #[serde(default, deny_unknown_fields)]
 pub struct LuaConfig {
     /// Lua standard libraries loaded into every state.
+    ///
+    /// `"io"` and `"os"` give scripts ambient filesystem/process access and
+    /// are excluded by default; adding `"io"` also restores `dofile` and
+    /// `loadfile`, which read and execute any file the process can reach.
+    ///
+    /// `"debug"` is **refused**: mlua's safe constructor cannot load it, and
+    /// it would defeat the execution budget anyway, since `debug.sethook`
+    /// replaces the instruction-count hook that stops CPU-bound loops.
     pub stdlib: Vec<String>,
     /// Per-state Lua memory limit in bytes.
     pub memory_limit: usize,
@@ -545,7 +553,20 @@ impl LuaConfig {
                 "utf8" => StdLib::UTF8,
                 "math" => StdLib::MATH,
                 "package" => StdLib::PACKAGE,
-                "debug" => StdLib::DEBUG,
+                // Refused here, where the names are mapped, rather than
+                // passed through: mlua would reject `StdLib::DEBUG` at boot
+                // anyway, but naming an internal Rust constructor instead of
+                // the `nitr.toml` setting. The full rationale is the error
+                // below.
+                "debug" => {
+                    return Err(Error::Config(
+                        "[lua] stdlib cannot include \"debug\": the Lua state is built with \
+                         mlua's safe constructor, which refuses the debug library outright. \
+                         It would also defeat the execution budget, since `debug.sethook` \
+                         replaces the instruction-count hook that stops CPU-bound loops."
+                            .into(),
+                    ));
+                }
                 _ => {
                     return Err(Error::Config(format!(
                         "unknown Lua standard library `{name}`"

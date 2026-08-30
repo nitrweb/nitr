@@ -35,13 +35,27 @@ app:get("/globals", function(req)
             table.insert(leaked, name)
         end
     end
-    -- And the Lua-side sandbox: the ambient-authority libraries and the
-    -- file-executing base functions must be absent in a default server.
+    -- And the Lua-side sandbox: the ambient-authority libraries, the
+    -- file-executing base functions, and the collector control must be
+    -- absent in a default server.
     local ambient = {}
-    for _, name in ipairs({ "io", "os", "debug", "dofile", "loadfile" }) do
+    for _, name in ipairs({
+        "io", "os", "debug", "dofile", "loadfile", "collectgarbage",
+    }) do
         if _G[name] ~= nil then
             table.insert(ambient, name)
         end
+    end
+    -- The server always configures a package dir, so `package` itself is
+    -- present here — indexed unconditionally so this handler errors, and
+    -- the test fails loudly, if that ever changes rather than skipping the
+    -- checks. `loadlib` ignores `cpath` and would reach native code the
+    -- pinned `package.path` cannot contain.
+    if package.loadlib ~= nil then
+        table.insert(ambient, "package.loadlib")
+    end
+    if package.cpath ~= "" then
+        table.insert(ambient, "package.cpath")
     end
     return nitr.json({ leaked = leaked, ambient = ambient })
 end)

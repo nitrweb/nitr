@@ -246,7 +246,12 @@ features = [
 # "io" and "os" give scripts ambient filesystem/process access and are
 # deliberately NOT enabled: `nitr.time` covers dates and clocks, so
 # nothing here needs `os.date` — and with it would come `os.execute`,
-# `os.remove` and `os.getenv`.
+# `os.remove` and `os.getenv`. Adding "io" also restores `dofile` and
+# `loadfile`, which read and execute any file the process can reach.
+# "debug" is REFUSED at startup: the Lua state is built with mlua's safe
+# constructor, which cannot load it. It would also defeat the execution
+# budget, since `debug.sethook` replaces the instruction-count hook that
+# stops CPU-bound loops.
 stdlib = ["math", "table", "string", "utf8", "coroutine", "package"]
 
 # Per-state Lua memory limit in bytes. Default: 8388608 (8 MiB)

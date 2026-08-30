@@ -19,10 +19,24 @@ fn write_temp_script(name: &str, content: &str) -> PathBuf {
 fn test_runtime(exec_timeout: Option<Duration>) -> Runtime {
     Runtime::new_with(RuntimeOpts {
         libs: StdLib::MATH | StdLib::TABLE | StdLib::STRING,
-        memory_limit: 8 * 1024 * 1024,
+        memory_limit: MEMORY_LIMIT,
         dev_mode: false,
         exec_timeout,
         package_dir: None,
+    })
+    .expect("runtime")
+}
+
+/// A `package`-bearing state, confined when a directory is given — the
+/// single home for the options both `package` tests build on, so they
+/// cannot drift apart in which libraries they enable.
+fn package_runtime(package_dir: Option<PathBuf>) -> Runtime {
+    Runtime::new_with(RuntimeOpts {
+        libs: StdLib::MATH | StdLib::TABLE | StdLib::STRING | StdLib::PACKAGE,
+        memory_limit: MEMORY_LIMIT,
+        dev_mode: false,
+        exec_timeout: None,
+        package_dir,
     })
     .expect("runtime")
 }
@@ -118,9 +132,20 @@ fn the_default_library_set_carries_no_ambient_authority() {
     let rt = Runtime::new().expect("runtime");
     let globals = rt.lua().globals();
 
-    // Filesystem, process, and debug-introspection entry points, plus the
-    // base-library functions that read arbitrary files.
-    for name in ["io", "os", "debug", "dofile", "loadfile"] {
+    // Filesystem, process, and debug-introspection entry points, the
+    // base-library functions that read arbitrary files, and the collector
+    // control. `package` is absent from the default set entirely, so
+    // `require` cannot reach a search path nothing pinned.
+    for name in [
+        "io",
+        "os",
+        "debug",
+        "dofile",
+        "loadfile",
+        "collectgarbage",
+        "package",
+        "require",
+    ] {
         let value: Value = globals.get(name).expect("read global");
         assert!(
             value.is_nil(),
@@ -131,17 +156,49 @@ fn the_default_library_set_carries_no_ambient_authority() {
 
     // The safe computational set is present — the sandbox is a policy,
     // not an accident of loading nothing.
-    for name in [
-        "math",
-        "table",
-        "string",
-        "utf8",
-        "coroutine",
-        "require",
-        "pcall",
-    ] {
+    for name in ["math", "table", "string", "utf8", "coroutine", "pcall"] {
         let value: Value = globals.get(name).expect("read global");
         assert!(!value.is_nil(), "`{name}` must be available by default");
+    }
+
+    // `load` is a deliberate keep, not an oversight: a compiled chunk runs
+    // under the same instruction hook and memory limit as the code that
+    // compiled it, so it grants no authority the caller lacks. Asserted
+    // positively so a later tidy-up cannot quietly remove it.
+    let compiled: i64 = rt
+        .lua()
+        .load("return load('return 41 + 1')()")
+        .eval()
+        .expect("load compiles and runs a chunk");
+    assert_eq!(compiled, 42, "`load` must remain available");
+}
+
+/// `package.loadlib` is a confinement escape that ignores `package.cpath`:
+/// it takes an absolute path and calls straight into arbitrary native code.
+/// It must be gone from *every* `package`-bearing state — including the
+/// unconfined `package_dir: None` shape, which is the one a
+/// `package_dir`-conditional scrub would leave open.
+#[test]
+fn package_states_cannot_load_native_modules() {
+    for package_dir in [None, Some(std::env::temp_dir())] {
+        let confined = package_dir.is_some();
+        let rt = package_runtime(package_dir);
+        let lua = rt.lua();
+
+        let package: Table = lua.globals().get("package").expect("package table");
+
+        let loadlib: Value = package.get("loadlib").expect("read loadlib");
+        assert!(
+            loadlib.is_nil(),
+            "`package.loadlib` must be nil (confined: {confined}), got a {}",
+            loadlib.type_name()
+        );
+
+        let cpath: String = package.get("cpath").expect("read cpath");
+        assert_eq!(
+            cpath, "",
+            "`package.cpath` must be empty (confined: {confined})"
+        );
     }
 }
 
@@ -160,14 +217,7 @@ async fn require_is_confined_to_the_package_dir() {
     std::fs::write(root.join("outside.lua"), "return { where = 'outside' }")
         .expect("write outside");
 
-    let rt = Runtime::new_with(RuntimeOpts {
-        libs: StdLib::MATH | StdLib::TABLE | StdLib::STRING | StdLib::PACKAGE,
-        memory_limit: 8 * 1024 * 1024,
-        dev_mode: false,
-        exec_timeout: None,
-        package_dir: Some(pkg.clone()),
-    })
-    .expect("runtime");
+    let rt = package_runtime(Some(pkg.clone()));
     let lua = rt.lua();
 
     // The pinned search path and the emptied native-module path.
