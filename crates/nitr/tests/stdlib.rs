@@ -158,6 +158,63 @@ return app
 /// The CSRF middleware: safe methods pass and get a token cookie, unsafe
 /// methods need the token back (header or form field), and the comparison
 /// rejects a missing or wrong token with 403.
+/// A partial `cookie_opts` **extends** the CSRF defaults; it used to
+/// replace them, so `cookie_opts = { path = "/admin" }` shipped the token
+/// cookie with no `HttpOnly` and no `SameSite`, silently — on the more
+/// security-sensitive of the two cookie modules, while sessions merged
+/// correctly for the same job.
+///
+/// Asserted per attribute rather than against the whole header: the
+/// `cookie` crate's emission order is not this phase's contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn csrf_cookie_options_extend_the_defaults_instead_of_replacing_them() {
+    let mut server = TestServer::builder("std14-csrf-opts")
+        .handler(
+            r#"
+local app = nitr.app()
+
+-- Partial on purpose: only `path`. Everything else must survive.
+app:use(nitr.csrf({
+    secret = "csrf-secret-0123456789",
+    cookie_opts = { path = "/admin" },
+}))
+
+app:get("/form", function(req)
+    return nitr.json({ token = nitr.csrf.token(req) })
+end)
+
+return app
+"#,
+        )
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP)
+        .config(|cfg| cfg.workers = 1)
+        .spawn()
+        .await;
+
+    let resp = server.get("/form").await;
+    assert_eq!(resp.status(), 200);
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .expect("a token cookie")
+        .to_str()
+        .expect("ascii")
+        .to_string();
+
+    assert!(
+        set_cookie.contains("Path=/admin"),
+        "the caller's own option must be applied: {set_cookie}"
+    );
+    for kept in ["HttpOnly", "SameSite=Lax"] {
+        assert!(
+            set_cookie.contains(kept),
+            "a partial cookie_opts must keep `{kept}`: {set_cookie}"
+        );
+    }
+
+    server.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn csrf_middleware_protects_unsafe_methods() {
     let mut server = TestServer::builder("std14-csrf")

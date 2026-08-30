@@ -263,7 +263,7 @@ async fn run_main() -> anyhow::Result<()> {
     // broken one must not stand between them and a credential.
     if let Some(Command::HashPassword) = &cli.command {
         init_logging(None, cli.dev);
-        return cmd::hash_password::hash_password();
+        return cmd::hash_password::hash_password().await;
     }
 
     let cfg = match load_config(&cli) {

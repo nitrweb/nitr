@@ -218,6 +218,13 @@ pub struct BuiltinsEnv {
     pub fetch: FetchOptions,
     /// Read policy for the `nitr.env` builtin.
     pub env: EnvOptions,
+    /// Whether cookies Nitr builds carry `Secure` when the caller's own
+    /// options table does not say. Resolved by the server from
+    /// `[cookies] secure` and `[tls] enabled`.
+    ///
+    /// `false` in `Default` deliberately: an embedder who never sets one,
+    /// and `nitr hash-password`, keep exactly today's behaviour.
+    pub cookie_secure: bool,
 }
 
 /// Registers the selected builtins as fields of the global `nitr`
@@ -246,6 +253,14 @@ fn not_compiled_in(name: &str) -> nitr_core::Error {
 /// using the [`BuiltinsEnv`] for the resources some of them need.
 pub fn register_builtins(lua: &mlua::Lua, builtins: Builtins, env: &BuiltinsEnv) -> Result {
     let nitr = nitr_core::nitr_table(lua)?;
+    // The cookie policy is stashed per state rather than captured, because
+    // the cookie serializer is reached from `UserData` methods whose
+    // closures are registered once per type. Set unconditionally — not
+    // only under `Builtins::HTTP` — so the value a state carries never
+    // depends on which builtins happened to be enabled.
+    lua.set_app_data(http::CookieDefaults {
+        secure: env.cookie_secure,
+    });
     for builtin in builtins.iter() {
         match builtin {
             Builtins::DEBUG => nitr.set("dbg", utils::create_debug_fn(lua)?)?,

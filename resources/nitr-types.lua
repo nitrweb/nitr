@@ -272,7 +272,7 @@ function nitr.error(code, body) end
 ---@return string
 function nitr.etag(value, weak) end
 
----As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field). Options: `secret` (required), `cookie`, `header`, `field`, `cookie_opts`. (std feature: `http`)
+---As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field). Options: `secret` (required), `cookie` (the cookie NAME, default `_csrf`), `header`, `field`, and `cookie_opts` (the cookie ATTRIBUTES, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set). Note `nitr.session` spells its attribute table `cookie` — here that key is the name. (std feature: `http`)
 ---@class nitr.csrf
 ---@overload fun(opts: table): fun
 nitr.csrf = {}
@@ -282,7 +282,7 @@ nitr.csrf = {}
 ---@return string
 function nitr.csrf.token(req) end
 
----Loads (or starts) the stateless signed-cookie session. Options: `secret` (required), `name`, `max_age`, `cookie`. (std feature: `http`)
+---Loads (or starts) the stateless signed-cookie session. Options: `secret` (required), `name` (the cookie name), `max_age`, and `cookie` (the cookie ATTRIBUTES table, which extends the HttpOnly/SameSite=Lax defaults; `http_only` cannot be un-set). Note `nitr.csrf` spells the attribute table `cookie_opts` and uses `cookie` for the name. (std feature: `http`)
 ---@param req nitr.Request
 ---@param opts table
 ---@return nitr.Session
@@ -414,19 +414,19 @@ function nitr.crypto.random_bytes(n) end
 ---@return boolean
 function nitr.crypto.constant_time_eq(a, b) end
 
----argon2id hash for storage (m=19456, t=2, p=1). Also available as `nitr hash-password`.
+---argon2id hash for storage (m=19456, t=2, p=1). Also available as `nitr hash-password`. ASYNC: the argon2 work runs on the blocking pool, so this yields — call it from a handler or middleware, never from the top level of a handler script (that chunk runs outside the async executor and a yield there fails). Store hashes minted by `nitr hash-password` instead of hashing at boot.
 ---@param password string At most 1024 bytes; longer is an error, never a silent truncation.
 ---@return string
 function nitr.crypto.password_hash(password) end
 
----Verifies a password against a stored hash. Total on login input: no password, whatever its size, makes it raise.
+---Verifies a password against a stored hash. Total on login input: no password, whatever its size, makes it raise. ASYNC: the argon2 work runs on the blocking pool, so this yields — call it from a handler or middleware, never from the top level of a handler script (that chunk runs outside the async executor and a yield there fails). Store hashes minted by `nitr hash-password` instead of hashing at boot.
 ---@param password string
 ---@param hash string
 ---@return boolean _ Whether the password matches.
 ---@return string|nil _ Set only when the *stored hash* is unusable (bcrypt, truncated, absurd parameters) — nil for an ordinary wrong password, including one over `max_password_bytes` (answered false before argon2 runs, never an error).
 function nitr.crypto.password_verify(password, hash) end
 
----Spends one argon2 hash against a process-private decoy and returns false. Call it on the no-such-user branch of a login: skipping the hash there leaks your user list through response time.
+---Spends one argon2 hash against a process-private decoy and returns false. Call it on the no-such-user branch of a login: skipping the hash there leaks your user list through response time. ASYNC: the argon2 work runs on the blocking pool, so this yields — call it from a handler or middleware, never from the top level of a handler script (that chunk runs outside the async executor and a yield there fails). Store hashes minted by `nitr hash-password` instead of hashing at boot.
 ---@param password string
 ---@return boolean _ Always false.
 function nitr.crypto.password_verify_dummy(password) end
@@ -445,7 +445,7 @@ function nitr.crypto.seal(key, plaintext, aad) end
 ---@return string|nil
 function nitr.crypto.open(key, sealed, aad) end
 
----HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list; `exp`/`nbf` are checked by default. (std feature: `crypto`)
+---HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list and checks `exp`/`nbf` when present. It does NOT check `iss`, `aud` or `typ` — those are the caller's job — and a token with no `exp` never expires. See docs-feat/jwt.md. (std feature: `crypto`)
 nitr.crypto.jwt = {}
 
 ---Signs a token.
@@ -455,7 +455,7 @@ nitr.crypto.jwt = {}
 ---@return string
 function nitr.crypto.jwt.sign(claims, key, opts) end
 
----Verifies a token.
+---Verifies the signature, the `alg` against the allow-list, and `exp`/`nbf` if the token carries them. Checks no other claim: compare `iss`/`aud` yourself, and require `exp` if your tokens must expire (`aud` may be a string or an array).
 ---@param token string
 ---@param key string
 ---@param opts table `{ algorithms = {...}, leeway? }` — the allow-list is required.

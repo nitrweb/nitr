@@ -387,3 +387,141 @@ return app
 
     server.stop().await;
 }
+
+/// A failing statement must not carry its own text — or its bind values —
+/// into the error a handler receives, because that error is logged by the
+/// server *and* reachable from Lua through `nitr.errinfo`, which a handler
+/// can forward anywhere. The `db_query` span has excluded SQL text since it
+/// was written; the error path did not, ten lines below the comment saying
+/// why it must.
+///
+/// Reverting `db/mod.rs`'s message to the interpolated
+/// `format!("SQL statement `{sql}` failed: …")` must make this fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn database_errors_carry_no_statement_text() {
+    let mut server = TestServer::builder("p6-sql-redaction")
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::HTTP | nitr::Builtins::DATABASE)
+        .config(|cfg| cfg.workers = 1)
+        .database("t.db")
+        .seed_sql("CREATE TABLE t (v TEXT)")
+        .handler(
+            r#"
+local app = nitr.app()
+
+-- Every statement below embeds a distinctive literal and names a table
+-- that does not exist, so each one fails inside rusqlite with the secret
+-- in scope.
+app:get("/leak", function(req)
+    local out = {}
+    local function attempt(name, fn)
+        local ok, err = pcall(fn)
+        out[name] = tostring(err)
+    end
+    attempt("execute", function()
+        return nitr.db:execute("insert into missing (t) values ('tok_live_SEEKRET')")
+    end)
+    attempt("query", function()
+        return nitr.db:query("select 'tok_live_SEEKRET' from missing")
+    end)
+    attempt("query_row", function()
+        return nitr.db:query_row("select 'tok_live_SEEKRET' from missing")
+    end)
+    attempt("query_one", function()
+        return nitr.db:query_one("select 'tok_live_SEEKRET' from missing")
+    end)
+    attempt("params", function()
+        return nitr.db:execute("insert into missing (t) values (?1)", { "tok_live_SEEKRET" })
+    end)
+    -- Prepare-time failures are the sharp case: rusqlite's own
+    -- SqlInputError renders as "{msg} in {sql} at offset {n}", so an
+    -- error *type* — not our format string — puts the whole statement
+    -- back. "no such table" carries no offset and never sees this, which
+    -- is exactly why it cannot be the only case tested.
+    attempt("syntax", function()
+        return nitr.db:query("select 'tok_live_SEEKRET' frm t")
+    end)
+    -- A prepare-time failure whose secret sits in a quoted literal: the
+    -- shape the redaction owns. (An *unquoted* secret would come back
+    -- inside SQLite's own "no such column: …" text, which redaction
+    -- cannot remove without discarding the diagnostic entirely — and a
+    -- value reaching SQL unquoted is a SQL-injection bug in the handler,
+    -- not this one. See `redact` in nitr-std/src/db/mod.rs.)
+    attempt("unknown_column", function()
+        return nitr.db:query("select nope from t where v = 'tok_live_SEEKRET'")
+    end)
+    attempt("tx", function()
+        return nitr.db:transaction(function(tx)
+            return tx:execute("insert into missing (t) values ('tok_live_SEEKRET')")
+        end)
+    end)
+    -- Two failures of the *same* statement must carry the same tag, which
+    -- is what makes the correlator useful at all.
+    attempt("repeat1", function()
+        return nitr.db:execute("insert into missing (t) values ('tok_live_SEEKRET')")
+    end)
+    attempt("repeat2", function()
+        return nitr.db:execute("insert into missing (t) values ('tok_live_SEEKRET')")
+    end)
+    return nitr.json(out)
+end)
+
+return app
+"#,
+        )
+        .spawn()
+        .await;
+
+    let body: serde_json::Value = server.json("/leak").await;
+
+    for channel in [
+        "execute",
+        "query",
+        "query_row",
+        "query_one",
+        "params",
+        "tx",
+        "syntax",
+        "unknown_column",
+    ] {
+        let message = body[channel].as_str().unwrap_or_default();
+        assert!(
+            !message.is_empty() && message != "nil",
+            "`{channel}` was expected to fail, got: {message:?}"
+        );
+        // What must never appear: the literal a statement embedded, the
+        // bind value, and the statement text itself.
+        for leaked in ["tok_live_seekret", "insert into", "select '", "values ("] {
+            assert!(
+                !message.to_ascii_lowercase().contains(leaked),
+                "`{channel}` leaked `{leaked}`: {message}"
+            );
+        }
+        // What deliberately *does* appear: rusqlite's own reason, which
+        // names the schema object it could not find ("no such table:
+        // missing"). That is the diagnostic — without it the message is
+        // "execute failed (stmt 50f29299)" and nobody can act on it — and
+        // a schema name is not a secret the way an embedded literal is.
+        // The phase's design sketch keeps it for exactly this reason; its
+        // attack-replay wording, which also listed the table name, is the
+        // looser of the two and is not what this pins.
+        // …but the rusqlite reason survives, or the message is useless.
+        assert!(
+            message.contains("stmt "),
+            "`{channel}` must carry a correlator: {message}"
+        );
+    }
+
+    // The same statement, twice, gets the same tag.
+    let tag = |key: &str| {
+        let msg = body[key].as_str().unwrap_or_default().to_string();
+        let at = msg.find("stmt ").expect("a tag");
+        msg[at + 5..at + 13].to_string()
+    };
+    assert_eq!(
+        tag("repeat1"),
+        tag("repeat2"),
+        "the correlator must group repeated failures of one statement"
+    );
+
+    server.stop().await;
+}

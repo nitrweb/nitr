@@ -24,7 +24,7 @@ use std::io::{IsTerminal as _, Read as _, Write as _};
 use anyhow::{Context as _, bail};
 
 /// Reads a password (prompt or stdin) and prints its argon2id hash.
-pub(crate) fn hash_password() -> anyhow::Result<()> {
+pub(crate) async fn hash_password() -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let password = if stdin.is_terminal() {
         let password = prompt("Password")?;
@@ -53,7 +53,7 @@ pub(crate) fn hash_password() -> anyhow::Result<()> {
 
     // The hash alone on stdout, so `nitr hash-password > hash.txt` and
     // `$(nitr hash-password)` both give exactly the storable string.
-    println!("{}", argon2id(&password)?);
+    println!("{}", argon2id(&password).await?);
     Ok(())
 }
 
@@ -166,7 +166,7 @@ fn set_echo(_on: bool) -> bool {
 /// cannot drift from what the running server verifies. On a build without
 /// the `crypto` feature the builtin registration is what fails, with the
 /// error that already names the Cargo feature to enable.
-fn argon2id(password: &str) -> anyhow::Result<String> {
+async fn argon2id(password: &str) -> anyhow::Result<String> {
     let lua = mlua::Lua::new();
     nitr::stdlib::register_builtins(&lua, nitr::Builtins::CRYPTO, &nitr::BuiltinsEnv::default())
         .context("`nitr hash-password` needs argon2, which this build does not have")?;
@@ -178,7 +178,11 @@ fn argon2id(password: &str) -> anyhow::Result<String> {
         .context("the nitr.crypto table")?;
     let hash: mlua::Function = crypto.get("password_hash").context("password_hash")?;
     let password = lua.create_string(password)?;
-    Ok(hash.call::<String>(password)?)
+    // Awaited rather than driven on a runtime of its own: `password_hash`
+    // offloads the argon2 work to `spawn_blocking` and is therefore async,
+    // and `main` is already `#[tokio::main]` — building a second runtime
+    // here panics with "cannot start a runtime from within a runtime".
+    Ok(hash.call_async::<String>(password).await?)
 }
 
 #[cfg(test)]

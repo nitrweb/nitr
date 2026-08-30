@@ -370,8 +370,8 @@ impl UserData for ResponseCookies {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method(
             "set",
-            |_, this, (name, value, opts): (String, String, Option<Table>)| {
-                this.push(build_cookie(&name, &value, opts.as_ref())?)
+            |lua, this, (name, value, opts): (String, String, Option<Table>)| {
+                this.push(build_cookie(lua, &name, &value, opts.as_ref())?)
             },
         );
 
@@ -379,8 +379,9 @@ impl UserData for ResponseCookies {
         // secret)` can authenticate it on later requests.
         methods.add_method(
             "set_signed",
-            |_, this, (name, value, secret, opts): (String, String, String, Option<Table>)| {
+            |lua, this, (name, value, secret, opts): (String, String, String, Option<Table>)| {
                 this.push(build_cookie(
+                    lua,
                     &name,
                     &sign(&name, &value, &secret),
                     opts.as_ref(),
@@ -416,17 +417,80 @@ pub(crate) fn attach_cookie(resp: &Table, cookie: String) -> mlua::Result<()> {
     }
 }
 
+/// The per-state cookie policy, stashed by `register_builtins` and read
+/// by [`build_cookie`].
+///
+/// App data rather than a captured value because [`build_cookie`] is
+/// reached from `UserData` methods, whose closures are registered once per
+/// *type* and so cannot capture per-server state — the alternative would
+/// be threading the flag into every `ResponseCookies` construction site.
+/// Absent means not secure, matching `BuiltinsEnv`'s derived `Default`, so
+/// an embedder who never sets one keeps today's behaviour.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CookieDefaults {
+    /// Whether cookies carry `Secure` when the caller's options do not say.
+    pub secure: bool,
+}
+
+/// The resolved `Secure` default for this state; `false` when nothing
+/// registered one.
+fn secure_default(lua: &Lua) -> bool {
+    lua.app_data_ref::<CookieDefaults>()
+        .is_some_and(|defaults| defaults.secure)
+}
+
+/// Merges caller-supplied cookie options over a module's defaults and
+/// forces `http_only` back on.
+///
+/// The single home of "extend, don't replace" for cookie options. CSRF
+/// used to do the opposite — a caller passing `cookie_opts = { path =
+/// "/admin" }` got *only* that path, silently losing `HttpOnly` and
+/// `SameSite` — while sessions merged. Both now come through here, so the
+/// two cannot disagree again.
+///
+/// `http_only` is forced because no script has business reading these
+/// cookies (`nitr.csrf.token(req)` is the supported route, and a session
+/// is server state). `same_site` deliberately stays overridable: a
+/// legitimate cross-site form needs `None`, and forcing it would repeat
+/// the same mistake in the other direction.
+pub(crate) fn merge_cookie_opts(defaults: Table, caller: Option<&Table>) -> mlua::Result<Table> {
+    if let Some(caller) = caller {
+        for pair in caller.pairs::<Value, Value>() {
+            let (key, value) = pair?;
+            defaults.set(key, value)?;
+        }
+    }
+    defaults.set("http_only", true)?;
+    Ok(defaults)
+}
+
 /// Serializes one cookie, applying the recognized options: `http_only`,
 /// `secure`, `path`, `domain`, `max_age` (seconds), `same_site`
 /// (`"Strict"` / `"Lax"` / `"None"`).
-pub(crate) fn build_cookie(name: &str, value: &str, opts: Option<&Table>) -> mlua::Result<String> {
+///
+/// `secure` is the one attribute with a server-resolved default (see
+/// [`CookieDefaults`]): an explicit value from Lua always wins, in both
+/// directions, and its absence means the `[cookies] secure` policy
+/// decides. That resolution happens *outside* the options block below, so
+/// it also covers `res.cookies:set(name, value)` called with no options
+/// table at all.
+pub(crate) fn build_cookie(
+    lua: &Lua,
+    name: &str,
+    value: &str,
+    opts: Option<&Table>,
+) -> mlua::Result<String> {
     let mut builder = cookie::Cookie::build((name.to_owned(), value.to_owned()));
+    let explicit_secure = match opts {
+        Some(opts) => opts.get::<Option<bool>>("secure")?,
+        None => None,
+    };
+    if explicit_secure.unwrap_or_else(|| secure_default(lua)) {
+        builder = builder.secure(true);
+    }
     if let Some(opts) = opts {
         if opts.get::<Option<bool>>("http_only")?.unwrap_or(false) {
             builder = builder.http_only(true);
-        }
-        if opts.get::<Option<bool>>("secure")?.unwrap_or(false) {
-            builder = builder.secure(true);
         }
         if let Some(path) = opts.get::<Option<String>>("path")? {
             builder = builder.path(path);
@@ -508,6 +572,89 @@ mod tests {
         assert_eq!(verify("session", "garbage", "s3cret"), None);
     }
 
+    /// The `Secure` default reaches every cookie Nitr serializes, and an
+    /// explicit value from Lua wins in *both* directions — a caller who
+    /// writes `secure = false` on a TLS server must still get a plain
+    /// cookie, or the escape hatch is gone.
+    #[test]
+    fn the_secure_default_applies_unless_the_caller_says_otherwise() {
+        for (default_secure, explicit, want_secure) in [
+            // No policy registered at all: today's behaviour.
+            (None, None, false),
+            (Some(false), None, false),
+            (Some(true), None, true),
+            // An explicit value always wins.
+            (Some(true), Some(false), false),
+            (Some(false), Some(true), true),
+        ] {
+            let lua = mlua::Lua::new();
+            if let Some(secure) = default_secure {
+                lua.set_app_data(CookieDefaults { secure });
+            }
+            let opts = match explicit {
+                Some(value) => {
+                    let opts = lua.create_table().expect("table");
+                    opts.set("secure", value).expect("set");
+                    Some(opts)
+                }
+                None => None,
+            };
+            let cookie = build_cookie(&lua, "session", "abc", opts.as_ref()).expect("cookie");
+            assert_eq!(
+                cookie.contains("Secure"),
+                want_secure,
+                "default={default_secure:?} explicit={explicit:?} gave `{cookie}`"
+            );
+        }
+    }
+
+    /// A caller's options extend the module defaults rather than replacing
+    /// them, and `http_only` cannot be un-set.
+    #[test]
+    fn merging_cookie_options_keeps_the_defaults_a_caller_did_not_mention() {
+        let lua = mlua::Lua::new();
+        let defaults = lua.create_table().expect("table");
+        defaults.set("path", "/").expect("set");
+        defaults.set("same_site", "Lax").expect("set");
+
+        // A partial table: only `path` is mentioned.
+        let caller = lua.create_table().expect("table");
+        caller.set("path", "/admin").expect("set");
+        let merged = merge_cookie_opts(defaults, Some(&caller)).expect("merge");
+        assert_eq!(
+            merged.get::<String>("path").expect("path"),
+            "/admin",
+            "the caller's value wins"
+        );
+        assert_eq!(
+            merged.get::<String>("same_site").expect("same_site"),
+            "Lax",
+            "a default the caller did not mention must survive"
+        );
+        assert!(
+            merged.get::<bool>("http_only").expect("http_only"),
+            "http_only must survive"
+        );
+
+        // `http_only = false` cannot un-set it; `same_site` stays
+        // overridable, because a legitimate cross-site form needs `None`.
+        let defaults = lua.create_table().expect("table");
+        defaults.set("same_site", "Lax").expect("set");
+        let caller = lua.create_table().expect("table");
+        caller.set("http_only", false).expect("set");
+        caller.set("same_site", "None").expect("set");
+        let merged = merge_cookie_opts(defaults, Some(&caller)).expect("merge");
+        assert!(
+            merged.get::<bool>("http_only").expect("http_only"),
+            "http_only is forced, not merely defaulted"
+        );
+        assert_eq!(
+            merged.get::<String>("same_site").expect("same_site"),
+            "None",
+            "same_site is deliberately overridable"
+        );
+    }
+
     #[test]
     fn cookies_serialize_their_options() {
         let lua = mlua::Lua::new();
@@ -515,7 +662,7 @@ mod tests {
             .load(r#"{ http_only = true, secure = true, same_site = "Lax", max_age = 3600, path = "/" }"#)
             .eval()
             .expect("opts table");
-        let cookie = build_cookie("session", "abc", Some(&opts)).expect("cookie");
+        let cookie = build_cookie(&lua, "session", "abc", Some(&opts)).expect("cookie");
         for part in [
             "session=abc",
             "HttpOnly",

@@ -899,6 +899,7 @@ fn new_runtime(
         fetch: cfg.fetch.options(),
         env: cfg.env_options(),
         cache: cache.cloned(),
+        cookie_secure: cfg.cookies.secure.resolve(cfg.tls.enabled),
     };
     nitr_std::register_builtins(rt.lua(), builtins, &env)?;
     app::register_nitr_app(rt.lua())?;

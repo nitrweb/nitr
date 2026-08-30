@@ -38,9 +38,20 @@ struct CsrfSlot {
 /// factory runs (at app compile time, not per request).
 struct Config {
     secret: String,
+    /// The cookie's **name** (default `_csrf`) — a string, not a table.
+    ///
+    /// This is the trap in the option set, so it is named here: the
+    /// attributes live under `cookie_opts`, while `nitr.session` spells
+    /// the same idea `cookie` and takes a *table* there. A caller who
+    /// copies the session spelling and writes
+    /// `nitr.csrf({ secret = …, cookie = { path = "/admin" } })` is
+    /// passing a table where a name goes, and gets a conversion error
+    /// rather than options — see the factory's doc comment.
     cookie: String,
     header: String,
     field: String,
+    /// The cookie's attributes, **extending** the defaults rather than
+    /// replacing them. See [`cookie_opts`].
     cookie_opts: Option<Table>,
 }
 
@@ -51,15 +62,20 @@ fn new_token() -> mlua::Result<String> {
     Ok(B64.encode(buf))
 }
 
-/// Default cookie attributes when the options carry no `cookie` table:
-/// site-wide, HttpOnly (scripts get the token from `nitr.csrf.token`, not
-/// the cookie) and SameSite=Lax as a second layer of defense.
-fn default_cookie_opts(lua: &Lua) -> mlua::Result<Table> {
+/// Cookie attributes for the CSRF token cookie: site-wide, HttpOnly
+/// (scripts get the token from `nitr.csrf.token`, not the cookie) and
+/// SameSite=Lax as a second layer of defense.
+///
+/// A caller's `cookie_opts` **extends** these rather than replacing them.
+/// It used to replace: `nitr.csrf({ secret = …, cookie_opts = { path =
+/// "/admin" } })` issued its token cookie with no `HttpOnly` and no
+/// `SameSite`, silently — on the more security-sensitive of the two cookie
+/// modules, while sessions merged correctly for the same job.
+fn cookie_opts(lua: &Lua, caller: Option<&Table>) -> mlua::Result<Table> {
     let opts = lua.create_table()?;
     opts.set("path", "/")?;
-    opts.set("http_only", true)?;
     opts.set("same_site", "Lax")?;
-    Ok(opts)
+    http::merge_cookie_opts(opts, caller)
 }
 
 /// The token the request supplied: the header when present, else the
@@ -149,14 +165,11 @@ async fn handle(lua: Lua, config: Arc<Config>, next: Function, req: Value) -> ml
     // Issue the cookie on whatever goes out — including the 403, so a
     // client that lost its cookie can succeed on retry.
     if issue && let Value::Table(resp) = &resp {
-        let opts = match &config.cookie_opts {
-            Some(opts) => opts.clone(),
-            None => default_cookie_opts(&lua)?,
-        };
+        let opts = cookie_opts(&lua, config.cookie_opts.as_ref())?;
         let signed = http::sign(&config.cookie, &token, &config.secret);
         http::attach_cookie(
             resp,
-            http::build_cookie(&config.cookie, &signed, Some(&opts))?,
+            http::build_cookie(&lua, &config.cookie, &signed, Some(&opts))?,
         )?;
     }
     Ok(resp)
@@ -164,6 +177,23 @@ async fn handle(lua: Lua, config: Arc<Config>, next: Function, req: Value) -> ml
 
 /// Builds `nitr.csrf`: callable as `nitr.csrf(opts)` (the middleware
 /// factory) with `nitr.csrf.token(req)` alongside.
+///
+/// Options: `secret` (required, 16+ bytes), `cookie` (the cookie *name*,
+/// default `_csrf`), `header` (default `x-csrf-token`), `field` (the form
+/// field, default `_csrf`), and `cookie_opts` (the cookie's *attributes*).
+///
+/// **`cookie` is a name here, not a table.** `nitr.session` uses `cookie`
+/// for the attribute table and has no separate name/options split, so a
+/// caller moving between the two naturally writes
+/// `nitr.csrf({ secret = …, cookie = { path = "/admin" } })` — which
+/// passes a table where a string belongs. That fails loudly (a conversion
+/// error) rather than silently ignoring the options, but the error names
+/// neither option, so the mapping is spelled out here: the CSRF spelling
+/// is `cookie_opts`.
+///
+/// `cookie_opts` **extends** the defaults (`path = "/"`, `HttpOnly`,
+/// `SameSite=Lax`); it does not replace them, and `http_only` cannot be
+/// un-set.
 pub(crate) fn create_csrf_table(lua: &Lua) -> mlua::Result<Table> {
     let csrf = lua.create_table()?;
 

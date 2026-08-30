@@ -135,6 +135,39 @@ impl Config {
                 static_dir.display()
             ));
         }
+        // Auth cookies that will ship without `Secure`. Not a refusal:
+        // plain-HTTP local development is legitimate, and a `Secure`
+        // cookie sent over `http` is dropped by the browser silently —
+        // a far worse failure than a line an operator can read.
+        //
+        // Deliberately *not* suppressed for a loopback bind: that is
+        // precisely the terminating-proxy deployment, the one case that
+        // most needs telling, and the one `"auto"` cannot see. `dev_mode`
+        // is suppressed instead, because it is an explicit "I am
+        // developing" switch rather than a deployment shape.
+        //
+        // `"never"` on a plaintext listener is silent: the operator has
+        // answered the question, and the answer is consistent with the
+        // transport. `"never"` *with* TLS enabled is the contradiction
+        // worth naming — a server that terminates TLS and then opts its
+        // cookies out of it.
+        let secure_cookies = self.cookies.secure.resolve(self.tls.enabled);
+        let contradiction = self.cookies.secure == super::CookieSecure::Never && self.tls.enabled;
+        if !self.dev_mode
+            && (contradiction
+                || (!secure_cookies && self.cookies.secure != super::CookieSecure::Never))
+        {
+            let why = if contradiction {
+                "[cookies] secure = \"never\" is set even though [tls] enabled = true"
+            } else {
+                "[tls] enabled = false, and [cookies] secure = \"auto\" follows it"
+            };
+            out.push(format!(
+                "session and CSRF cookies will be sent without the `Secure` attribute: {why}. \
+                 If TLS is terminated by a proxy in front of this process, set \
+                 [cookies] secure = \"always\" — nothing here can detect that proxy."
+            ));
+        }
         // `"debug"` is deliberately *not* warned about here: it is refused
         // outright by `LuaConfig::parse_stdlib`, because mlua's safe
         // constructor cannot load it at all. A warning would only precede a

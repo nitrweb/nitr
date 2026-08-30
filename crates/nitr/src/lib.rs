@@ -35,8 +35,8 @@ pub use nitr_core::{
     mount, nitr_table,
 };
 pub use nitr_http::{
-    CacheConfig, CompressionConfig, Config, CorsConfig, DatabaseConfig, FetchConfig, HealthConfig,
-    LimitsConfig, LogConfig, LogFormat, LuaConfig, MultipartConfig, RateLimitConfig, Server,
-    ServerBuilder, ShutdownConfig, StdConfig, TlsConfig,
+    CacheConfig, CompressionConfig, Config, CookieSecure, CookiesConfig, CorsConfig,
+    DatabaseConfig, FetchConfig, HealthConfig, LimitsConfig, LogConfig, LogFormat, LuaConfig,
+    MultipartConfig, RateLimitConfig, Server, ServerBuilder, ShutdownConfig, StdConfig, TlsConfig,
 };
 pub use nitr_std::{Builtins, BuiltinsEnv};

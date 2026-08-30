@@ -48,13 +48,13 @@ A well-formed entity tag for whatever identifies the resource (a row version, an
 
 ### `nitr.csrf(opts) -> fun` (std feature: `http`)
 
-As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field). Options: `secret` (required), `cookie`, `header`, `field`, `cookie_opts`.
+As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field). Options: `secret` (required), `cookie` (the cookie NAME, default `_csrf`), `header`, `field`, and `cookie_opts` (the cookie ATTRIBUTES, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set). Note `nitr.session` spells its attribute table `cookie` — here that key is the name.
 
 - `nitr.csrf.token(req) -> string` — The request's token, for a form or meta tag. Requires the middleware.
 
 ### `nitr.session(req, opts) -> nitr.Session` (std feature: `http`)
 
-Loads (or starts) the stateless signed-cookie session. Options: `secret` (required), `name`, `max_age`, `cookie`.
+Loads (or starts) the stateless signed-cookie session. Options: `secret` (required), `name` (the cookie name), `max_age`, and `cookie` (the cookie ATTRIBUTES table, which extends the HttpOnly/SameSite=Lax defaults; `http_only` cannot be un-set). Note `nitr.csrf` spells the attribute table `cookie_opts` and uses `cookie` for the name.
 
 ### `nitr.app() -> nitr.App`
 
@@ -110,19 +110,19 @@ Crypto primitives (RustCrypto): compose them; never reimplement them in Lua.
 - `nitr.crypto.hmac_sha256(key, data) -> string` — HMAC-SHA256, lowercase hex.
 - `nitr.crypto.random_bytes(n) -> string` — N random bytes from the OS (1..=65536).
 - `nitr.crypto.constant_time_eq(a, b) -> boolean` — Timing-safe comparison — what `==` on secrets is not.
-- `nitr.crypto.password_hash(password) -> string` — argon2id hash for storage (m=19456, t=2, p=1). Also available as `nitr hash-password`.
-- `nitr.crypto.password_verify(password, hash) -> boolean, string|nil` — Verifies a password against a stored hash. Total on login input: no password, whatever its size, makes it raise.
-- `nitr.crypto.password_verify_dummy(password) -> boolean` — Spends one argon2 hash against a process-private decoy and returns false. Call it on the no-such-user branch of a login: skipping the hash there leaks your user list through response time.
+- `nitr.crypto.password_hash(password) -> string` — argon2id hash for storage (m=19456, t=2, p=1). Also available as `nitr hash-password`. ASYNC: the argon2 work runs on the blocking pool, so this yields — call it from a handler or middleware, never from the top level of a handler script (that chunk runs outside the async executor and a yield there fails). Store hashes minted by `nitr hash-password` instead of hashing at boot.
+- `nitr.crypto.password_verify(password, hash) -> boolean, string|nil` — Verifies a password against a stored hash. Total on login input: no password, whatever its size, makes it raise. ASYNC: the argon2 work runs on the blocking pool, so this yields — call it from a handler or middleware, never from the top level of a handler script (that chunk runs outside the async executor and a yield there fails). Store hashes minted by `nitr hash-password` instead of hashing at boot.
+- `nitr.crypto.password_verify_dummy(password) -> boolean` — Spends one argon2 hash against a process-private decoy and returns false. Call it on the no-such-user branch of a login: skipping the hash there leaks your user list through response time. ASYNC: the argon2 work runs on the blocking pool, so this yields — call it from a handler or middleware, never from the top level of a handler script (that chunk runs outside the async executor and a yield there fails). Store hashes minted by `nitr hash-password` instead of hashing at boot.
 - `nitr.crypto.seal(key, plaintext, aad) -> string` — Authenticated encryption (XChaCha20-Poly1305); printable token.
 - `nitr.crypto.open(key, sealed, aad) -> string|nil` — Opens a sealed token; nil on any tampering.
 - `nitr.crypto.max_password_bytes: integer` — The password cap (1024 bytes): password_hash raises above it, password_verify answers a plain false. Read it to size a registration field — `#pw > nitr.crypto.max_password_bytes` is the pre-check that turns password_hash's error into a 400.
 
 ### `nitr.crypto.jwt` (std feature: `crypto`)
 
-HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list; `exp`/`nbf` are checked by default.
+HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list and checks `exp`/`nbf` when present. It does NOT check `iss`, `aud` or `typ` — those are the caller's job — and a token with no `exp` never expires. See docs-feat/jwt.md.
 
 - `nitr.crypto.jwt.sign(claims, key, opts) -> string` — Signs a token.
-- `nitr.crypto.jwt.verify(token, key, opts) -> table|nil, string|nil` — Verifies a token.
+- `nitr.crypto.jwt.verify(token, key, opts) -> table|nil, string|nil` — Verifies the signature, the `alg` against the allow-list, and `exp`/`nbf` if the token carries them. Checks no other claim: compare `iss`/`aud` yourself, and require `exp` if your tokens must expire (`aud` may be a string or an array).
 
 ### `nitr.auth` (std feature: `crypto`)
 

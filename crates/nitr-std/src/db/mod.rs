@@ -58,18 +58,32 @@ where
     T: Send + 'static,
     F: FnOnce(&Connection, &str, &[SqlValue]) -> Result<T, rusqlite::Error> + Send + 'static,
 {
-    // The `db_query` span: which statement kind ran and for how long.
-    // Deliberately no SQL text and no bind values — statements can embed
-    // secrets, and logs outlive them. DEBUG so the per-request
-    // decomposition is opt-in via the level filter.
-    let span = tracing::debug_span!("db_query", kind, elapsed_ms = tracing::field::Empty);
+    // The `db_query` span: which statement kind ran, for how long, and a
+    // correlator for *which* statement. Deliberately no SQL text and no
+    // bind values — statements can embed secrets, and logs outlive them.
+    // DEBUG so the per-request decomposition is opt-in via the level
+    // filter.
+    let stmt_tag = stmt_tag(&sql);
+    let span = tracing::debug_span!(
+        "db_query",
+        kind,
+        stmt = %stmt_tag,
+        elapsed_ms = tracing::field::Empty
+    );
     let started = std::time::Instant::now();
     let result = tokio::task::spawn_blocking(move || {
         let conn = conn.lock().map_err(|_| {
             mlua::Error::RuntimeError("failed to lock the database connection".into())
         })?;
+        // The same policy as the span above, and for the same reason: this
+        // message becomes an ordinary Lua error, so it reaches the
+        // operator's log through the handler's error path *and* reaches
+        // application Lua through `nitr.errinfo`, which can forward it
+        // anywhere. Interpolating the statement here put a token or an
+        // email address in a literal into both. The tag keeps repeated
+        // failures groupable without carrying what the statement said.
         f(&conn, &sql, &params).map_err(|err| {
-            mlua::Error::RuntimeError(format!("SQL statement `{sql}` failed: {err}"))
+            mlua::Error::RuntimeError(format!("{kind} failed (stmt {stmt_tag}): {}", redact(&err)))
         })
     })
     .instrument(span.clone())
@@ -77,6 +91,54 @@ where
     .map_err(mlua::Error::external)?;
     span.record("elapsed_ms", started.elapsed().as_millis() as u64);
     result
+}
+
+/// Renders a rusqlite error without the statement it came from.
+///
+/// Dropping the interpolated `{sql}` from our own `format!` is not enough:
+/// `rusqlite::Error::SqlInputError`'s own `Display` is
+/// `"{msg} in {sql} at offset {n}"`, so every prepare-time failure that
+/// carries an offset — a syntax error, an unknown column — puts the whole
+/// statement back into the message, quoted literals included. That is the
+/// original leak, re-entering through the error type rather than through
+/// the caller. Everything else formats normally: no other variant embeds
+/// the statement.
+///
+/// The offset survives because it is a position, not content, and it is
+/// what makes the message actionable next to the statement tag.
+///
+/// One residual, stated rather than papered over: SQLite's own `msg` names
+/// the *identifier* it could not resolve (`no such column: foo`). If an
+/// application interpolated an untrusted value into the statement as a
+/// bare identifier, that value appears here. Nothing this function can do
+/// helps — the message would have to be discarded entirely, leaving
+/// "query failed (stmt a1b2c3d4)" and nothing to act on — and a value
+/// reaching SQL unquoted is a SQL-injection bug in the handler, which is a
+/// different and larger problem than the one this redaction addresses.
+/// Bind parameters (`?1`) are the fix for that, and they never reach the
+/// statement text at all.
+fn redact(err: &rusqlite::Error) -> String {
+    match err {
+        rusqlite::Error::SqlInputError { msg, offset, .. } => {
+            format!("{msg} at offset {offset}")
+        }
+        other => other.to_string(),
+    }
+}
+
+/// A short correlator for a statement, so repeated failures of the *same*
+/// query can be grouped in a log without the log carrying the query.
+///
+/// Stable **within one process only**: `DefaultHasher`'s output is not
+/// guaranteed across Rust releases, and nothing here should encourage
+/// treating the tag as an identifier that outlives the run. It is chosen
+/// over a digest to avoid coupling the database to the optional `crypto`
+/// feature for what is a log-grouping aid, not a security primitive.
+fn stmt_tag(sql: &str) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sql.hash(&mut hasher);
+    format!("{:08x}", hasher.finish() as u32)
 }
 
 /// Executes a control statement (`BEGIN`, `COMMIT`, `SAVEPOINT ...`).

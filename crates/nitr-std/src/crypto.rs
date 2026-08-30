@@ -89,10 +89,26 @@ fn pw_err(err: argon2::password_hash::Error) -> mlua::Error {
     mlua::Error::RuntimeError(format!("password hashing failed: {err}"))
 }
 
+/// Lowercase hex digits, indexed by nibble.
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+/// Lowercase hex, two characters per byte.
+///
+/// A nibble lookup rather than `format!("{b:02x}")` per byte: the old form
+/// ran the whole `core::fmt` machinery and allocated a temporary `String`
+/// for every byte of every digest. The table is 16 bytes — one cache line
+/// — and the output is byte-identical, which is the entire safety
+/// argument for the change.
+///
+/// This encodes digest and MAC *outputs*, never a value being compared:
+/// comparison has its own primitive (`constant_time_eq`), so a
+/// data-dependent table index introduces no property the `format!` did
+/// not already have.
 fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        out.push_str(&format!("{b:02x}"));
+        out.push(HEX_DIGITS[(b >> 4) as usize] as char);
+        out.push(HEX_DIGITS[(b & 0x0f) as usize] as char);
     }
     out
 }
@@ -143,9 +159,33 @@ pub fn create_crypto_table(lua: &Lua) -> mlua::Result<Table> {
         })?,
     )?;
 
+    // Argon2 is deliberately expensive — ~19 MiB of scratch and tens of
+    // milliseconds — and none of that is interruptible: it is synchronous
+    // Rust, so the instruction hook never fires and the async timeout
+    // never fires. Run inline it holds a tokio *worker* for its whole
+    // duration, and with `workers` of them busy the executor cannot even
+    // answer `/healthz`. So all three argon2 doors offload to the blocking
+    // pool, the shape `db/mod.rs` already uses: only plain `Send` data
+    // crosses, never a Lua handle.
+    //
+    // Concurrency is bounded by the state pool, not by anything here: one
+    // pooled state serves one request at a time and no builtin fans a
+    // state out over several hashes (`nitr.await_all`'s job set is a
+    // closed enum of fetch and db work). Worst case is `workers`
+    // concurrent blocking tasks against a 512-thread default pool — which
+    // is why there is no semaphore. That invariant becomes load-bearing
+    // the day `await_all` grows a hashing job.
     crypto.set(
         "password_hash",
-        lua.create_function(|_, password: LuaString| hash_password(&password.as_bytes()))?,
+        lua.create_async_function(|_, password: LuaString| async move {
+            let password = password.as_bytes().to_vec();
+            // Before the offload: an over-cap password must cost a length
+            // comparison, not a blocking-pool slot.
+            check_password_len(&password)?;
+            tokio::task::spawn_blocking(move || hash_password(&password))
+                .await
+                .map_err(mlua::Error::external)?
+        })?,
     )?;
 
     // The cap, as data, so a registration form can size its field with
@@ -229,8 +269,8 @@ pub fn create_crypto_table(lua: &Lua) -> mlua::Result<Table> {
     // `jwt.verify`: nil-plus-reason on the failure path.
     crypto.set(
         "password_verify",
-        lua.create_function(|lua, (password, hash): (LuaString, String)| {
-            let password = password.as_bytes();
+        lua.create_async_function(|lua, (password, hash): (LuaString, String)| async move {
+            let password = password.as_bytes().to_vec();
             // Over the cap is answered, not raised: no stored hash was
             // ever minted from a password this long (`password_hash`
             // refuses them), so it is a credential that cannot match —
@@ -255,18 +295,22 @@ pub fn create_crypto_table(lua: &Lua) -> mlua::Result<Table> {
                 );
                 return Ok((false, Value::Nil));
             }
-            match parse_stored_hash(&hash) {
-                Err(reason) => reject_hash(lua, &hash, reason),
-                Ok(parsed) => match Argon2::default().verify_password(&password, &parsed) {
-                    Ok(()) => Ok((true, Value::Nil)),
-                    // `Error::Password` is the one benign outcome: a
-                    // well-formed argon2 hash that this password does not
-                    // match. Everything else is the hash's fault, and the
-                    // guards above have already ruled out the cases the
-                    // verifier itself reports as `Password`.
-                    Err(argon2::password_hash::Error::Password) => Ok((false, Value::Nil)),
-                    Err(_) => reject_hash(lua, &hash, "unusable hash"),
-                },
+            // Both the parse (which enforces the stored-parameter
+            // ceilings) and the verification run on the blocking pool.
+            // The parse has to go with it: `PasswordHash` borrows the hash
+            // string, so splitting them would either send a borrow across
+            // the boundary or re-parse on the worker.
+            let owned = hash.clone();
+            let outcome = tokio::task::spawn_blocking(move || verify_stored(&password, &owned))
+                .await
+                .map_err(mlua::Error::external)?;
+            match outcome {
+                VerifyOutcome::Matched => Ok((true, Value::Nil)),
+                VerifyOutcome::Mismatch => Ok((false, Value::Nil)),
+                // Logging the rejection needs `&Lua`, so it stays on this
+                // side of the boundary — the blocking half returns a
+                // plain reason and touches nothing Lua.
+                VerifyOutcome::Rejected(reason) => reject_hash(&lua, &hash, reason),
             }
         })?,
     )?;
@@ -276,7 +320,21 @@ pub fn create_crypto_table(lua: &Lua) -> mlua::Result<Table> {
     // comparison in that case leaks its user list.
     crypto.set(
         "password_verify_dummy",
-        lua.create_function(|_, password: LuaString| dummy_verify(&password.as_bytes()))?,
+        lua.create_async_function(|_, password: LuaString| async move {
+            let password = password.as_bytes().to_vec();
+            // Before the offload, and symmetric with `password_verify`'s
+            // over-cap answer, so the two branches of a login still cost
+            // the same and leak nothing about which one ran.
+            if password.len() > MAX_PASSWORD_BYTES {
+                return Ok(false);
+            }
+            // The first call in a process mints the decoy, so it pays for
+            // two hashes — which is exactly why it belongs off the worker
+            // rather than on it.
+            tokio::task::spawn_blocking(move || dummy_verify(&password))
+                .await
+                .map_err(mlua::Error::external)?
+        })?,
     )?;
 
     Ok(crypto)
@@ -358,6 +416,48 @@ fn hash_password(password: &[u8]) -> mlua::Result<String> {
         .hash_password(password, &salt)
         .map_err(pw_err)?
         .to_string())
+}
+
+/// What a stored-hash verification concluded, as plain `Send` data.
+///
+/// The boundary type for the blocking offload: the verification runs on
+/// the blocking pool, which cannot touch a `Lua`, so it reports an outcome
+/// and the caller does the Lua-side logging.
+enum VerifyOutcome {
+    /// The password matches the stored hash.
+    Matched,
+    /// A well-formed argon2 hash this password does not match — the one
+    /// benign failure.
+    Mismatch,
+    /// The stored row is at fault, with the reason to log.
+    Rejected(&'static str),
+}
+
+/// The blocking half of `password_verify`: parse the stored hash (which
+/// enforces the parameter ceilings) and verify against it.
+///
+/// Note what this does *not* do. The ceilings cap a single verification;
+/// they do not make an at-ceiling row cheap. A stored hash at m=262144,
+/// t=8, p=8 is accepted by design, and verifying it can still buy roughly
+/// 256 MiB and seconds of a blocking-pool slot — the offload relocates
+/// that cost off the async worker, it does not bound it. That is
+/// acceptable because the ceiling caps one verification, the state pool
+/// caps concurrency at `workers`, and the hashes come from the
+/// deployment's own database rather than from an attacker.
+fn verify_stored(password: &[u8], hash: &str) -> VerifyOutcome {
+    match parse_stored_hash(hash) {
+        Err(reason) => VerifyOutcome::Rejected(reason),
+        Ok(parsed) => match Argon2::default().verify_password(password, &parsed) {
+            Ok(()) => VerifyOutcome::Matched,
+            // `Error::Password` is the one benign outcome: a well-formed
+            // argon2 hash that this password does not match. Everything
+            // else is the hash's fault, and `parse_stored_hash` has
+            // already ruled out the cases the verifier reports as
+            // `Password`.
+            Err(argon2::password_hash::Error::Password) => VerifyOutcome::Mismatch,
+            Err(_) => VerifyOutcome::Rejected("unusable hash"),
+        },
+    }
 }
 
 /// Parses a stored hash, or names why it can never verify anything.
@@ -531,6 +631,30 @@ fn jwt_reject(lua: &Lua, reason: &str) -> mlua::Result<(Value, Value)> {
 }
 
 /// Builds `nitr.crypto.jwt`: verification first, signing second.
+///
+/// # What `verify` does not check
+///
+/// It enforces the signature, the mandatory `algorithms` allow-list, and
+/// `exp`/`nbf`. It checks **no registered claim beyond those**, and the
+/// omissions are invisible at the call site, so they are written down
+/// here and in `docs-feat/jwt.md`:
+///
+/// - **`iss` and `aud` are never read.** A token minted for another
+///   audience, or by another issuer, verifies here exactly like one minted
+///   for you. Comparing them is the caller's job.
+/// - **`typ` is written on sign and never verified.** `sign` sets
+///   `typ: "JWT"` in the header; `verify` does not look at it. The
+///   asymmetry is the trap: the field's presence suggests a check that
+///   does not exist.
+/// - **`exp` and `nbf` are checked only when present.** A token carrying
+///   neither never expires. Nothing requires them, so "the signature is
+///   valid" and "the token is still good" are different questions.
+///
+/// Shipping primitives rather than a framework is deliberate — a claim
+/// policy belongs to the application — but an undocumented omission is a
+/// defect regardless of that. See `docs-feat/jwt.md` for the caller-side
+/// checks to write, including the `aud`-is-a-string-or-an-array edge
+/// (RFC 7519 §4.1.3).
 fn create_jwt_table(lua: &Lua) -> mlua::Result<Table> {
     let jwt = lua.create_table()?;
 
@@ -761,29 +885,47 @@ mod tests {
         )
     }
 
+    /// Drives one async Lua call to completion on a throwaway runtime.
+    ///
+    /// The three password functions offload argon2 to `spawn_blocking`, so
+    /// they are async and need a reactor. A helper rather than
+    /// `#[tokio::test]` on each test because the proptest block below is
+    /// sync by construction and needs the same path — and because argon2
+    /// itself dwarfs the cost of building a current-thread runtime.
+    fn pw<R: mlua::FromLuaMulti + 'static>(
+        f: &mlua::Function,
+        args: impl mlua::IntoLuaMulti,
+    ) -> mlua::Result<R> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(f.call_async::<R>(args))
+    }
+
     #[test]
     fn passwords_hash_and_verify() {
         let lua = Lua::new();
         let (hash_fn, verify, _) = password_fns(&lua);
-        let hash: String = hash_fn.call("hunter2").expect("hash");
+        let hash: String = pw(&hash_fn, "hunter2").expect("hash");
         assert!(hash.starts_with("$argon2id$"), "got: {hash}");
 
         // A correct password verifies, with no reason attached.
         let (ok, why): (bool, Option<String>) =
-            verify.call(("hunter2", hash.clone())).expect("verify");
+            pw(&verify, ("hunter2", hash.clone())).expect("verify");
         assert!(ok);
         assert_eq!(why, None);
 
         // A wrong password against a usable hash is `false, nil`: the
         // absent reason is what says "the hash was fine".
-        let (ok, why): (bool, Option<String>) = verify.call(("wrong", hash)).expect("verify");
+        let (ok, why): (bool, Option<String>) = pw(&verify, ("wrong", hash)).expect("verify");
         assert!(!ok);
         assert_eq!(why, None);
 
         // The old single-value call shape still works — callers written
         // against `local ok = password_verify(...)` must not break.
-        let hash: String = hash_fn.call("hunter2").expect("hash");
-        assert!(verify.call::<bool>(("hunter2", hash)).expect("verify"));
+        let hash: String = pw(&hash_fn, "hunter2").expect("hash");
+        assert!(pw::<bool>(&verify, ("hunter2", hash)).expect("verify"));
     }
 
     /// Every stored hash Nitr cannot verify names *why*, instead of being
@@ -847,7 +989,7 @@ mod tests {
             ),
         ] {
             let (ok, why): (bool, Option<String>) =
-                verify.call(("hunter2", stored)).expect("verify");
+                pw(&verify, ("hunter2", stored)).expect("verify");
             assert!(!ok, "{stored:?} verified");
             assert_eq!(why.as_deref(), Some(expected), "for {stored:?}");
             assert!(
@@ -861,13 +1003,15 @@ mod tests {
         // complaint about the hash. Weak parameters are a policy question
         // for whoever wrote the row, not a verification failure — and the
         // fuzz target leans on this entry to reach the KDF cheaply.
-        let (ok, why): (bool, Option<String>) = verify
-            .call((
+        let (ok, why): (bool, Option<String>) = pw(
+            &verify,
+            (
                 "hunter2",
                 "$argon2id$v=19$m=8,t=1,p=1$mHVoGfzni7/d60QmEsVJlw$\
                  7rFvapCGZeh96Zf4R2I/pEVmV2YRWxfl6xo5yGL3F6Q",
-            ))
-            .expect("verify");
+            ),
+        )
+        .expect("verify");
         assert!(!ok);
         assert_eq!(why, None);
 
@@ -894,15 +1038,12 @@ mod tests {
         let at_cap = "x".repeat(MAX_PASSWORD_BYTES);
         let over_cap = "x".repeat(MAX_PASSWORD_BYTES + 1);
 
-        let hash: String = hash_fn
-            .call(at_cap.clone())
-            .expect("a 1 KiB password hashes");
-        assert!(verify.call::<bool>((at_cap.clone(), hash)).expect("verify"));
-        assert!(!dummy.call::<bool>(at_cap).expect("dummy"));
+        let hash: String = pw(&hash_fn, at_cap.clone()).expect("a 1 KiB password hashes");
+        assert!(pw::<bool>(&verify, (at_cap.clone(), hash)).expect("verify"));
+        assert!(!pw::<bool>(&dummy, at_cap).expect("dummy"));
 
-        let err = hash_fn
-            .call::<String>(over_cap.clone())
-            .expect_err("1 KiB + 1 byte must not hash");
+        let err =
+            pw::<String>(&hash_fn, over_cap.clone()).expect_err("1 KiB + 1 byte must not hash");
         assert!(
             err.to_string().contains("at most 1024 bytes"),
             "unhelpful error: {err}"
@@ -916,12 +1057,11 @@ mod tests {
         // stored hash here is malformed on purpose — the length check
         // must win, or an oversized password would still warn about the
         // row.
-        let (ok, why): (bool, Option<String>) = verify
-            .call((over_cap.clone(), "$argon2id$"))
+        let (ok, why): (bool, Option<String>) = pw(&verify, (over_cap.clone(), "$argon2id$"))
             .expect("an over-cap password answers, it does not raise");
         assert!(!ok);
         assert_eq!(why, None, "an over-cap password is an ordinary miss");
-        assert!(!dummy.call::<bool>(over_cap).expect("dummy answers false"));
+        assert!(!pw::<bool>(&dummy, over_cap).expect("dummy answers false"));
 
         // The cap is data a script can read, and it matches the enforced
         // constant — a drifted copy would send registration forms a 400
@@ -942,7 +1082,7 @@ mod tests {
         let (_, _, dummy) = password_fns(&lua);
 
         for password in ["", "hunter2", "\0\u{feff}ñ", &"x".repeat(512)] {
-            assert!(!dummy.call::<bool>(password).expect("dummy"));
+            assert!(!pw::<bool>(&dummy, password).expect("dummy"));
         }
 
         // The decoy is one process-wide hash with the same parameters a
@@ -1202,6 +1342,41 @@ mod tests {
             sha256.call::<String>("abc").expect("digest"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+        // The empty input, whose digest is the one every implementation
+        // publishes — a nibble table is exactly where an off-by-one hides,
+        // and this is the known answer that catches one.
+        assert_eq!(
+            sha256.call::<String>("").expect("digest"),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // A single byte, chosen so both nibbles differ and neither is
+        // zero: `0x61` must render as "61", not "16", "6" or "061".
+        assert_eq!(
+            sha256.call::<String>("a").expect("digest"),
+            "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+        );
+        // Every nibble value appears across those three, and each digest
+        // is exactly two characters per byte.
+        for input in ["", "a", "abc"] {
+            let digest = sha256.call::<String>(input).expect("digest");
+            assert_eq!(digest.len(), 64, "sha256 of {input:?} is 32 bytes");
+            assert!(
+                digest
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "hex must be lowercase and complete: {digest}"
+            );
+        }
+
+        // `hex` is shared with the MAC, so pin that caller too rather than
+        // leaving one of the two encoders untested.
+        let hmac: mlua::Function = crypto.get("hmac_sha256").expect("fn");
+        let mac = hmac.call::<String>(("key", "abc")).expect("mac");
+        assert_eq!(mac.len(), 64);
+        assert!(
+            mac.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
 
         let eq: mlua::Function = crypto.get("constant_time_eq").expect("fn");
         assert!(eq.call::<bool>(("same", "same")).expect("eq"));
@@ -1231,24 +1406,24 @@ mod tests {
             let (hash_fn, verify, dummy) = password_fns(&lua);
             let secret = lua.create_string(&password).expect("bytes");
 
-            let hash: String = hash_fn.call(&secret).expect("hash");
+            let hash: String = pw(&hash_fn, &secret).expect("hash");
             proptest::prop_assert!(hash.starts_with("$argon2id$"), "got: {}", hash);
 
             let (ok, why): (bool, Option<String>) =
-                verify.call((&secret, hash.clone())).expect("verify");
+                pw(&verify, (&secret, hash.clone())).expect("verify");
             proptest::prop_assert!(ok, "a password did not verify against its own hash");
             proptest::prop_assert_eq!(why, None);
 
             if other != password {
                 let wrong = lua.create_string(&other).expect("bytes");
                 let (ok, why): (bool, Option<String>) =
-                    verify.call((&wrong, hash)).expect("verify");
+                    pw(&verify, (&wrong, hash)).expect("verify");
                 proptest::prop_assert!(!ok, "a different password verified");
                 proptest::prop_assert_eq!(why, None);
             }
 
             // The unknown-user path answers false for anything.
-            proptest::prop_assert!(!dummy.call::<bool>(&secret).expect("dummy"));
+            proptest::prop_assert!(!pw::<bool>(&dummy, &secret).expect("dummy"));
         }
     }
 

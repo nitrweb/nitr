@@ -213,8 +213,18 @@ pub fn run(conn: &Connection, dir: &Path) -> Result<Vec<String>> {
             None => {}
         }
 
+        // The file name, never the file's SQL — and through `redact`,
+        // because `SqlInputError`'s own `Display` would otherwise put the
+        // whole failing statement back into the message. A migration is
+        // operator-authored rather than request-shaped, but it is exactly
+        // the kind of file that carries a seeded credential in a literal,
+        // and this error reaches the boot log.
         let fail = |err: rusqlite::Error| {
-            Error::Config(format!("migration `{}` failed: {err}", migration.name))
+            Error::Config(format!(
+                "migration `{}` failed: {}",
+                migration.name,
+                super::redact(&err)
+            ))
         };
         conn.execute_batch("BEGIN").map_err(fail)?;
         let result = conn

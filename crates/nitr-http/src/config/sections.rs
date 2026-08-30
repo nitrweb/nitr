@@ -311,6 +311,59 @@ pub struct TemplatingConfig {
     pub dir: Option<PathBuf>,
 }
 
+/// When cookies Nitr builds carry the `Secure` attribute
+/// (`[cookies] secure`).
+///
+/// Tri-state rather than a bool because the most common Nitr deployment —
+/// a loopback bind behind a terminating proxy — needs `Secure` cookies
+/// while `[tls] enabled = false` is the correct setting for this process.
+/// A bool cannot express that without reading as a contradiction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CookieSecure {
+    /// `Secure` when `[tls] enabled = true`. Warns at boot when it
+    /// resolves to *not* secure, since this cannot see a proxy in front.
+    #[default]
+    Auto,
+    /// Always `Secure`: TLS is terminated in front of this process.
+    Always,
+    /// Never `Secure`: plain-HTTP development.
+    Never,
+}
+
+impl CookieSecure {
+    /// Resolves the policy against whether this process terminates TLS.
+    pub fn resolve(self, tls_enabled: bool) -> bool {
+        match self {
+            Self::Auto => tls_enabled,
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
+
+/// Cookie defaults (`[cookies]` section).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CookiesConfig {
+    /// Default `Secure` attribute for cookies Nitr builds — the session
+    /// and CSRF cookies, and anything through `res.cookies:set` /
+    /// `:set_signed` — when the caller's own options table does not set
+    /// `secure`. An explicit `secure` from Lua always wins, in both
+    /// directions.
+    ///
+    /// This reaches only cookies Nitr *builds*. A handler that writes the
+    /// header itself (`headers = { ["Set-Cookie"] = "a=1" }`) is converted
+    /// straight through and never passes the serializer, so that cookie's
+    /// attributes are the script's own responsibility.
+    ///
+    /// Deliberately not forced the way `HttpOnly` is: a `Secure` cookie
+    /// sent over plain `http` is dropped by the browser without a word, so
+    /// forcing it would break local development with a failure mode far
+    /// worse than a startup line.
+    pub secure: CookieSecure,
+}
+
 /// Filesystem policy for multipart uploads (`[multipart]` section).
 ///
 /// The byte caps stay in [`LimitsConfig`] with every other byte cap; a

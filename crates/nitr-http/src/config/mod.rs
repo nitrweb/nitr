@@ -82,6 +82,8 @@ pub struct Config {
     pub templating: TemplatingConfig,
     /// Filesystem policy for multipart uploads (`[multipart]` section).
     pub multipart: MultipartConfig,
+    /// Cookie defaults (`[cookies]` section).
+    pub cookies: CookiesConfig,
     /// Test runner settings (`[testing]` section).
     pub testing: TestingConfig,
     /// Environment access for the `nitr.env` builtin (`[env]` section).
@@ -121,6 +123,7 @@ impl Default for Config {
             static_files: StaticConfig::default(),
             templating: TemplatingConfig::default(),
             multipart: MultipartConfig::default(),
+            cookies: CookiesConfig::default(),
             testing: TestingConfig::default(),
             env: EnvConfig::default(),
             lua: LuaConfig::default(),
@@ -299,12 +302,74 @@ mod tests {
     /// subscriber.
     #[test]
     fn suspicious_settings_are_reported_as_warnings() {
+        // The default configuration carries exactly one warning, and it is
+        // load-bearing rather than noise: no TLS and `[cookies] secure =
+        // "auto"` means auth cookies really will ship without `Secure`,
+        // which is correct for local development and wrong behind a
+        // terminating proxy — the case nothing here can detect. Asserted
+        // as a set rather than as "empty" so a *new* warning on the
+        // default path is still a visible failure.
         let clean = valid_base();
-        assert!(
-            clean.warnings().is_empty(),
-            "the default config must warn about nothing, got: {:?}",
-            clean.warnings()
+        let warnings = clean.warnings();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the default config must carry only the Secure-cookie warning, got: {warnings:?}"
         );
+        assert!(
+            warnings[0].contains("without the `Secure` attribute"),
+            "got: {warnings:?}"
+        );
+
+        // …and it goes away the moment the deployment says how it
+        // terminates TLS, in either direction.
+        let mut secure = valid_base();
+        secure.cookies.secure = CookieSecure::Always;
+        assert!(
+            secure.warnings().is_empty(),
+            "`always` is an explicit answer: {:?}",
+            secure.warnings()
+        );
+        let mut tls = valid_base();
+        tls.tls.enabled = true;
+        assert!(
+            !tls.warnings().iter().any(|w| w.contains("Secure")),
+            "TLS on satisfies `auto`: {:?}",
+            tls.warnings()
+        );
+        // `dev_mode` is an explicit "I am developing" switch, so it
+        // suppresses the warning; a loopback bind deliberately does not.
+        let mut dev = valid_base();
+        dev.dev_mode = true;
+        assert!(
+            dev.warnings().is_empty(),
+            "dev_mode suppresses it: {:?}",
+            dev.warnings()
+        );
+
+        // The full policy table, row by row. `"never"` on a plaintext
+        // listener is a consistent answer and stays silent; `"never"`
+        // *with* TLS is the contradiction worth naming.
+        for (secure, tls, want_warning) in [
+            (CookieSecure::Auto, true, false),
+            (CookieSecure::Auto, false, true),
+            (CookieSecure::Always, true, false),
+            (CookieSecure::Always, false, false),
+            (CookieSecure::Never, true, true),
+            (CookieSecure::Never, false, false),
+        ] {
+            let mut cfg = valid_base();
+            cfg.cookies.secure = secure;
+            cfg.tls.enabled = tls;
+            let warned = cfg
+                .warnings()
+                .iter()
+                .any(|w| w.contains("without the `Secure` attribute"));
+            assert_eq!(
+                warned, want_warning,
+                "[cookies] secure = {secure:?} with [tls] enabled = {tls}"
+            );
+        }
 
         // Above the execution budget, but the pool wait stays under it — the
         // pool-wait contradiction is a hard refusal and would mask this.

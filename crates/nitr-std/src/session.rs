@@ -34,13 +34,12 @@ fn cookie_opts(lua: &Lua, base: Option<&Table>, max_age: Option<i64>) -> mlua::R
     let opts = lua.create_table()?;
     opts.set("path", "/")?;
     opts.set("same_site", "Lax")?;
-    if let Some(base) = base {
-        for pair in base.pairs::<Value, Value>() {
-            let (k, v) = pair?;
-            opts.set(k, v)?;
-        }
-    }
-    opts.set("http_only", true)?;
+    // Shared with `nitr.csrf` so the two cannot drift: merge the caller's
+    // table over these, then force `http_only`.
+    let opts = http::merge_cookie_opts(opts, base)?;
+    // After the merge deliberately: the deletion cookie's `max_age = 0` is
+    // the mechanism that expires it, so a caller's `max_age` must not be
+    // able to keep a cleared session alive.
     if let Some(max_age) = max_age {
         opts.set("max_age", max_age)?;
     }
@@ -137,12 +136,14 @@ pub(crate) fn create_session_fn(lua: &Lua) -> mlua::Result<mlua::Function> {
                     let cookie = if empty {
                         // An empty session deletes its cookie.
                         http::build_cookie(
+                            lua,
                             &name,
                             "",
                             Some(&cookie_opts(lua, base_opts.as_ref(), Some(0))?),
                         )?
                     } else {
                         http::build_cookie(
+                            lua,
                             &name,
                             &http::sign(&name, &json, &secret),
                             Some(&cookie_opts(lua, base_opts.as_ref(), max_age)?),

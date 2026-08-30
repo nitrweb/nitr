@@ -71,6 +71,11 @@ pub(crate) async fn run_tests(cfg: Config, filter: Option<&str>) -> anyhow::Resu
         // Tests get their own cache: a test file must not see entries a
         // previous one left behind.
         cache: Some(nitr::stdlib::Cache::new(cfg.cache_options())),
+        // Resolved the way the server resolves it, not left at the
+        // default: `nitr test` boots a real `Server` from this same `cfg`
+        // below, so a cookie assertion written in a test file must
+        // exercise the policy production will run.
+        cookie_secure: cfg.cookies.secure.resolve(cfg.tls.enabled),
     };
     let opts = cfg.runtime_opts()?;
 

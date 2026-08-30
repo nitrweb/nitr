@@ -86,6 +86,29 @@ dev_mode = true
 # on its own. `part.filename` stays exactly as the client sent it.
 #upload_dir = "uploads"
 
+# Cookie defaults. Applies to cookies Nitr builds — the session and CSRF
+# cookies, and anything through `res.cookies:set` / `:set_signed`. A
+# handler that writes the `Set-Cookie` header itself bypasses this
+# entirely; that cookie's attributes are the script's own business.
+#[cookies]
+# When those cookies carry the `Secure` attribute, if the caller's own
+# options table does not set `secure` (an explicit value from Lua always
+# wins, in both directions).
+#   "auto"    Secure when [tls] enabled = true            (default)
+#   "always"  always Secure: TLS is terminated in front of this process
+#   "never"   never Secure: plain-HTTP development
+#
+# `"always"` is not a nicety. The most common deployment is a loopback
+# bind behind a terminating proxy, where [tls] enabled = false is correct
+# for this process *and* the cookies must still be Secure. Nothing here
+# can detect that proxy, so a configuration resolving to "not secure"
+# warns at startup rather than guessing.
+#
+# Deliberately not forced the way HttpOnly is: a Secure cookie sent over
+# plain http is dropped by the browser silently, which is a far worse
+# failure than a startup line.
+#secure = "auto"
+
 # SQLite database for the `nitr.db` builtin. Optional: without this
 # section the `nitr.db` builtin is unavailable. `path` is the only
 # required key; the pragma defaults below are already applied.

@@ -385,7 +385,7 @@ returns = [{ type = "string" }]
 [[fn]]
 name = "nitr.csrf"
 feature = "http"
-desc = "As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field). Options: `secret` (required), `cookie`, `header`, `field`, `cookie_opts`."
+desc = "As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field). Options: `secret` (required), `cookie` (the cookie NAME, default `_csrf`), `header`, `field`, and `cookie_opts` (the cookie ATTRIBUTES, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set). Note `nitr.session` spells its attribute table `cookie` — here that key is the name."
 params = [{ name = "opts", type = "table" }]
 returns = [{ type = "fun" }]
 methods = [
@@ -395,7 +395,7 @@ methods = [
 [[fn]]
 name = "nitr.session"
 feature = "http"
-desc = "Loads (or starts) the stateless signed-cookie session. Options: `secret` (required), `name`, `max_age`, `cookie`."
+desc = "Loads (or starts) the stateless signed-cookie session. Options: `secret` (required), `name` (the cookie name), `max_age`, and `cookie` (the cookie ATTRIBUTES table, which extends the HttpOnly/SameSite=Lax defaults; `http_only` cannot be un-set). Note `nitr.csrf` spells the attribute table `cookie_opts` and uses `cookie` for the name."
 params = [
   { name = "req", type = "nitr.Request" },
   { name = "opts", type = "table" },
@@ -481,9 +481,9 @@ functions = [
   { name = "hmac_sha256", params = [{ name = "key", type = "string" }, { name = "data", type = "string" }], returns = [{ type = "string" }], desc = "HMAC-SHA256, lowercase hex." },
   { name = "random_bytes", params = [{ name = "n", type = "integer" }], returns = [{ type = "string" }], desc = "N random bytes from the OS (1..=65536)." },
   { name = "constant_time_eq", params = [{ name = "a", type = "string" }, { name = "b", type = "string" }], returns = [{ type = "boolean" }], desc = "Timing-safe comparison — what `==` on secrets is not." },
-  { name = "password_hash", params = [{ name = "password", type = "string", desc = "At most 1024 bytes; longer is an error, never a silent truncation." }], returns = [{ type = "string" }], desc = "argon2id hash for storage (m=19456, t=2, p=1). Also available as `nitr hash-password`." },
-  { name = "password_verify", params = [{ name = "password", type = "string" }, { name = "hash", type = "string" }], returns = [{ type = "boolean", desc = "Whether the password matches." }, { type = "string|nil", desc = "Set only when the *stored hash* is unusable (bcrypt, truncated, absurd parameters) — nil for an ordinary wrong password, including one over `max_password_bytes` (answered false before argon2 runs, never an error)." }], desc = "Verifies a password against a stored hash. Total on login input: no password, whatever its size, makes it raise." },
-  { name = "password_verify_dummy", params = [{ name = "password", type = "string" }], returns = [{ type = "boolean", desc = "Always false." }], desc = "Spends one argon2 hash against a process-private decoy and returns false. Call it on the no-such-user branch of a login: skipping the hash there leaks your user list through response time." },
+  { name = "password_hash", params = [{ name = "password", type = "string", desc = "At most 1024 bytes; longer is an error, never a silent truncation." }], returns = [{ type = "string" }], desc = "argon2id hash for storage (m=19456, t=2, p=1). Also available as `nitr hash-password`. ASYNC: the argon2 work runs on the blocking pool, so this yields — call it from a handler or middleware, never from the top level of a handler script (that chunk runs outside the async executor and a yield there fails). Store hashes minted by `nitr hash-password` instead of hashing at boot." },
+  { name = "password_verify", params = [{ name = "password", type = "string" }, { name = "hash", type = "string" }], returns = [{ type = "boolean", desc = "Whether the password matches." }, { type = "string|nil", desc = "Set only when the *stored hash* is unusable (bcrypt, truncated, absurd parameters) — nil for an ordinary wrong password, including one over `max_password_bytes` (answered false before argon2 runs, never an error)." }], desc = "Verifies a password against a stored hash. Total on login input: no password, whatever its size, makes it raise. ASYNC: the argon2 work runs on the blocking pool, so this yields — call it from a handler or middleware, never from the top level of a handler script (that chunk runs outside the async executor and a yield there fails). Store hashes minted by `nitr hash-password` instead of hashing at boot." },
+  { name = "password_verify_dummy", params = [{ name = "password", type = "string" }], returns = [{ type = "boolean", desc = "Always false." }], desc = "Spends one argon2 hash against a process-private decoy and returns false. Call it on the no-such-user branch of a login: skipping the hash there leaks your user list through response time. ASYNC: the argon2 work runs on the blocking pool, so this yields — call it from a handler or middleware, never from the top level of a handler script (that chunk runs outside the async executor and a yield there fails). Store hashes minted by `nitr hash-password` instead of hashing at boot." },
   { name = "seal", params = [{ name = "key", type = "string", desc = "Exactly 32 bytes." }, { name = "plaintext", type = "string" }, { name = "aad", type = "string?" }], returns = [{ type = "string" }], desc = "Authenticated encryption (XChaCha20-Poly1305); printable token." },
   { name = "open", params = [{ name = "key", type = "string" }, { name = "sealed", type = "string" }, { name = "aad", type = "string?" }], returns = [{ type = "string|nil" }], desc = "Opens a sealed token; nil on any tampering." },
 ]
@@ -494,10 +494,10 @@ fields = [
 [[table]]
 name = "nitr.crypto.jwt"
 feature = "crypto"
-desc = "HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list; `exp`/`nbf` are checked by default."
+desc = "HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list and checks `exp`/`nbf` when present. It does NOT check `iss`, `aud` or `typ` — those are the caller's job — and a token with no `exp` never expires. See docs-feat/jwt.md."
 functions = [
   { name = "sign", params = [{ name = "claims", type = "table" }, { name = "key", type = "string" }, { name = "opts", type = "table?", desc = "`{ alg = \"HS256\" }`" }], returns = [{ type = "string" }], desc = "Signs a token." },
-  { name = "verify", params = [{ name = "token", type = "string" }, { name = "key", type = "string" }, { name = "opts", type = "table", desc = "`{ algorithms = {...}, leeway? }` — the allow-list is required." }], returns = [{ type = "table|nil", desc = "The claims." }, { type = "string|nil", desc = "The rejection reason." }], desc = "Verifies a token." },
+  { name = "verify", params = [{ name = "token", type = "string" }, { name = "key", type = "string" }, { name = "opts", type = "table", desc = "`{ algorithms = {...}, leeway? }` — the allow-list is required." }], returns = [{ type = "table|nil", desc = "The claims." }, { type = "string|nil", desc = "The rejection reason." }], desc = "Verifies the signature, the `alg` against the allow-list, and `exp`/`nbf` if the token carries them. Checks no other claim: compare `iss`/`aud` yourself, and require `exp` if your tokens must expire (`aud` may be a string or an array)." },
 ]
 
 [[table]]

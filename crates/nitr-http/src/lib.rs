@@ -57,8 +57,8 @@ pub mod fuzzing {
 pub mod service;
 
 pub use config::{
-    CacheConfig, CompressionConfig, Config, CorsConfig, DatabaseConfig, FetchConfig, HealthConfig,
-    LimitsConfig, LogConfig, LogFormat, LuaConfig, MultipartConfig, RateLimitConfig,
-    ShutdownConfig, StaticConfig, StdConfig, TlsConfig,
+    CacheConfig, CompressionConfig, Config, CookieSecure, CookiesConfig, CorsConfig,
+    DatabaseConfig, FetchConfig, HealthConfig, LimitsConfig, LogConfig, LogFormat, LuaConfig,
+    MultipartConfig, RateLimitConfig, ShutdownConfig, StaticConfig, StdConfig, TlsConfig,
 };
 pub use server::{Server, ServerBuilder};

@@ -205,6 +205,30 @@ thread_local! {
         lua.globals().set("auth", auth).expect("nitr.auth global");
         lua
     };
+
+    /// One current-thread runtime for the whole process.
+    ///
+    /// `password_hash`, `password_verify` and `password_verify_dummy`
+    /// offload their argon2 work to `spawn_blocking`, so they are async
+    /// Lua functions and need a reactor: calling them with `Function::call`
+    /// under libFuzzer panics with "there is no reactor running" on *every*
+    /// input, which silently reduces this target — the one carrying the
+    /// password and auth contract assertions — to zero coverage.
+    static RT: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("fuzz runtime");
+}
+
+/// Drives one async Lua call to completion on the per-process runtime.
+///
+/// The same shape `crypto.rs`'s own test helper uses. Only the three
+/// password functions need it; `auth.basic`/`auth.bearer` stay synchronous.
+fn pw<R: mlua::FromLuaMulti + 'static>(
+    f: &Function,
+    args: impl mlua::IntoLuaMulti,
+) -> mlua::Result<R> {
+    RT.with(|rt| rt.block_on(f.call_async::<R>(args)))
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -332,8 +356,7 @@ fn check_basic(basic: &Function, header: &str) -> Option<(Vec<u8>, Vec<u8>)> {
 /// password within the cap: the outcome must be something a handler can
 /// branch on, not a 500.
 fn verify(f: &Function, password: &LuaString, stored: &str, problems: &[&str]) -> (bool, Option<String>) {
-    let (ok, reason): (bool, Option<String>) = f
-        .call((password, stored))
+    let (ok, reason): (bool, Option<String>) = pw(f, (password, stored))
         .unwrap_or_else(|err| panic!("password_verify raised for {stored:?}: {err}"));
     if ok {
         assert_eq!(
@@ -495,13 +518,12 @@ fuzz_target!(|data: &[u8]| {
             .expect("string");
         verify(&verifier, &at_cap, MIN_COST_HASH, problems);
         assert!(
-            hasher.call::<Value>(&over_cap).is_err(),
+            pw::<Value>(&hasher, &over_cap).is_err(),
             "password_hash accepted a password of {} bytes",
             MAX_PASSWORD_BYTES + 1
         );
         assert!(
-            !dummy
-                .call::<bool>(&over_cap)
+            !pw::<bool>(&dummy, &over_cap)
                 .expect("password_verify_dummy must answer an over-cap password, not raise"),
             "password_verify_dummy returned true for an over-cap password"
         );
@@ -513,7 +535,7 @@ fuzz_target!(|data: &[u8]| {
         );
         if password_bytes.len() > MAX_PASSWORD_BYTES {
             assert!(
-                hasher.call::<Value>(&password).is_err(),
+                pw::<Value>(&hasher, &password).is_err(),
                 "password_hash accepted {} bytes",
                 password_bytes.len()
             );
@@ -522,7 +544,7 @@ fuzz_target!(|data: &[u8]| {
         // the round trip
         // Sampled: this branch is four argon2id passes at 19 MiB apiece.
         if work % 32 == 0 && password_bytes.len() <= MAX_PASSWORD_BYTES {
-            let fresh: String = hasher.call(&password).expect("password_hash");
+            let fresh: String = pw(&hasher, &password).expect("password_hash");
             assert!(
                 fresh.starts_with(HASH_PREFIX),
                 "password_hash produced {fresh:?}, not {HASH_PREFIX}…"
@@ -551,8 +573,7 @@ fuzz_target!(|data: &[u8]| {
 
             // The unknown-user branch of every login handler: total, and
             // false for anything.
-            let decoyed: bool = dummy
-                .call(&password)
+            let decoyed: bool = pw(&dummy, &password)
                 .expect("password_verify_dummy never raises within the cap");
             assert!(!decoyed, "password_verify_dummy returned true");
         }

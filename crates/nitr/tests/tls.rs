@@ -63,10 +63,8 @@ impl TlsServer {
     /// Spawns a TLS server on a reserved port. `tune` gets the config
     /// after `[tls]` has been filled in, for tests that need to break it.
     async fn spawn(label: &str, tune: impl FnOnce(&mut nitr::Config)) -> Self {
-        let dir = TestDir::new(label);
-        let identity = mint(&dir);
-        let handler = dir.write(
-            "app.lua",
+        Self::spawn_with(
+            label,
             r#"
             local app = nitr.app()
             app:get("/hello", function(req)
@@ -78,7 +76,18 @@ impl TlsServer {
             end)
             return app
             "#,
-        );
+            tune,
+        )
+        .await
+    }
+
+    /// As [`spawn`](Self::spawn), with the handler script supplied — for
+    /// tests whose subject is what the handler produces rather than the
+    /// transport itself.
+    async fn spawn_with(label: &str, handler: &str, tune: impl FnOnce(&mut nitr::Config)) -> Self {
+        let dir = TestDir::new(label);
+        let identity = mint(&dir);
+        let handler = dir.write("app.lua", handler);
 
         // Port 0, kept bound: nothing can take it between choosing it and
         // serving on it — the same rule the plaintext harness follows.
@@ -354,4 +363,94 @@ async fn a_half_configured_tls_section_refuses_to_build() {
         err.to_string().to_ascii_lowercase().contains("mismatch"),
         "the refusal must say the key does not match the certificate, got: {err}"
     );
+}
+
+/// Cookies Nitr builds must carry `Secure` on a TLS server, all the way
+/// from `[cookies] secure` through `BuiltinsEnv` and the per-state app
+/// data to the bytes on the wire.
+///
+/// This is the case the unit tests structurally cannot cover: the one in
+/// `http.rs` hand-sets the app data and the one in `session.rs` passes
+/// `secure = true` explicitly, so both pass even with the *plumbing*
+/// deleted. Verified by reverting `server.rs`'s
+/// `cookie_secure: cfg.cookies.secure.resolve(cfg.tls.enabled)` to
+/// `false`: every other test in the workspace stays green and only this
+/// one fails.
+///
+/// Asserted per attribute rather than against the whole header — the
+/// `cookie` crate's emission order is not this phase's contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cookies_are_secure_over_tls() {
+    const HANDLER: &str = r#"
+local app = nitr.app()
+
+app:use(nitr.csrf({ secret = "csrf-secret-0123456789" }))
+
+app:get("/cookies", function(req)
+    local res = nitr.text("ok")
+    -- Every route a cookie leaves the process by. The bare `set` takes no
+    -- options table at all, which is the shape a default that lived
+    -- inside the options block would miss.
+    res.cookies:set("plain", "1")
+    res.cookies:set_signed("signed", "2", "cookie-secret-0123456789")
+    -- An explicit `secure = false` must still win, or the escape hatch is
+    -- gone.
+    res.cookies:set("optout", "3", { secure = false })
+
+    local s = nitr.session(req, { secret = "0123456789abcdef" })
+    s.user = "u1"
+    s:save(res)
+    return res
+end)
+
+return app
+"#;
+
+    let mut server = TlsServer::spawn_with("tls-cookies", HANDLER, |_| {}).await;
+
+    let resp = server
+        .client()
+        .get(server.url("/cookies"))
+        .send()
+        .await
+        .expect("a TLS request must succeed");
+    assert_eq!(resp.status(), 200);
+
+    let cookies: Vec<String> = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().expect("ascii").to_string())
+        .collect();
+
+    let find = |name: &str| {
+        cookies
+            .iter()
+            .find(|c| c.starts_with(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("no `{name}` cookie in {cookies:?}"))
+            .clone()
+    };
+
+    // Everything Nitr serializes carries `Secure` on a TLS server…
+    for name in ["plain", "signed", "session", "_csrf"] {
+        let cookie = find(name);
+        assert!(
+            cookie.contains("Secure"),
+            "`{name}` must be Secure on a TLS server: {cookie}"
+        );
+    }
+    // …and the session and CSRF cookies keep their other attributes.
+    for name in ["session", "_csrf"] {
+        let cookie = find(name);
+        assert!(cookie.contains("HttpOnly"), "{cookie}");
+        assert!(cookie.contains("SameSite=Lax"), "{cookie}");
+    }
+    // …but an explicit opt-out still wins.
+    let optout = find("optout");
+    assert!(
+        !optout.contains("Secure"),
+        "an explicit `secure = false` must beat the default: {optout}"
+    );
+
+    server.stop().await;
 }

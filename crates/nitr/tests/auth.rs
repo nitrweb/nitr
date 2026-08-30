@@ -81,8 +81,15 @@ fn the_test_encoder_agrees_with_rfc_4648() {
 const LOGIN_HANDLER: &str = r#"
 local app = nitr.app()
 
+-- Stored hashes, not hashes computed here. `password_hash` offloads
+-- argon2 to the blocking pool and is therefore async, which means it
+-- cannot run in this chunk: the handler script's top level is evaluated
+-- outside the async executor, so a yield here has no coroutine to yield
+-- to. That is the right shape anyway — a real deployment stores hashes
+-- minted by `nitr hash-password`, it does not burn argon2 per boot.
 local users = {
-    ada = nitr.crypto.password_hash("lovelace"),
+    -- `nitr hash-password` for "lovelace".
+    ada = "$argon2id$v=19$m=19456,t=2,p=1$vMXfHutNUW2TKOAlXkcjhw$4inB2KB+UGSwuLVU21BPzcYITNSqQ7Hs39S0/v8g6Pw",
     -- Not re-hashed during the migration from the old app. Every login as
     -- `grace` fails; before password_verify grew a reason, nothing
     -- anywhere said why.
@@ -291,6 +298,112 @@ async fn an_unknown_user_costs_the_same_as_a_wrong_password() {
         slow <= fast * 20,
         "the two login paths cost {known:?} and {unknown:?}: a gap that size \
          is measurable over a network"
+    );
+
+    server.stop().await;
+}
+
+/// Argon2 must not run on an async worker.
+///
+/// It is ~19 MiB of scratch and tens of milliseconds of uninterruptible
+/// synchronous Rust: the instruction hook cannot fire (no Lua executes)
+/// and the async timeout cannot fire (nothing yields). Run inline it holds
+/// a tokio worker for the whole hash, and with every worker hashing the
+/// executor cannot answer anything at all.
+///
+/// `/healthz` is the right canary rather than an ordinary route: it is
+/// answered by Rust on the main listener *before* `Protection` and without
+/// taking a pooled state, so a slow reply means the executor itself is
+/// starved rather than the state pool merely being busy.
+///
+/// Reverting the three entry points to `create_function` must make this
+/// fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hashing_does_not_starve_the_executor() {
+    let mut server = TestServer::builder("auth-offload")
+        .handler(
+            r#"
+local app = nitr.app()
+
+app:get("/hash", function(req)
+    return nitr.json({ hash = nitr.crypto.password_hash("hunter2") })
+end)
+
+return app
+"#,
+        )
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::CRYPTO)
+        // More workers than executor threads, so every worker can be busy
+        // hashing while the executor still has to answer the probe.
+        .config(|cfg| cfg.workers = 4)
+        .spawn()
+        .await;
+
+    // One warm-up hash, timed, so every bound below is relative to what
+    // argon2 actually costs on this machine rather than a wall-clock
+    // constant — it is roughly 10x slower in the debug profile `cargo
+    // test` uses than in release, and slower again on a small CI box.
+    let started = Instant::now();
+    let warm = server.client().get(server.url("/hash")).send().await;
+    assert_eq!(warm.expect("warm-up hash").status(), 200);
+    let one_hash = started.elapsed();
+
+    // Saturate every pooled state.
+    let mut hashes = Vec::new();
+    for _ in 0..8 {
+        let client = server.client().clone();
+        let url = server.url("/hash");
+        hashes.push(tokio::spawn(async move {
+            client.get(url).send().await.map(|r| r.status().as_u16())
+        }));
+    }
+
+    // Probe continuously for the whole saturation window and keep the
+    // WORST round trip.
+    //
+    // The worst one is the measurement that matters, and a single probe is
+    // not: tokio interleaves a lone probe's few wakeups between argon2
+    // polls, so even a fully blocked executor usually answers one probe
+    // quickly. What it cannot do is answer while *every* worker thread is
+    // inside a single ~600 ms synchronous argon2 call — no task is polled
+    // at all until one returns. Sampling across the window is what catches
+    // that state, and it is the difference a deadline on one probe misses.
+    //
+    // Throughput is deliberately not the signal either: argon2 is CPU
+    // bound, so on a machine with fewer cores than workers the offload
+    // does not make the hashes finish sooner. It makes the executor stay
+    // responsive while they run, which is exactly this.
+    let probe_client = server.client().clone();
+    let probe_url = server.url("/healthz");
+    let probes = tokio::spawn(async move {
+        let mut worst = Duration::ZERO;
+        let mut count = 0u32;
+        let until = Instant::now() + one_hash * 2;
+        while Instant::now() < until {
+            let at = Instant::now();
+            let resp = probe_client.get(&probe_url).send().await;
+            assert_eq!(resp.expect("healthz").status(), 200);
+            worst = worst.max(at.elapsed());
+            count += 1;
+        }
+        (worst, count)
+    });
+
+    for hash in hashes {
+        let status = hash.await.expect("join").expect("hash request");
+        assert_eq!(status, 200);
+    }
+    let (worst_probe, probe_count) = probes.await.expect("probe task");
+
+    assert!(probe_count > 0, "the probe loop never completed a request");
+    // Half a hash is the threshold with room on both sides: run inline the
+    // worst probe waits about a whole hash (every worker is in argon2);
+    // offloaded it stays in the low milliseconds.
+    assert!(
+        worst_probe < one_hash / 2,
+        "the worst of {probe_count} /healthz probes took {worst_probe:?} against \
+         a single hash of {one_hash:?} — argon2 is holding the async workers \
+         instead of the blocking pool"
     );
 
     server.stop().await;
