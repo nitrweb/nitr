@@ -259,7 +259,13 @@ impl UserData for LuaRequest {
         // The size argument is what lets a handler process an upload larger
         // than its own memory limit: the request-side mirror of a streaming
         // response. `nil` marks the end of the body.
-        methods.add_async_method_mut("read", |lua, mut req, n: Option<usize>| async move {
+        // `n` is taken as a full Lua integer, not `usize`: a Lua integer
+        // is 64-bit on every platform while `usize` is not, and on a
+        // 32-bit target a script asking for more than 4 GiB would fail
+        // the conversion — an error on one platform for what is a plain
+        // "read everything" on another. The saturation below (with the
+        // clamp after it) keeps the pointer width invisible to scripts.
+        methods.add_async_method_mut("read", |lua, mut req, n: Option<i64>| async move {
             let body_limit = req.body_limit;
             let reader = req.req.body_mut();
             let Some(want) = n else {
@@ -272,10 +278,15 @@ impl UserData for LuaRequest {
                 return Ok(None);
             };
 
+            if want < 0 {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "req:read(n) requires a non-negative size, got {want}"
+                )));
+            }
             // The limiter installed by `guard_body` already bounds what the
             // body can deliver; the clamp makes that bound local and keeps
             // the loop's termination readable here, without trusting `want`.
-            let want = clamp_want(want, body_limit);
+            let want = clamp_want(usize::try_from(want).unwrap_or(usize::MAX), body_limit);
             let mut buf = Vec::new();
             while buf.len() < want {
                 let Some(frame) = reader.frame().await else {

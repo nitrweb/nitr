@@ -75,15 +75,20 @@ pub fn create_crypto_table(lua: &Lua) -> mlua::Result<Table> {
     )?;
 
     // Raw bytes (a binary Lua string) from the OS entropy source.
+    //
+    // `n` is a full Lua integer, not `usize`: a Lua integer is 64-bit on
+    // every platform, and taking `usize` would turn an out-of-range `n`
+    // into a conversion error on 32-bit targets but this range message on
+    // 64-bit ones. The range check itself is the only bound that matters.
     crypto.set(
         "random_bytes",
-        lua.create_function(|lua, n: usize| {
-            if n == 0 || n > MAX_RANDOM_BYTES {
+        lua.create_function(|lua, n: i64| {
+            if n < 1 || n > MAX_RANDOM_BYTES as i64 {
                 return Err(mlua::Error::RuntimeError(format!(
                     "random_bytes(n) requires 1 <= n <= {MAX_RANDOM_BYTES}, got {n}"
                 )));
             }
-            let mut buf = vec![0u8; n];
+            let mut buf = vec![0u8; n as usize];
             getrandom::getrandom(&mut buf).map_err(rng_err)?;
             lua.create_string(&buf)
         })?,
