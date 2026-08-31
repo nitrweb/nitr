@@ -19,6 +19,7 @@ fn tls_base() -> (Config, PathBuf, PathBuf) {
         cert: Some(cert.clone()),
         key: Some(key.clone()),
         min_version: None,
+        handshake_ms: None,
     };
     (cfg, cert, key)
 }
@@ -215,6 +216,7 @@ proptest::proptest! {
             cert: pick(cert),
             key: pick(key),
             min_version: min_version.map(String::from),
+            handshake_ms: None,
         };
         let outcome = cfg.validate();
         std::fs::remove_file(&real).ok();
@@ -327,4 +329,78 @@ proptest::proptest! {
             }
         }
     }
+}
+
+/// `[tls] handshake_ms = 0` is a startup error, never "unbounded"
+/// (audit 3, phase 5, T-4): `0` is how `[limits]` spells "disabled",
+/// and it is exactly the spelling this key must refuse — the handshake
+/// precedes hyper's header machinery, so nothing else can reclaim the
+/// connection slot a stalled ClientHello holds.
+#[cfg(feature = "tls")]
+#[test]
+fn a_zero_handshake_deadline_is_a_startup_error() {
+    let (mut cfg, cert, key) = tls_base();
+    cfg.tls.handshake_ms = Some(0);
+    let err = cfg.validate().expect_err("handshake_ms = 0");
+    assert!(err.to_string().contains("handshake_ms"), "got: {err}");
+    assert!(err.to_string().contains("unbounded"), "got: {err}");
+
+    // A positive value, and unset, both validate.
+    cfg.tls.handshake_ms = Some(10_000);
+    cfg.validate().expect("a positive deadline");
+    cfg.tls.handshake_ms = None;
+    cfg.validate().expect("the bounded default");
+    std::fs::remove_file(&cert).ok();
+    std::fs::remove_file(&key).ok();
+}
+
+/// The `[tls] key` mode predicate (audit 3, phase 5, T-2): owner-only
+/// passes, any group/other bit warns — and the check is a *warning*,
+/// never a refusal, so a world-readable key still boots.
+#[cfg(all(unix, feature = "tls"))]
+#[test]
+fn a_readable_key_file_warns_and_boots_anyway() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // The mask itself, pinned: a wrong mask (say `0o007`) passes 0640.
+    for private in [0o600, 0o400, 0o100600] {
+        assert!(
+            super::super::validate::key_mode_is_private(private),
+            "{private:o}"
+        );
+    }
+    for exposed in [0o640, 0o644, 0o604, 0o666, 0o100644] {
+        assert!(
+            !super::super::validate::key_mode_is_private(exposed),
+            "{exposed:o}"
+        );
+    }
+
+    let (cfg, cert, key) = tls_base();
+    // World-readable: warns, names the file and the mode, and validates.
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    let warnings = cfg.warnings();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("644") && w.contains("key.pem")),
+        "expected a key-mode warning, got: {warnings:?}"
+    );
+    // A wrapped literal missing its `\` continuation renders with runs
+    // of spaces; the warning is operator-facing and must not.
+    assert!(
+        warnings.iter().all(|w| !w.contains("  ")),
+        "a warning rendered with literal space runs: {warnings:?}"
+    );
+    cfg.validate().expect("a readable key must still boot");
+
+    // Owner-only: silent.
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let warnings = cfg.warnings();
+    assert!(
+        !warnings.iter().any(|w| w.contains("key.pem")),
+        "0600 must not warn: {warnings:?}"
+    );
+    std::fs::remove_file(&cert).ok();
+    std::fs::remove_file(&key).ok();
 }

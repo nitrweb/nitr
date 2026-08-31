@@ -486,3 +486,199 @@ return app
     // error.
     assert!(err.contains("app.lua:3"), "no position in: {err}");
 }
+
+/// T-8 (audit 3, phase 5): the argon2 endpoints must be limitable, and
+/// the limiter must actually bind them — every request here takes the
+/// dummy-verify path, which costs one full argon2 by design, so an
+/// unthrottled stream from an account-less client is pool starvation
+/// plus a brute-force surface. Flipping `enabled` back to `false` in
+/// this fixture fails the test: every attempt answers 401.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_unknown_user_logins_are_rate_limited() {
+    let mut server = TestServer::builder("auth-ratelimit")
+        .handler(LOGIN_HANDLER)
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::CRYPTO)
+        .config(|cfg| {
+            cfg.workers = 1;
+            cfg.rate_limit.enabled = true;
+            cfg.rate_limit.requests = 5;
+            cfg.rate_limit.window = 60;
+        })
+        .spawn()
+        .await;
+
+    let mut statuses = Vec::new();
+    let mut retry_after_seen = false;
+    for i in 0..8 {
+        let resp = server
+            .client()
+            .get(server.url("/private"))
+            .header("authorization", basic(&format!("nobody{i}"), "x"))
+            .send()
+            .await
+            .expect("attempt");
+        if resp.status().as_u16() == 429 {
+            retry_after_seen |= resp.headers().contains_key("retry-after");
+        }
+        statuses.push(resp.status().as_u16());
+    }
+    // The window's budget spends on argon2-costing 401s; past it the
+    // limiter answers before any hashing happens.
+    assert_eq!(&statuses[..5], &[401; 5], "got: {statuses:?}");
+    assert_eq!(&statuses[5..], &[429; 3], "got: {statuses:?}");
+    assert!(retry_after_seen, "429s must carry Retry-After");
+
+    server.stop().await;
+}
+
+/// T-10 (audit 3, phase 5): a request with two `Authorization` headers is
+/// refused with a 400 before the handler runs — for either ordering, and
+/// regardless of which credential is valid. The Lua header table keeps
+/// one value per name, so a handler would otherwise see a different
+/// credential than a proxy in front authenticated on. The hit counter
+/// proves the handler was never entered; deleting the check in
+/// `Protection::check` fails this test with a 200 for the valid-last
+/// ordering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_authorization_headers_are_refused_before_the_handler() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let mut server = TestServer::builder("auth-dup")
+        .handler(
+            r#"
+local app = nitr.app()
+local hits = 0
+app:get("/private", function(req)
+    hits = hits + 1
+    local user, pass = nitr.auth.basic(req)
+    return nitr.json({ user = user or false })
+end)
+app:get("/hits", function(req)
+    return nitr.json({ hits = hits })
+end)
+return app
+"#,
+        )
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::CRYPTO)
+        .config(|cfg| cfg.workers = 1)
+        .spawn()
+        .await;
+
+    let valid = basic("ada", "lovelace");
+    let bogus = basic("nobody", "x");
+    for (first, second) in [(&valid, &bogus), (&bogus, &valid)] {
+        let mut sock = tokio::net::TcpStream::connect(server.addr())
+            .await
+            .expect("connect");
+        sock.write_all(
+            format!(
+                "GET /private HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+                 Authorization: {first}\r\nAuthorization: {second}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write");
+        let mut raw = Vec::new();
+        sock.read_to_end(&mut raw).await.expect("read");
+        let head = String::from_utf8_lossy(&raw);
+        assert!(
+            head.starts_with("HTTP/1.1 400"),
+            "two Authorization headers must be a 400, got: {head}"
+        );
+    }
+
+    // The handler was never entered — and one credential still works, so
+    // the refusal is about multiplicity, not about the header itself.
+    let resp = server
+        .client()
+        .get(server.url("/private"))
+        .header("authorization", &valid)
+        .send()
+        .await
+        .expect("single header");
+    assert_eq!(resp.status(), 200);
+    let hits: serde_json::Value = server
+        .client()
+        .get(server.url("/hits"))
+        .send()
+        .await
+        .expect("hits")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        hits["hits"], 1,
+        "only the single-header request may have reached the handler"
+    );
+
+    server.stop().await;
+}
+
+/// T-9 (audit 3, phase 5): the bearer pattern the docs and
+/// `examples/bearer-auth` teach — `nitr.auth.bearer` for the header,
+/// `nitr.crypto.constant_time_eq` for the compare, and one identical 401
+/// for every failure shape — exercised so the example cannot rot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_bearer_pattern_compares_in_constant_time_and_fails_uniformly() {
+    const TOKEN: &str = "1f8e4c0a6b5d92e37a41c8f0d3b6a95c1e2d4f6a8b0c3e5d7f9a1b3c5d7e9f01";
+    let mut server = TestServer::builder("auth-bearer")
+        .handler(
+            r#"
+local app = nitr.app()
+local SECRET = "1f8e4c0a6b5d92e37a41c8f0d3b6a95c1e2d4f6a8b0c3e5d7f9a1b3c5d7e9f01"
+local function challenge()
+    local res = nitr.json({ error = "unauthorized" }, 401)
+    res.headers["WWW-Authenticate"] = 'Bearer realm="test"'
+    return res
+end
+app:get("/private", function(req)
+    local token = nitr.auth.bearer(req)
+    if not token or not nitr.crypto.constant_time_eq(token, SECRET) then
+        return challenge()
+    end
+    return nitr.json({ ok = true })
+end)
+return app
+"#,
+        )
+        .builtins(nitr::Builtins::JSON | nitr::Builtins::CRYPTO)
+        .config(|cfg| cfg.workers = 1)
+        .spawn()
+        .await;
+
+    // The right token authorizes.
+    let resp = server
+        .client()
+        .get(server.url("/private"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .expect("valid token");
+    assert_eq!(resp.status(), 200);
+
+    // Every failure shape answers identically: status, body, challenge.
+    let mut failures = Vec::new();
+    for header in [
+        None,
+        Some("Bearer wrong".to_string()),
+        Some(format!("Bearer {}x", TOKEN)),
+        Some(format!("Basic {TOKEN}")),
+        Some("Bearer".to_string()),
+    ] {
+        let mut req = server.client().get(server.url("/private"));
+        if let Some(header) = header {
+            req = req.header("authorization", header);
+        }
+        let resp = req.send().await.expect("attempt");
+        assert_eq!(resp.status(), 401);
+        assert_eq!(resp.headers()["www-authenticate"], "Bearer realm=\"test\"");
+        failures.push(resp.text().await.expect("body"));
+    }
+    assert!(
+        failures.windows(2).all(|w| w[0] == w[1]),
+        "every failure must carry the identical body: {failures:?}"
+    );
+
+    server.stop().await;
+}

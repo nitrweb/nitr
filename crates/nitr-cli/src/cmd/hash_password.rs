@@ -19,9 +19,16 @@
 //! printf %s "$NEW_PASSWORD" | nitr hash-password
 //! ```
 
-use std::io::{IsTerminal as _, Read as _, Write as _};
+use std::io::{IsTerminal as _, Read, Write as _};
 
 use anyhow::{Context as _, bail};
+use zeroize::Zeroizing;
+
+/// The server's own password cap (`nitr.crypto.max_password_bytes`,
+/// enforced before any argon2 work), re-exported so the CLI and the
+/// verifier share one number and one reason: a password the server will
+/// refuse at verify time must not be hashable at mint time.
+const MAX_PASSWORD_BYTES: usize = nitr::stdlib::MAX_PASSWORD_BYTES;
 
 /// Reads a password (prompt or stdin) and prints its argon2id hash.
 pub(crate) async fn hash_password() -> anyhow::Result<()> {
@@ -30,17 +37,12 @@ pub(crate) async fn hash_password() -> anyhow::Result<()> {
         let password = prompt("Password")?;
         // A typo here becomes a credential nobody can ever use, and the
         // only symptom is a login that always fails. Cheap to prevent.
-        if prompt("Confirm password")? != password {
+        if *prompt("Confirm password")? != *password {
             bail!("the passwords do not match");
         }
         password
     } else {
-        let mut raw = String::new();
-        stdin
-            .lock()
-            .read_to_string(&mut raw)
-            .context("cannot read the password from stdin")?;
-        strip_eol(raw)
+        read_stdin_password(stdin.lock())?
     };
 
     if password.is_empty() {
@@ -55,6 +57,36 @@ pub(crate) async fn hash_password() -> anyhow::Result<()> {
     // `$(nitr hash-password)` both give exactly the storable string.
     println!("{}", argon2id(&password).await?);
     Ok(())
+}
+
+/// Reads the piped password, bounded by the server's own cap.
+///
+/// `read_to_string` with no cap made `nitr hash-password < /dev/zero` an
+/// OOM; the `take` bounds the read at the 1 KiB the verifier enforces
+/// anyway (`+ 2` leaves room for the shell's `\r\n`, `+ 1` more is how
+/// overflow is detected without reading further). The buffer is wiped on
+/// every return path.
+fn read_stdin_password(reader: impl Read) -> anyhow::Result<Zeroizing<String>> {
+    let cap = MAX_PASSWORD_BYTES + 2;
+    let mut raw = Zeroizing::new(String::new());
+    reader
+        .take(cap as u64 + 1)
+        .read_to_string(&mut raw)
+        .context("cannot read the password from stdin")?;
+    if raw.len() > cap {
+        bail!(
+            "the password from stdin is longer than the {MAX_PASSWORD_BYTES}-byte limit \
+             the server enforces: a hash of it could never verify"
+        );
+    }
+    let stripped = strip_eol(std::mem::take(&mut *raw));
+    if stripped.len() > MAX_PASSWORD_BYTES {
+        bail!(
+            "the password from stdin is longer than the {MAX_PASSWORD_BYTES}-byte limit \
+             the server enforces: a hash of it could never verify"
+        );
+    }
+    Ok(Zeroizing::new(stripped))
 }
 
 /// Removes the line ending the shell added, and nothing else.
@@ -79,7 +111,7 @@ fn strip_eol(mut raw: String) -> String {
 /// interactive UI, not a diagnostic — it must appear whatever the log
 /// level is, must not be timestamped or shipped to a log collector, and
 /// must stay out of the stdout the caller is capturing.
-fn prompt(label: &str) -> anyhow::Result<String> {
+fn prompt(label: &str) -> anyhow::Result<Zeroizing<String>> {
     let echo = EchoOff::new();
     eprint!("{label}: ");
     if echo.is_visible() {
@@ -87,7 +119,7 @@ fn prompt(label: &str) -> anyhow::Result<String> {
     }
     std::io::stderr().flush().ok();
 
-    let mut line = String::new();
+    let mut line = Zeroizing::new(String::new());
     let read = std::io::stdin().read_line(&mut line);
     let visible = echo.is_visible();
     drop(echo);
@@ -97,7 +129,7 @@ fn prompt(label: &str) -> anyhow::Result<String> {
         eprintln!();
     }
     read.context("cannot read the password from the terminal")?;
-    Ok(strip_eol(line))
+    Ok(Zeroizing::new(strip_eol(std::mem::take(&mut *line))))
 }
 
 /// Turns terminal echo off while it is alive, and back on when dropped —
@@ -114,9 +146,14 @@ fn prompt(label: &str) -> anyhow::Result<String> {
 /// Echo is toggled by running `stty`, not by calling `tcsetattr`: the
 /// workspace forbids `unsafe`, so the libc call is unavailable, and one
 /// terminal flag does not justify a dependency. `nitr reload` sends its
-/// signal through `kill` for the same reason. Where `stty` is missing
-/// (or on a non-Unix host) the password is read with echo on and the
-/// prompt says so — visibly degraded beats refusing to run.
+/// signal through `kill` for the same reason — these two are the only
+/// subprocesses in the workspace, both resolved through `PATH` by that
+/// decision. The realistic failure mode of the trade is that `stty` is
+/// *missing or failing*, in which case the password is read with echo on
+/// and the prompt says so — visibly degraded beats refusing to run. A
+/// `PATH`-substituted `stty` is code execution, but in a context that
+/// already runs the operator's own `nitr` binary from the same `PATH`,
+/// so it grants nothing the attacker did not have.
 struct EchoOff {
     disabled: bool,
 }
@@ -187,7 +224,7 @@ async fn argon2id(password: &str) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_eol;
+    use super::{MAX_PASSWORD_BYTES, read_stdin_password, strip_eol};
 
     #[test]
     fn only_the_shells_line_ending_is_removed() {
@@ -202,5 +239,37 @@ mod tests {
         assert_eq!(strip_eol("a\nb\n".into()), "a\nb");
         assert_eq!(strip_eol("\n".into()), "");
         assert_eq!(strip_eol(String::new()), "");
+    }
+
+    /// The stdin read is capped at the server's own password limit
+    /// (audit 3, phase 5, T-12): `nitr hash-password < /dev/zero` must be
+    /// a clear error, not an OOM — and a password the verifier would
+    /// refuse must not be mintable here.
+    #[test]
+    fn stdin_reads_are_capped_at_the_servers_password_limit() {
+        // The limit itself, and the limit plus the shell's line ending,
+        // both still work.
+        let max = "x".repeat(MAX_PASSWORD_BYTES);
+        let got = read_stdin_password(max.as_bytes()).expect("at the limit");
+        assert_eq!(got.len(), MAX_PASSWORD_BYTES);
+        let with_eol = format!("{max}\r\n");
+        let got = read_stdin_password(with_eol.as_bytes()).expect("limit + crlf");
+        assert_eq!(got.len(), MAX_PASSWORD_BYTES);
+        // A trailing space survives, exactly as `strip_eol` promises.
+        let got = read_stdin_password(b"hunter2 \n".as_slice()).expect("trailing space");
+        assert_eq!(&*got, "hunter2 ");
+
+        // One byte over — with or without a line ending — is refused with
+        // the limit named, and the reader stops at the cap instead of
+        // draining the stream (`/dev/zero` must not be read to the end).
+        let over = "x".repeat(MAX_PASSWORD_BYTES + 1);
+        let err = read_stdin_password(over.as_bytes()).expect_err("one over");
+        assert!(err.to_string().contains("1024"), "got: {err}");
+        // Operator-facing: a wrapped literal missing its `\` continuation
+        // renders with runs of spaces.
+        assert!(!err.to_string().contains("  "), "got: {err}");
+        let endless = std::io::repeat(b'z');
+        let err = read_stdin_password(endless).expect_err("an endless stream");
+        assert!(err.to_string().contains("1024"), "got: {err}");
     }
 }

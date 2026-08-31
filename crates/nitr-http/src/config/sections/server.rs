@@ -259,6 +259,16 @@ pub struct TlsConfig {
     /// (RFC 8996) and are not settings this server offers under any
     /// spelling — see [`TLS_MIN_VERSIONS`].
     pub min_version: Option<String>,
+    /// Deadline for the TLS handshake itself, in milliseconds. Unset
+    /// means `min(header_read_ms, 10s)` — and when `[limits]
+    /// header_read_ms` is `0` (disabled), simply 10 s. `0` here is a
+    /// startup error, never "unbounded": the handshake happens before
+    /// hyper's header machinery exists, so a stalled `ClientHello` holds
+    /// a connection slot the header deadline can never reclaim, and 1024
+    /// of them close the listener. The header read and the handshake are
+    /// different waits on different protocol phases; a streaming
+    /// deployment that relaxes the first says nothing about the second.
+    pub handshake_ms: Option<u64>,
 }
 
 /// Every protocol version `[tls] min_version` may name, weakest first.

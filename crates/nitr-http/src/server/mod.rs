@@ -56,12 +56,13 @@ pub struct Server {
     /// the same storage rather than starting cold.
     cache: Option<nitr_std::Cache>,
     /// The TLS acceptor built from `[tls] cert`/`key`, or `None` on a
-    /// plaintext listener. Built once, in [`ServerBuilder::build`], so
-    /// every connection clones an `Arc` instead of reading the
-    /// filesystem — and so a broken pair fails the build rather than
-    /// every handshake on an already-bound port.
+    /// plaintext listener. Built in [`ServerBuilder::build`] — so a
+    /// broken pair fails the build rather than every handshake on an
+    /// already-bound port — and held behind a lock so a `SIGHUP` can
+    /// swap in renewed material without a restart: the accept loop reads
+    /// the slot per accepted connection, never from the filesystem.
     #[cfg(feature = "tls")]
-    tls: Option<tokio_rustls::TlsAcceptor>,
+    tls: Arc<RwLock<Option<tokio_rustls::TlsAcceptor>>>,
 }
 
 mod builder;
@@ -104,8 +105,22 @@ impl Server {
     /// Builds a complete replacement pool (re-running the configuration
     /// script) and atomically swaps it in; in-flight requests finish on
     /// the old pool, which is dropped when its last guard returns. On any
-    /// error the old pool stays.
+    /// error the old pool stays. With `[tls]` enabled the certificate and
+    /// key are re-read too, each half independent: a failed TLS re-read
+    /// keeps the old acceptor while the pool still reloads, and vice
+    /// versa.
+    ///
+    /// What a reload deliberately does **not** refresh, so the boundary
+    /// is written down rather than discovered: `nitr.toml` itself is
+    /// never re-read (`self.cfg` is fixed at build), and with it every
+    /// compiled policy — `Protection` (limits, rate limit, request-id
+    /// trust), the CORS and compression policies, the cache and its
+    /// capacity, the listen address and worker count. A reload re-runs
+    /// the configuration *script* and re-reads the certificate *files*;
+    /// everything else needs a restart.
     async fn reload(&self) {
+        #[cfg(feature = "tls")]
+        self.reload_tls();
         tracing::info!("reload requested: rebuilding the runtime pool");
         match build_runtimes(
             &self.cfg,
@@ -135,6 +150,42 @@ impl Server {
             }
             Err(err) => {
                 tracing::error!("reload failed, keeping the current pool: {err}");
+            }
+        }
+    }
+
+    /// Re-reads `[tls] cert`/`key` from their configured paths and swaps
+    /// the acceptor — validate first, swap only on success: a server that
+    /// stops terminating TLS because certbot wrote a half-file is
+    /// strictly worse than a stale certificate. Connections already
+    /// established keep the acceptor they handshook with.
+    #[cfg(feature = "tls")]
+    fn reload_tls(&self) {
+        // `enabled` cannot change here: a reload re-reads the certificate
+        // files, not `nitr.toml`, so a plaintext listener has nothing to
+        // swap — and saying so beats silently doing nothing.
+        if !self.cfg.tls.enabled {
+            tracing::debug!("reload: [tls] is disabled, no certificate to re-read");
+            return;
+        }
+        match crate::tls::load(&self.cfg.tls) {
+            Ok(loaded) => {
+                let acceptor = tokio_rustls::TlsAcceptor::from(loaded.config);
+                match self.tls.write() {
+                    Ok(mut slot) => {
+                        *slot = Some(acceptor);
+                        tracing::info!(
+                            "reload complete: TLS material re-read ({} certificate(s))",
+                            loaded.certs
+                        );
+                    }
+                    // Unreachable in practice: the lock is only ever held
+                    // to clone or replace the acceptor.
+                    Err(_) => tracing::error!("TLS reload failed: the acceptor lock is poisoned"),
+                }
+            }
+            Err(err) => {
+                tracing::warn!("TLS reload failed, keeping the current certificate: {err}");
             }
         }
     }

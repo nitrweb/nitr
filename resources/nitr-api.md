@@ -128,8 +128,8 @@ HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list
 
 `Authorization` header parsing.
 
-- `nitr.auth.basic(req) -> string|nil, string|nil` — Basic credentials, or nil.
-- `nitr.auth.bearer(req) -> string|nil` — The bearer token, or nil.
+- `nitr.auth.basic(req) -> string|nil, string|nil` — Basic credentials, or nil. Credentials must be UTF-8, and the scheme must be separated from the value by at least one space (extra spaces are trimmed; a tab is not a separator). Anything unparseable reads as no credentials, never a partial one.
+- `nitr.auth.bearer(req) -> string|nil` — The bearer token, or nil. Compare it with nitr.crypto.constant_time_eq, not ==; a length mismatch still returns early, so a variable-length secret is compared as a digest. See examples/bearer-auth.
 
 ### `nitr.cache` (std feature: `cache`)
 

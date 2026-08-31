@@ -101,6 +101,7 @@ impl TlsServer {
                 cert: Some(identity.cert_path.clone()),
                 key: Some(identity.key_path.clone()),
                 min_version: None,
+                handshake_ms: None,
             },
             ..nitr::Config::default()
         };
@@ -315,6 +316,7 @@ async fn a_half_configured_tls_section_refuses_to_build() {
                 cert: Some(identity.cert_path.clone()),
                 key: Some(identity.key_path.clone()),
                 min_version: None,
+                handshake_ms: None,
             },
             ..nitr::Config::default()
         };
@@ -453,4 +455,239 @@ return app
     );
 
     server.stop().await;
+}
+
+/// T-4 (audit 3, phase 5): `[limits] header_read_ms = 0` disables hyper's
+/// header deadline — and must NOT unbound the TLS handshake. The
+/// handshake deadline is its own bound (`[tls] handshake_ms`, or a
+/// bounded default), so stalled ClientHellos release their connection
+/// slots and a real client is still served. Deleting the handshake
+/// timeout fails this test: the stalled connections hold every slot
+/// forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_handshake_is_dropped_even_with_header_read_disabled() {
+    let mut server = TlsServer::spawn("tls-stall", |cfg| {
+        cfg.limits.header_read_ms = 0;
+        cfg.limits.max_connections = 4;
+        cfg.tls.handshake_ms = Some(500);
+    })
+    .await;
+
+    // Four connections that send one TLS record byte and then stall —
+    // exactly the connection-slot budget.
+    let mut stalled = Vec::new();
+    for _ in 0..4 {
+        let mut sock = tokio::net::TcpStream::connect(server.addr)
+            .await
+            .expect("connect");
+        sock.write_all(&[0x16]).await.expect("one record byte");
+        stalled.push(sock);
+    }
+    // Give the handshake deadline room to fire and the permits to return.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // A real client must be served — pre-fix (no deadline with
+    // header_read_ms = 0) every slot is still held and this times out.
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        server.client().get(server.url("/hello")).send(),
+    )
+    .await
+    .expect("the listener must not be wedged by stalled handshakes")
+    .expect("a real TLS request succeeds");
+    assert_eq!(resp.status(), 200);
+
+    drop(stalled);
+    server.stop().await;
+}
+
+/// T-1 (audit 3, phase 5): a reload swaps in renewed TLS material
+/// without a restart. Trust is the fingerprint: a client that trusts
+/// ONLY the new certificate fails before the swap and succeeds after
+/// it, and a client that handshook before the swap keeps its
+/// connection. A reload over a broken key file keeps the old material.
+///
+/// The reload is triggered through dev mode's file watcher, which feeds
+/// the same channel `SIGHUP` does — a signal would hit every test in
+/// this process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reload_swaps_the_certificate_without_dropping_connections() {
+    let mut server = TlsServer::spawn("tls-reload", |cfg| {
+        cfg.dev_mode = true;
+    })
+    .await;
+
+    // A pre-swap connection, kept alive by the client pool.
+    let old_client = server.client();
+    let resp = old_client
+        .get(server.url("/hello"))
+        .send()
+        .await
+        .expect("pre-reload request");
+    assert_eq!(resp.status(), 200);
+
+    // Renewed material: a second identity written over the same paths,
+    // atomically (write, rename) the way certbot does.
+    let renewed =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("generate the renewed certificate");
+    let new_cert_pem = renewed.cert.pem();
+    let staged_cert = server.dir.write("cert.pem.new", &new_cert_pem);
+    let staged_key = server
+        .dir
+        .write("key.pem.new", renewed.signing_key.serialize_pem());
+    std::fs::rename(&staged_cert, server.identity.cert_path.as_path()).expect("swap cert");
+    std::fs::rename(&staged_key, server.identity.key_path.as_path()).expect("swap key");
+    // Trigger the reload: a save under the watched tree.
+    server.dir.write("app.lua", TOUCHED_APP);
+
+    // A client that trusts ONLY the renewed certificate: succeeds exactly
+    // when the acceptor has been swapped.
+    let root = reqwest::Certificate::from_pem(new_cert_pem.as_bytes()).expect("new root");
+    let new_client = reqwest::Client::builder()
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(root)
+        .build()
+        .expect("client");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(resp) = new_client.get(server.url("/hello")).send().await
+            && resp.status() == 200
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the renewed certificate was never presented: the reload did not swap the acceptor"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // The pre-swap client's pooled connection survived the swap: an
+    // established connection keeps the acceptor it handshook with.
+    let resp = old_client
+        .get(server.url("/hello"))
+        .send()
+        .await
+        .expect("the pre-reload connection must survive the swap");
+    assert_eq!(resp.status(), 200);
+
+    // The failure path: a half-written key must keep the CURRENT
+    // material, not stop terminating TLS.
+    std::fs::write(server.identity.key_path.as_path(), "not a key any more").expect("break key");
+    server.dir.write("app.lua", TOUCHED_APP_2);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let resp = new_client
+        .get(server.url("/hello"))
+        .send()
+        .await
+        .expect("a failed TLS reload must keep the old acceptor serving");
+    assert_eq!(resp.status(), 200);
+
+    server.stop().await;
+}
+
+/// The handler variants the reload test saves to trigger the watcher;
+/// same routes, so either compiles and serves.
+const TOUCHED_APP: &str = r#"
+local app = nitr.app()
+app:get("/hello", function(req)
+    return { status = 200, headers = { ["Content-Type"] = "text/plain" }, body = "over tls: " .. req.path }
+end)
+return app
+"#;
+const TOUCHED_APP_2: &str = r#"
+local app = nitr.app()
+app:get("/hello", function(req)
+    return { status = 200, headers = { ["Content-Type"] = "text/plain" }, body = "over tls: " .. req.path }
+end)
+-- touched again
+return app
+"#;
+
+/// T-5 (audit 3, phase 5): the two recipes `docs-feat/tls.md` documents,
+/// executed rather than quoted — the HSTS middleware and the
+/// plaintext-to-HTTPS redirect instance (path and query preserved, the
+/// canonical host from configuration and never from the request's Host
+/// header).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_documented_hsts_and_redirect_recipes_work() {
+    // The HSTS half, over real TLS.
+    let mut server = TlsServer::spawn_with(
+        "tls-hsts",
+        r#"
+        local app = nitr.app()
+        app:use(function(next)
+            return function(req)
+                local res = next(req)
+                res.headers["Strict-Transport-Security"] = "max-age=15552000"
+                return res
+            end
+        end)
+        app:get("/hello", function(req) return nitr.text("ok") end)
+        return app
+        "#,
+        |_| {},
+    )
+    .await;
+    let resp = server
+        .client()
+        .get(server.url("/hello"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.headers()["strict-transport-security"],
+        "max-age=15552000"
+    );
+    server.stop().await;
+
+    // The redirect half, on a plaintext instance — the doc's snippet
+    // verbatim, including the Host-safety property: whatever Host the
+    // client sends, the target is the configured canonical origin.
+    let mut plain = harness::TestServer::builder("tls-redirect")
+        .handler(
+            r#"
+local app = nitr.app()
+local CANONICAL = "https://example.com"
+
+local function to_https(req)
+    local target = CANONICAL .. req.path
+    if req.uri.query ~= "" then
+        target = target .. "?" .. req.uri.query
+    end
+    return nitr.redirect(target, 301)
+end
+
+app:get("/", to_https)
+app:get("/*", to_https)
+
+return app
+"#,
+        )
+        .builtins(nitr::Builtins::HTTP)
+        .config(|cfg| cfg.workers = 1)
+        .spawn()
+        .await;
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client");
+    for (path, want) in [
+        ("/", "https://example.com/"),
+        ("/a/b?x=1&y=2", "https://example.com/a/b?x=1&y=2"),
+    ] {
+        let resp = client
+            .get(plain.url(path))
+            // An attacker-supplied Host must not steer the target.
+            .header("host", "evil.example.net")
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), 301, "{path}");
+        assert_eq!(resp.headers()["location"], want, "{path}");
+    }
+
+    plain.stop().await;
 }

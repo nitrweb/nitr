@@ -111,6 +111,11 @@ path = "examples/basic-auth/main.rs"
 required-features = ["crypto"]
 
 [[example]]
+name = "bearer-auth"
+path = "examples/bearer-auth/main.rs"
+required-features = ["crypto"]
+
+[[example]]
 name = "data-io"
 path = "examples/data-io/main.rs"
 required-features = ["db", "fetch"]

@@ -203,6 +203,21 @@ impl UserData for LuaRequest {
             Ok(table)
         });
         fields.add_field_method_get("headers", |lua, req| {
+            // One value per name: for a repeated header the last value
+            // wins. That collapse is a written decision, not an
+            // accident, and each security-relevant name has its own
+            // answer: `Authorization` never gets here repeated (two or
+            // more are refused with a 400 in `Protection::check`, since
+            // a collapsed credential can desync from a proxy in front);
+            // `Cookie` is joined below, because a joined cookie string
+            // is still a valid cookie string; `X-Forwarded-For` is only
+            // trusted when `[rate_limit] trust_forwarded_for` says so,
+            // and the limiter parses the header itself rather than this
+            // table; `Content-Length` and `Transfer-Encoding` are
+            // enforced by hyper before a request exists. A non-UTF-8
+            // value becomes `""` — fail-closed, indistinguishable from
+            // absent, and kept that way because distinguishing the two
+            // would change the type of every header value a script reads.
             let headers = req.req.headers();
             let table = lua.create_table()?;
             for (k, v) in headers.iter() {

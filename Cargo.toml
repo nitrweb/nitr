@@ -155,6 +155,10 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v7"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2.5"
+# Wipes key PEM and CLI password buffers on drop. Already compiled either
+# way: rustls-pki-types pulls it in, so this is a manifest line, not a new
+# supply-chain surface.
+zeroize = "1"
 
 # Release with debug symbols, for profiling (perf).
 [profile.profiling]

@@ -43,7 +43,11 @@ use super::rng_err;
 /// itself, and a *reason* there would hand strangers a log-spam lever
 /// through the `if problem then log` pattern. Scripts that want a
 /// pre-check anyway read the cap as `nitr.crypto.max_password_bytes`.
-pub(super) const MAX_PASSWORD_BYTES: usize = 1024;
+///
+/// The value itself lives in [`crate::config`] (always compiled, like
+/// the configuration types) so the CLI's stdin cap can share it in every
+/// feature configuration; this re-import is the enforcing side.
+pub(crate) use crate::config::MAX_PASSWORD_BYTES;
 
 /// Ceilings on the argon2 parameters Nitr honors in a *stored* hash.
 ///

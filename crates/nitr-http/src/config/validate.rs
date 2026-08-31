@@ -168,6 +168,30 @@ impl Config {
                  [cookies] secure = \"always\" — nothing here can detect that proxy."
             ));
         }
+        // A private key other users on the box can read. A warning and
+        // never a refusal: containers legitimately run as root with a
+        // mounted secret, and a security check whose failure mode is "the
+        // deployment does not come up" gets disabled. Ownership is
+        // deliberately not examined — the operator's uid arrangement is
+        // not the server's to police; the mode bits are merely mentioned.
+        // Non-Unix has no comparable mode and skips the check.
+        #[cfg(unix)]
+        if self.tls.enabled
+            && let Some(key) = &self.tls.key
+            && let Ok(meta) = std::fs::metadata(key)
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = meta.permissions().mode();
+            if !key_mode_is_private(mode) {
+                out.push(format!(
+                    "[tls] key = {} is mode {:03o}: readable beyond its owner. The server \
+                     reads it regardless — protecting the file is the operator's job — \
+                     but a private key usually wants 0600",
+                    key.display(),
+                    mode & 0o7777
+                ));
+            }
+        }
         // `"debug"` is deliberately *not* warned about here: it is refused
         // outright by `LuaConfig::parse_stdlib`, because mlua's safe
         // constructor cannot load it at all. A warning would only precede a
@@ -217,6 +241,19 @@ impl Config {
                     path.display()
                 )));
             }
+        }
+        // `0` is how `[limits]` spells "disabled", and it is exactly the
+        // spelling this key must refuse: the handshake precedes hyper's
+        // header machinery, so an unbounded accept would hold a
+        // connection slot nothing else can reclaim. Unset (the default)
+        // already means a bounded `min(header_read_ms, 10s)`.
+        if self.tls.handshake_ms == Some(0) {
+            return Err(Error::Config(
+                "[tls] handshake_ms = 0 would leave the TLS handshake unbounded, and a \
+                 stalled ClientHello holds a connection slot forever: set a positive \
+                 deadline, or leave it unset for min(header_read_ms, 10s)"
+                    .into(),
+            ));
         }
         if let Some(version) = &self.tls.min_version
             && !super::sections::TLS_MIN_VERSIONS.contains(&version.as_str())
@@ -397,4 +434,14 @@ fn strip_nulls(value: serde_json::Value) -> serde_json::Value {
         }
         other => other,
     }
+}
+
+/// Whether a key file's mode keeps it to its owner: no group or other
+/// bits at all. `0600`/`0400` pass; `0640`, `0644` and wider do not.
+/// The predicate the `[tls] key` permission warning fires on, split out
+/// so the mask is pinned by a unit test rather than implied by a log
+/// line.
+#[cfg(unix)]
+pub(crate) fn key_mode_is_private(mode: u32) -> bool {
+    mode & 0o077 == 0
 }

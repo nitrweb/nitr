@@ -25,7 +25,7 @@
 //! cargo run --features crypto --bin nitr -- hash-password
 //! ```
 
-use nitr::{Builtins, Server};
+use nitr::{Builtins, Config, Server};
 
 #[tokio::main]
 async fn main() -> nitr::Result {
@@ -42,7 +42,23 @@ async fn main() -> nitr::Result {
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
 
+    // REQUIRED in front of any handler that calls password_verify /
+    // password_verify_dummy: by design both branches cost one argon2
+    // (~19 MiB, ~26 ms), so an unthrottled login lets a client with no
+    // account at all hold every pooled Lua state busy and shed real
+    // logins at pool_wait_ms. The same setting from nitr.toml:
+    //
+    //   [rate_limit]
+    //   enabled  = true
+    //   requests = 100
+    //   window   = 60
+    let mut cfg = Config::default();
+    cfg.rate_limit.enabled = true;
+    cfg.rate_limit.requests = 100;
+    cfg.rate_limit.window = 60;
+
     Server::builder()
+        .config(cfg)
         .listen(([127, 0, 0, 1], port).into())
         .handler_script("crates/nitr/examples/basic-auth/app.lua")
         // `CRYPTO` registers both `nitr.crypto` and `nitr.auth`.

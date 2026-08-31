@@ -8,7 +8,10 @@
 mod jwt;
 mod passwords;
 
-use base64::Engine as _;
+// `base64::Engine` for `B64.encode` arrives through `use super::*`: the
+// crypto module imports the trait, and an underscore trait import
+// propagates through a glob — spelling it again here is flagged as a
+// duplicate by newer toolchains.
 use base64::engine::general_purpose::STANDARD as B64;
 
 use super::auth::scheme_value;

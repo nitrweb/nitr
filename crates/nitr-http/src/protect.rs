@@ -154,6 +154,32 @@ impl Protection {
             return Some(plain_response(StatusCode::URI_TOO_LONG, "URI Too Long"));
         }
 
+        // More than one `Authorization` header is refused outright. The
+        // Lua header table keeps one value per name (last wins), so a
+        // handler — or `nitr.auth` — would see one credential while a
+        // proxy in front may have authenticated on the other: proxy
+        // desync and credential confusion in one shape. Joining, the way
+        // `Cookie` is joined for the Lua table, is wrong here — a joined
+        // cookie string is still a valid cookie string, but a joined
+        // credential is a credential nobody sent. Refusal is the one
+        // answer that cannot diverge from what anything in front saw.
+        // It lives here, pre-Lua, because it must also cover handlers
+        // that read `req.headers.authorization` themselves.
+        if req
+            .req
+            .headers()
+            .get_all(hyper::header::AUTHORIZATION)
+            .iter()
+            .nth(1)
+            .is_some()
+        {
+            tracing::debug!(
+                peer = %req.peer_addr,
+                "request refused: more than one Authorization header"
+            );
+            return Some(plain_response(StatusCode::BAD_REQUEST, "Bad Request"));
+        }
+
         // Declared body size; a chunked body that lies is caught later by
         // the state's memory limit when the handler reads it.
         let declared = req

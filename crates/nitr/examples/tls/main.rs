@@ -116,6 +116,10 @@ async fn main() -> nitr::Result {
             // either way, and nothing below it can be selected. Set
             // `"1.3"` instead when every client is known to speak it.
             min_version: Some("1.2".into()),
+            // Unset: the handshake is bounded by min(header_read_ms, 10s)
+            // either way — `[tls] handshake_ms` exists for deployments
+            // that want a different number, never for "unbounded".
+            handshake_ms: None,
         },
         ..nitr::Config::default()
     };

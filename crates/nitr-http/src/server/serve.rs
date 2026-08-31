@@ -43,9 +43,13 @@ impl Server {
     /// the listener stops accepting and in-flight requests get a grace
     /// period to complete.
     pub async fn serve_with_shutdown(mut self, shutdown: impl Future<Output = ()>) -> Result {
-        // Read once, at build time; here it is only an `Arc` to clone.
+        // The *slot*, not the acceptor: a `SIGHUP` swaps renewed TLS
+        // material into `self.tls`, and snapshotting the acceptor here
+        // would keep handing out the stale one — a hot reload that logs
+        // success and does nothing. Each accepted connection loads the
+        // current acceptor from this handle instead.
         #[cfg(feature = "tls")]
-        let tls_acceptor = self.tls.clone();
+        let tls_slot = self.tls.clone();
         let listener = match self.listener.take() {
             // A pre-bound listener arrives blocking; tokio requires
             // non-blocking before it will adopt it.
@@ -121,6 +125,13 @@ impl Server {
             0 => None,
             ms => Some(Duration::from_millis(ms)),
         };
+        // The handshake deadline is never `None`: `[tls] handshake_ms`,
+        // or `min(header_read_ms, 10s)` when unset — including when
+        // `header_read_ms` is `0`, the spelling that disables hyper's
+        // header deadline but must not unbound the handshake (a stalled
+        // `ClientHello` holds a connection slot nothing else reclaims).
+        #[cfg(feature = "tls")]
+        let handshake_deadline = handshake_deadline(&self.cfg.tls, header_read);
 
         // Health endpoints: on the main listener by default, or on their
         // own address so the probes stay off the public port.
@@ -270,8 +281,10 @@ impl Server {
                     // is seen by this connection instead of arriving one
                     // version late.
                     let watcher = graceful.watcher();
+                    // Loaded per accept, so a reload's swap is visible to
+                    // the next connection; the clone is an `Arc` handle.
                     #[cfg(feature = "tls")]
-                    let acceptor = tls_acceptor.clone();
+                    let acceptor = current_acceptor(&tls_slot);
                     tokio::spawn(async move {
                         // Held until the connection closes.
                         let _permit = permit;
@@ -284,7 +297,8 @@ impl Server {
                         #[cfg(feature = "tls")]
                         if let Some(acceptor) = acceptor {
                             let Some(stream) =
-                                tls_handshake(&acceptor, stream, header_read, peer_addr).await
+                                tls_handshake(&acceptor, stream, handshake_deadline, peer_addr)
+                                    .await
                             else {
                                 return;
                             };
@@ -428,26 +442,24 @@ pub(crate) async fn accept_error_backoff(listener: &str, err: &std::io::Error) {
 /// cipher suite in common), and an `error` per probe would drown the log
 /// an operator actually needs.
 ///
-/// `deadline` is `[limits] header_read_ms`. Without it a client can hold a
+/// `deadline` is `[tls] handshake_ms` (or its `min(header_read_ms, 10s)`
+/// default) — a plain `Duration`, not an `Option`, so the bound cannot be
+/// switched off by any spelling: without one a client can hold a
 /// connection slot — and, during a drain, the graceful watcher — open
 /// forever by never finishing its `ClientHello`.
 #[cfg(feature = "tls")]
 async fn tls_handshake(
     acceptor: &tokio_rustls::TlsAcceptor,
     stream: tokio::net::TcpStream,
-    deadline: Option<Duration>,
+    deadline: Duration,
     peer: std::net::SocketAddr,
 ) -> Option<tokio_rustls::server::TlsStream<tokio::net::TcpStream>> {
-    let accepting = acceptor.accept(stream);
-    let handshake = match deadline {
-        Some(limit) => match tokio::time::timeout(limit, accepting).await {
-            Ok(handshake) => handshake,
-            Err(_) => {
-                tracing::debug!("TLS handshake from {peer} did not finish within {limit:?}");
-                return None;
-            }
-        },
-        None => accepting.await,
+    let handshake = match tokio::time::timeout(deadline, acceptor.accept(stream)).await {
+        Ok(handshake) => handshake,
+        Err(_) => {
+            tracing::debug!("TLS handshake from {peer} did not finish within {deadline:?}");
+            return None;
+        }
     };
     match handshake {
         Ok(stream) => Some(stream),
@@ -456,6 +468,31 @@ async fn tls_handshake(
             None
         }
     }
+}
+
+/// The effective handshake deadline. Validation refuses `handshake_ms =
+/// 0`, but an embedder can hand a config over by value — a zero here
+/// falls back to the default rather than meaning "unbounded".
+#[cfg(feature = "tls")]
+fn handshake_deadline(tls: &crate::config::TlsConfig, header_read: Option<Duration>) -> Duration {
+    /// Long enough for any honest client on any honest network; far
+    /// short of forever.
+    const DEFAULT_HANDSHAKE: Duration = Duration::from_secs(10);
+    match tls.handshake_ms {
+        Some(ms) if ms > 0 => Duration::from_millis(ms),
+        _ => header_read.map_or(DEFAULT_HANDSHAKE, |d| d.min(DEFAULT_HANDSHAKE)),
+    }
+}
+
+/// The acceptor currently in the slot (poisoning is unreachable: the lock
+/// is only ever held to clone or replace the acceptor).
+#[cfg(feature = "tls")]
+fn current_acceptor(
+    slot: &Arc<std::sync::RwLock<Option<tokio_rustls::TlsAcceptor>>>,
+) -> Option<tokio_rustls::TlsAcceptor> {
+    slot.read()
+        .map(|s| s.clone())
+        .unwrap_or_else(|e| e.into_inner().clone())
 }
 
 /// Resolves when the drain has run out of time.

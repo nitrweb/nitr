@@ -240,7 +240,7 @@ impl ServerBuilder {
         // fails every handshake — which from the outside is
         // indistinguishable from a network fault.
         #[cfg(feature = "tls")]
-        let tls = load_tls(&cfg.tls)?;
+        let tls = Arc::new(RwLock::new(load_tls(&cfg.tls)?));
 
         Ok(Server {
             protection: Arc::new(Protection::new(&cfg)),
@@ -266,9 +266,9 @@ impl ServerBuilder {
 ///
 /// The whole certificate/key read happens in this one call, so every
 /// connection afterwards clones an `Arc` rather than touching the
-/// filesystem. The material is therefore fixed for the life of the
-/// process: a renewed certificate needs a restart, not a `SIGHUP` (which
-/// swaps the Lua pool and nothing else).
+/// filesystem. Renewed material arrives by `SIGHUP`: the reload path
+/// re-runs this same loading routine against the same paths and swaps
+/// the acceptor only when the new pair validates.
 #[cfg(feature = "tls")]
 fn load_tls(cfg: &crate::config::TlsConfig) -> Result<Option<tokio_rustls::TlsAcceptor>> {
     if !cfg.enabled {

@@ -466,13 +466,13 @@ function nitr.crypto.jwt.verify(token, key, opts) end
 ---`Authorization` header parsing. (std feature: `crypto`)
 nitr.auth = {}
 
----Basic credentials, or nil.
+---Basic credentials, or nil. Credentials must be UTF-8, and the scheme must be separated from the value by at least one space (extra spaces are trimmed; a tab is not a separator). Anything unparseable reads as no credentials, never a partial one.
 ---@param req nitr.Request|string
 ---@return string|nil _ User.
 ---@return string|nil _ Password.
 function nitr.auth.basic(req) end
 
----The bearer token, or nil.
+---The bearer token, or nil. Compare it with nitr.crypto.constant_time_eq, not ==; a length mismatch still returns early, so a variable-length secret is compared as a digest. See examples/bearer-auth.
 ---@param req nitr.Request|string
 ---@return string|nil
 function nitr.auth.bearer(req) end

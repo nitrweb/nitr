@@ -47,7 +47,7 @@ pub(crate) mod validate;
 pub use cache::{Cache, CacheOptions};
 // The configuration types are always available: `nitr.toml` has one shape
 // regardless of which builtins this build compiled in.
-pub use config::{EnvOptions, FetchOptions, SqlitePragmas};
+pub use config::{EnvOptions, FetchOptions, MAX_PASSWORD_BYTES, SqlitePragmas};
 pub use http::{RequestCookies, ResponseCookies, best_match};
 pub use utils::error_lua_value;
 

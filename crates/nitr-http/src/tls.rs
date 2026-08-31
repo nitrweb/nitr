@@ -65,7 +65,11 @@ pub(crate) fn load(cfg: &TlsConfig) -> Result<Loaded> {
     let cert_path = require(cfg.cert.as_deref(), "cert")?;
     let key_path = require(cfg.key.as_deref(), "key")?;
     let cert_pem = read(cert_path, "cert")?;
-    let key_pem = read(key_path, "key")?;
+    // Wiped when `load` returns. Only this copy is ours to wipe: the DER
+    // parsed out of it is consumed by rustls (`with_single_cert`) and
+    // lives as long as the acceptor — see the threat model for what that
+    // means for a core dump.
+    let key_pem = zeroize::Zeroizing::new(read(key_path, "key")?);
     build(&cert_pem, &key_pem, cfg.min_version.as_deref()).map_err(|err| {
         Error::Config(format!(
             "[tls] cannot use {} with {}: {err}",
@@ -369,6 +373,7 @@ mod tests {
             cert: Some("/nonexistent/nitr/cert.pem".into()),
             key: Some("/nonexistent/nitr/key.pem".into()),
             min_version: None,
+            handshake_ms: None,
         };
         let err = load(&cfg).expect_err("missing cert file");
         assert!(err.to_string().contains("[tls] cert"), "got: {err}");

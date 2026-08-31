@@ -109,3 +109,13 @@ impl Default for SqlitePragmas {
         }
     }
 }
+
+/// Upper bound on a password handed to `password_hash`/`password_verify`,
+/// in bytes — the argon2 input cap, checked before any hashing work.
+///
+/// Defined here, outside the `crypto` feature, for the same reason the
+/// configuration types are: the *shape* of the surface (the CLI's stdin
+/// cap, `nitr.crypto.max_password_bytes` as data) must not depend on
+/// which features a binary compiled in. The full rationale for the value
+/// lives on the `crypto::password` module that enforces it.
+pub const MAX_PASSWORD_BYTES: usize = 1024;

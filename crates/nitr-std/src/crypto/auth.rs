@@ -12,6 +12,18 @@ use mlua::{Lua, ObjectLike as _, Table, Value};
 /// Builds the `nitr.auth` table: `basic(req)` returns `user, pass` (or
 /// `nil`) and `bearer(req)` returns the token (or `nil`). Both accept the
 /// request object or the raw `Authorization` header value.
+///
+/// `basic` is stricter than RFC 7617, and it fails closed: credentials
+/// must be UTF-8 (latin-1 decodes to `nil`), and the scheme must be
+/// separated from the value by at least one space character — extra
+/// spaces are trimmed away, but a tab or any other separator does not
+/// count. Anything the parser rejects reads as "no credentials", never
+/// as a partial or wrong credential.
+///
+/// `bearer` hands back a secret; compare it with
+/// `nitr.crypto.constant_time_eq`, not `==` (see
+/// `examples/bearer-auth`). A length mismatch still returns early, so a
+/// secret whose length varies is compared as a digest.
 pub fn create_auth_table(lua: &Lua) -> mlua::Result<Table> {
     let auth = lua.create_table()?;
 
