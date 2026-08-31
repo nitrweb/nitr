@@ -12,7 +12,6 @@
 //! several concurrently, returning their responses in argument order.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -25,64 +24,13 @@ use reqwest::{Client as HttpClient, Method as HttpMethod, StatusCode, Url, redir
 use tracing::Instrument as _;
 
 use crate::config::FetchOptions;
+use crate::fetch::budget::{OutboundBudget, traceparent};
 use crate::fetch::policy::{ConnectPolicy, GuardedResolver, check_url};
 use crate::fetch::response::LuaResponse;
+use crate::fetch::retry::{Retry, backoff, is_retryable, parse_retry};
 
 /// Maximum redirects followed per outbound request.
 const MAX_REDIRECTS: usize = 5;
-
-/// Base delay for the first retry; each further attempt doubles it.
-const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
-
-/// Ceiling on a single backoff wait, so a long backoff cannot outlive the
-/// inbound request it belongs to.
-const RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
-
-/// How many outbound requests the current inbound request has made.
-///
-/// Stored in the Lua state's app data rather than passed around: the state
-/// handles one request at a time, so "the current request" is unambiguous,
-/// and the server resets it at dispatch.
-#[derive(Debug, Default)]
-pub struct OutboundBudget(AtomicU32);
-
-impl OutboundBudget {
-    /// Starts a new inbound request's count.
-    pub fn reset(&self) {
-        self.0.store(0, Ordering::Relaxed);
-    }
-
-    /// Counts one outbound call, refusing past `limit` (`0` = unlimited).
-    fn take(&self, limit: u32) -> mlua::Result<()> {
-        if limit == 0 {
-            return Ok(());
-        }
-        if self.0.fetch_add(1, Ordering::Relaxed) >= limit {
-            return Err(mlua::Error::RuntimeError(format!(
-                "this request has already made {limit} outbound calls \
-                 (fetch.max_per_request); a handler's outbound cost has to be bounded"
-            )));
-        }
-        Ok(())
-    }
-}
-
-/// Resets the outbound budget for a new inbound request.
-///
-/// Called by the server before dispatch. A no-op when `fetch` is not
-/// enabled for this state.
-pub fn reset_outbound_budget(lua: &Lua) {
-    if let Some(budget) = lua.app_data_ref::<Arc<OutboundBudget>>() {
-        budget.reset();
-    }
-}
-
-/// Per-call retry intent, from the Lua options table.
-#[derive(Debug, Clone, Copy)]
-struct Retry {
-    attempts: u32,
-    exponential: bool,
-}
 
 /// Everything needed to (re-)issue one outbound request.
 #[derive(Clone)]
@@ -136,13 +84,6 @@ impl UserData for LuaFetch {
     }
 }
 
-/// Statuses worth trying again: the upstream is saying "not now" rather
-/// than "no". A `404` or a `400` would return the same answer forever, so
-/// repeating those only wastes the budget.
-fn is_retryable(status: StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
-}
-
 /// Performs a request, repeating it when the policy allows.
 ///
 /// Retries count as one logical call against the per-request budget: the
@@ -184,30 +125,6 @@ async fn send_with_retries(
         );
         tokio::time::sleep(delay).await;
     }
-}
-
-/// Exponential backoff with jitter.
-///
-/// The jitter matters more than the curve: without it, every request that
-/// failed together retries together, and the upstream that just fell over
-/// gets a synchronized second wave.
-fn backoff(attempt: u32, exponential: bool) -> Duration {
-    let base = if exponential {
-        RETRY_BASE_DELAY.saturating_mul(1u32 << (attempt - 1).min(10))
-    } else {
-        RETRY_BASE_DELAY
-    }
-    .min(RETRY_MAX_DELAY);
-
-    // Full jitter over [base/2, base]. A counter-seeded xorshift is plenty:
-    // this decorrelates retries, it does not need to be unpredictable.
-    static SEED: AtomicU32 = AtomicU32::new(0x9e37_79b9);
-    let mut x = SEED.fetch_add(0x9e37_79b9, Ordering::Relaxed) | 1;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    let half = base / 2;
-    half + half.mul_f64(f64::from(x % 1000) / 1000.0)
 }
 
 /// Performs one attempt under the fetch policy, following redirects
@@ -399,24 +316,6 @@ fn parse_spec(method: String, url: String, arg: Option<Table>) -> mlua::Result<R
     })
 }
 
-/// `retry = { attempts = 3, backoff = "exponential" }`.
-fn parse_retry(table: &Table) -> mlua::Result<Retry> {
-    let attempts = table.get::<Option<u32>>("attempts")?.unwrap_or(3);
-    let exponential = match table.get::<Option<String>>("backoff")?.as_deref() {
-        None | Some("exponential") => true,
-        Some("constant") => false,
-        Some(other) => {
-            return Err(mlua::Error::RuntimeError(format!(
-                "unknown retry backoff `{other}`: expected \"exponential\" or \"constant\""
-            )));
-        }
-    };
-    Ok(Retry {
-        attempts,
-        exponential,
-    })
-}
-
 fn fill_headers(headers: &mut HeaderMap, table: &Table) -> mlua::Result<()> {
     for pair in table.pairs::<String, String>() {
         let (k, v) = pair.into_lua_err()?;
@@ -426,44 +325,6 @@ fn fill_headers(headers: &mut HeaderMap, table: &Table) -> mlua::Result<()> {
         );
     }
     Ok(())
-}
-
-/// The W3C `traceparent` for the current request, when propagation is on.
-///
-/// Pass-through, not a tracing SDK: the trace id is derived from the
-/// request id the server generates for every request, so a request
-/// crossing several Nitr services can be stitched together without any
-/// pipeline.
-fn traceparent(lua: &Lua) -> Option<HeaderValue> {
-    use sha2::Digest as _;
-
-    let id = lua.app_data_ref::<TraceContext>()?;
-    let digest = sha2::Sha256::digest(id.0.as_bytes());
-    let hex = |bytes: &[u8]| {
-        bytes.iter().fold(String::new(), |mut acc, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(acc, "{byte:02x}");
-            acc
-        })
-    };
-    // version-traceid(16 bytes)-spanid(8 bytes)-flags. `01` marks it
-    // sampled, which is the only honest answer when we do not sample.
-    HeaderValue::from_str(&format!(
-        "00-{}-{}-01",
-        hex(&digest[..16]),
-        hex(&digest[16..24])
-    ))
-    .ok()
-}
-
-/// The inbound request id this state is currently serving.
-#[derive(Debug, Clone)]
-pub struct TraceContext(pub String);
-
-/// Records the inbound request id so outbound calls can carry a
-/// `traceparent` derived from it.
-pub fn set_trace_context(lua: &Lua, request_id: &str) {
-    lua.set_app_data(TraceContext(request_id.to_string()));
 }
 
 /// HTTP fetch function: `fetch(method, url, opts?)` → request handle.
@@ -596,27 +457,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn backoff_grows_and_stays_jittered_within_bounds() {
-        for attempt in 1..=4u32 {
-            let base = RETRY_BASE_DELAY * (1 << (attempt - 1));
-            for _ in 0..20 {
-                let delay = backoff(attempt, true);
-                assert!(
-                    delay >= base / 2 && delay <= base,
-                    "attempt {attempt}: {delay:?} outside [{:?}, {:?}]",
-                    base / 2,
-                    base
-                );
-            }
-        }
-        // Constant backoff ignores the attempt number.
-        let delay = backoff(8, false);
-        assert!(delay <= RETRY_BASE_DELAY);
-        // And nothing ever waits longer than the ceiling.
-        assert!(backoff(30, true) <= RETRY_MAX_DELAY);
-    }
-
     /// The security boundary is the resolver wired *into* the client, not
     /// `check_url`: even with the URL check bypassed entirely, the built
     /// client must refuse to connect to a policy-forbidden address. This
@@ -650,22 +490,5 @@ mod tests {
             chain.contains("private or local"),
             "unexpected error: {chain}"
         );
-    }
-
-    #[test]
-    fn the_outbound_budget_counts_and_refuses() {
-        let budget = OutboundBudget::default();
-        assert!(budget.take(2).is_ok());
-        assert!(budget.take(2).is_ok());
-        assert!(budget.take(2).is_err(), "the third call is over budget");
-
-        budget.reset();
-        assert!(budget.take(2).is_ok(), "a new request starts fresh");
-
-        // Zero means unlimited.
-        let unlimited = OutboundBudget::default();
-        for _ in 0..1000 {
-            assert!(unlimited.take(0).is_ok());
-        }
     }
 }
