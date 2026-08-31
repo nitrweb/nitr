@@ -278,6 +278,11 @@ async fn run_main() -> anyhow::Result<()> {
     };
 
     match cli.command.unwrap_or(Command::Run) {
+        // Invariant: both commands returned early above — `Init` before
+        // the config load (it *creates* the config), `HashPassword` right
+        // after it (it must work without one) — so neither can reach this
+        // match. The arm exists only to keep the match exhaustive.
+        #[allow(clippy::unreachable)]
         Command::Init { .. } | Command::HashPassword => unreachable!("handled above"),
         Command::Run | Command::Dev => {
             let pidfile_path = cfg.pidfile.clone();

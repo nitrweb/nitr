@@ -44,6 +44,12 @@ pub(crate) struct LuaRequest {
     /// middleware (e.g. `nitr.csrf`) and the handler can both read it —
     /// the body itself can only be consumed once.
     pub(crate) cached_form: Option<Vec<(String, String)>>,
+    /// The effective `[limits] max_body_bytes`, recorded by
+    /// [`guard_body`](Self::guard_body) so the sized `req:read(n)` branch
+    /// can clamp a Lua-supplied size *at the allocation* instead of
+    /// relying on the limiter installed in another file. `u64::MAX` until
+    /// the guard runs (nothing to clamp against yet).
+    pub(crate) body_limit: u64,
 }
 
 /// Bounds applied while parsing a request body into Lua values.
@@ -101,6 +107,9 @@ impl LuaRequest {
             oversized: Arc::new(AtomicBool::new(false)),
             stalled: Arc::new(AtomicBool::new(false)),
         };
+        // Recorded for `req:read(n)`'s clamp, so the bound is readable at
+        // the point that allocates.
+        self.body_limit = limit;
         let inner = std::mem::take(self.req.body_mut());
         let limited = LimitedBody {
             inner,
@@ -134,6 +143,26 @@ impl LuaRequest {
     pub(crate) fn discard_body(&mut self) {
         *self.req.body_mut() = BoxBody::default();
     }
+}
+
+/// Clamps the sized `req:read(n)` argument — a Lua-supplied `usize` — to
+/// the effective body limit **plus one**.
+///
+/// The `+ 1` is what keeps `LimitedBody` able to trip. The limiter flags
+/// `oversized` only once *cumulative* `read > limit` (`body.rs`), and the
+/// handler turns that flag into the `413`. Clamped to `limit` exactly, the
+/// read loop would stop the moment `buf.len() >= limit`, so an over-limit
+/// body whose frames happen to sum to the limit at a frame boundary would
+/// never be pulled one frame further, never trip the limiter, and get the
+/// application's `200` instead of a `413` — and 1 MiB is a multiple of
+/// typical frame sizes, so "happen to" means "usually". The one extra
+/// frame is the one that errors; its bytes are never appended, so the
+/// buffer still never exceeds `limit`.
+fn clamp_want(want: usize, limit: u64) -> usize {
+    // Saturating twice: `limit + 1` must not wrap at `u64::MAX`, and the
+    // cast must not wrap on a 32-bit `usize`.
+    let ceiling = usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX);
+    want.min(ceiling)
 }
 
 impl UserData for LuaRequest {
@@ -216,6 +245,7 @@ impl UserData for LuaRequest {
         // than its own memory limit: the request-side mirror of a streaming
         // response. `nil` marks the end of the body.
         methods.add_async_method_mut("read", |lua, mut req, n: Option<usize>| async move {
+            let body_limit = req.body_limit;
             let reader = req.req.body_mut();
             let Some(want) = n else {
                 while let Some(frame) = reader.frame().await {
@@ -227,6 +257,10 @@ impl UserData for LuaRequest {
                 return Ok(None);
             };
 
+            // The limiter installed by `guard_body` already bounds what the
+            // body can deliver; the clamp makes that bound local and keeps
+            // the loop's termination readable here, without trusting `want`.
+            let want = clamp_want(want, body_limit);
             let mut buf = Vec::new();
             while buf.len() < want {
                 let Some(frame) = reader.frame().await else {

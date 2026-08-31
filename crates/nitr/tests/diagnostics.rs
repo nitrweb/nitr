@@ -78,6 +78,69 @@ end)
 return app
 "#;
 
+/// In-process `tracing` capture for the M-3 level assertion. This crate
+/// already inherits `tracing-subscriber`; `nitr-http` deliberately does
+/// not (phase 1 of the audit-3 remediation rejected a log-capture
+/// dev-dependency there), which is why the log-level contract is pinned
+/// here rather than beside `fs_ok`.
+mod logcap {
+    use std::fmt::Write as _;
+    use std::sync::Mutex;
+
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    /// One captured event: its level and the flattened `field=value` text.
+    #[derive(Clone)]
+    pub struct Event {
+        pub level: tracing::Level,
+        pub text: String,
+    }
+
+    static EVENTS: Mutex<Vec<Event>> = Mutex::new(Vec::new());
+
+    struct Capture;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _cx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Collect(String);
+            impl tracing::field::Visit for Collect {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    let _ = write!(self.0, " {}={:?}", field.name(), value);
+                }
+            }
+            let mut collect = Collect(String::new());
+            event.record(&mut collect);
+            EVENTS.lock().expect("event log").push(Event {
+                level: *event.metadata().level(),
+                text: collect.0,
+            });
+        }
+    }
+
+    /// Installs the capturing subscriber process-wide, once. Every test
+    /// in this binary shares the list, so assertions filter by their own
+    /// marker text rather than assuming exclusivity.
+    pub fn install() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let subscriber = tracing_subscriber::registry().with(Capture);
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+    }
+
+    pub fn events() -> Vec<Event> {
+        EVENTS.lock().expect("event log").clone()
+    }
+}
+
 /// Removes ANSI SGR sequences (`ESC [ … m`), leaving the visible text.
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -355,4 +418,81 @@ async fn syntax_errors_point_at_the_line() {
     assert!(message.contains("syntax.lua"), "{message}");
     // The gutter renders the offending source line.
     assert!(message.contains("| return app"), "{message}");
+}
+
+/// M-3 (audit 3, phase 4): a request-manufactured filesystem error on the
+/// static-serving path logs at `debug` — never `warn` or above — with the
+/// path escaped, so an unauthenticated URI can neither spam the
+/// operator's log nor forge a line in it. The client answer stays a
+/// uniform 404 throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn static_fs_errors_log_at_debug_with_the_path_escaped() {
+    logcap::install();
+
+    let dir = harness::TestDir::new("diagnostics-static");
+    std::fs::write(dir.path().join("ok.txt"), "ok").expect("write file");
+    let app = format!(
+        "local app = nitr.app()\napp:static(\"/assets\", {:?})\nreturn app\n",
+        dir.path().to_string_lossy(),
+    );
+    let mut server = TestServer::builder("diagnostics")
+        .handler(app)
+        .builtins(nitr::Builtins::HTTP)
+        .config(|cfg| cfg.workers = 1)
+        .spawn()
+        .await;
+
+    // A component past NAME_MAX with an embedded newline: it passes the
+    // lexical path rules, so `metadata` itself fails (`ENAMETOOLONG`) —
+    // the class an unauthenticated URI can still manufacture — and the
+    // newline rides on an error that is actually logged. (A `%00` never
+    // reaches the filesystem any more: `safe_join` rejects NUL lexically,
+    // so that probe is a silent 404 — the phase plan's NUL vector
+    // predates that rule.)
+    let hostile = format!("/assets/{}%0A%20WARN%20forged", "B".repeat(300));
+    let resp = server
+        .client()
+        .get(server.url(&hostile))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 404, "the client answer stays a uniform 404");
+    // Control: the mount itself works, so the 404 above was the error
+    // path and not a dead mount.
+    let resp = server.get("/assets/ok.txt").await;
+    assert_eq!(resp.status(), 200);
+
+    server.stop().await;
+
+    let events: Vec<_> = logcap::events()
+        .into_iter()
+        .filter(|e| e.text.contains("static file access failed"))
+        .collect();
+    assert!(
+        !events.is_empty(),
+        "the probe must reach fs_ok and be logged (at debug)"
+    );
+    for event in &events {
+        assert_eq!(
+            event.level,
+            tracing::Level::DEBUG,
+            "a request-derived path must never steer the log above debug: {}",
+            event.text
+        );
+        assert!(
+            event.text.contains("kind="),
+            "the ErrorKind field is part of the contract: {}",
+            event.text
+        );
+        assert!(
+            !event.text.contains('\n'),
+            "a request newline must arrive escaped, not verbatim: {}",
+            event.text
+        );
+        assert!(
+            event.text.contains("\\n"),
+            "the escaped newline should still be visible in the quoted path: {}",
+            event.text
+        );
+    }
 }

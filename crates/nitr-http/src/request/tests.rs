@@ -165,3 +165,19 @@ fn a_request_without_validators_is_never_fresh() {
         Some(1)
     ));
 }
+
+/// The sized `req:read(n)` clamp (audit 3, phase 4, L-2). The runtime
+/// bound already held — `LimitedBody` ends the body at the limit — so the
+/// value under test is the *clamp*: `limit + 1`, never `limit`, because
+/// `limit` exactly would stop the read loop at a frame boundary without
+/// pulling the frame that trips the limiter, turning a `413` into a `200`.
+#[test]
+fn clamp_want_bounds_a_lua_supplied_size() {
+    // A huge ask lands one byte past the limit: the byte that trips.
+    assert_eq!(clamp_want(usize::MAX, 1_048_576), 1_048_577);
+    // A modest ask is untouched.
+    assert_eq!(clamp_want(10, 1_048_576), 10);
+    assert_eq!(clamp_want(0, 1_048_576), 0);
+    // The limit's own edge saturates instead of wrapping to zero.
+    assert_eq!(clamp_want(usize::MAX, u64::MAX), usize::MAX);
+}

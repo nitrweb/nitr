@@ -192,14 +192,25 @@ async fn resolve(dir: &Path, rel: &str) -> Option<PathBuf> {
 
 /// Filesystem access on the serving path. An absent file is normal
 /// traffic; anything else (permissions, a broken mount) is a server-side
-/// problem the operator needs to see, so it is logged here — while the
-/// client gets the same non-leaking 404 either way.
+/// problem worth a diagnostic — while the client gets the same
+/// non-leaking 404 either way.
+///
+/// The diagnostic is `debug`, not `warn`, and the path is rendered with
+/// `{:?}` rather than `Path::display`, both on purpose: the path here is
+/// built from the request URI, so a URI that manufactures a non-`NotFound`
+/// error (`ENAMETOOLONG`, `EACCES`) was an unauthenticated log amplifier
+/// at `warn`, and `display()` passes control bytes through — a `\n` in a
+/// request path could forge a whole log line. `{:?}` quotes and escapes;
+/// `debug` is not on in production. The operator debugging a real
+/// permissions problem (a mis-chowned static root looks exactly like a
+/// missing file) turns on `debug` and still gets the path and the error
+/// kind.
 fn fs_ok<T>(result: std::io::Result<T>, path: &Path) -> Option<T> {
     match result {
         Ok(value) => Some(value),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => {
-            tracing::warn!("static file access failed for {}: {err}", path.display());
+            tracing::debug!(kind = ?err.kind(), "static file access failed for {path:?}: {err}");
             None
         }
     }
@@ -410,7 +421,10 @@ mod tests {
 
     /// Absent files stay a quiet `None` (normal traffic); every other
     /// filesystem error also answers `None` — same non-leaking 404 — but
-    /// is the case [`fs_ok`] logs for the operator.
+    /// is the case [`fs_ok`] logs for the operator, at `debug` with the
+    /// path escaped (the path is request-derived, so `warn` was a log
+    /// amplifier; the level is pinned end to end in
+    /// `crates/nitr/tests/diagnostics.rs`).
     #[test]
     fn fs_errors_all_resolve_to_none() {
         use std::io::{Error as IoError, ErrorKind};

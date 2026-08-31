@@ -53,6 +53,14 @@ app:post("/echo", function(req)
     return nitr.text(req:text())
 end)
 
+-- Audit 3, phase 4 (L-2): a sized read asking for far more than the body
+-- limit. The clamp must not disarm the limiter: an over-limit body still
+-- answers 413 through this handler.
+app:post("/read-huge", function(req)
+    local chunk = req:read(1024 * 1024 * 1024 * 4)
+    return nitr.text(tostring(chunk and #chunk or 0))
+end)
+
 -- Phase 24: serializing a deep table chain must be a catchable error,
 -- not the stack-overflow abort it used to be.
 app:get("/deep-json", function(req)
@@ -780,6 +788,68 @@ async fn an_incomplete_header_read_is_cut_at_the_configured_deadline() {
         !head.contains("200 OK"),
         "no request existed to answer: {head}"
     );
+
+    h.stop().await;
+}
+
+/// The `req:read(n)` clamp must not disarm the body limiter (audit 3,
+/// phase 4, L-2). The clamp is a locality change — the limiter already
+/// bounded the buffer, and every other body shape behaves identically
+/// with the clamp deleted — so THE case this test exists for is the
+/// frame-aligned one: frames that sum to exactly `max_body_bytes` before
+/// the body ends. A clamp of `limit` (instead of `limit + 1`) stops the
+/// read loop at that boundary, never pulls the frame that trips the
+/// limiter, and turns this `413` into the application's `200`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversized_body_still_answers_413_after_the_clamp() {
+    let mut h = start(|cfg| {
+        cfg.workers = 1;
+        cfg.limits.max_body_bytes = 1024;
+    })
+    .await;
+
+    // Within the limit, semantics are unchanged: the whole body, and the
+    // huge `n` is simply never satisfied.
+    let resp = h
+        .client()
+        .post(h.url("/read-huge"))
+        .body(vec![b'x'; 1024])
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.expect("body"), "1024");
+
+    // Over the limit with 256-byte chunks: the running count reaches 1024
+    // at a frame boundary with the body not yet done. Raw socket, because
+    // the test client always declares a length and the declared-size check
+    // would answer first.
+    let mut sock = tokio::net::TcpStream::connect(h.addr())
+        .await
+        .expect("connect");
+    sock.write_all(
+        b"POST /read-huge HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n",
+    )
+    .await
+    .expect("write headers");
+    // Best-effort: the server may answer and hang up mid-body.
+    for _ in 0..8 {
+        if sock.write_all(b"100\r\n").await.is_err()
+            || sock.write_all(&[b'y'; 256]).await.is_err()
+            || sock.write_all(b"\r\n").await.is_err()
+        {
+            break;
+        }
+    }
+    let _ = sock.write_all(b"0\r\n\r\n").await;
+
+    let mut raw = [0u8; 128];
+    let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut raw))
+        .await
+        .expect("the server must answer, not hang")
+        .expect("read response");
+    let head = String::from_utf8_lossy(&raw[..n]);
+    assert!(head.starts_with("HTTP/1.1 413"), "got: {head}");
 
     h.stop().await;
 }

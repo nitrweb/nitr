@@ -73,16 +73,97 @@ impl HealthState {
     }
 }
 
+/// The main listener's guards, ported onto the probe listener: plain
+/// values rather than a `Config`, so [`serve_probes`] stays testable in
+/// isolation. `header_read` and `max_buf_size` are `[limits]`'s own —
+/// "how long may a client take to say what it wants?" has one answer per
+/// process — while the connection cap is `[health] max_connections`,
+/// deliberately far below the main listener's.
+#[derive(Clone, Copy)]
+pub(crate) struct ProbeGuards {
+    /// `[health] max_connections`; clamped to at least 1.
+    pub(crate) max_connections: usize,
+    /// `[limits] header_read_ms` as a duration; `None` disables the
+    /// deadline, exactly as it does on the main listener.
+    pub(crate) header_read: Option<std::time::Duration>,
+    /// `[limits] max_header_bytes`, already clamped to hyper's 8 KiB floor.
+    pub(crate) max_buf_size: usize,
+}
+
 /// A hyper service that answers *only* the health endpoints — everything
 /// else is 404. Served on the separate `[health] bind` listener, so the
 /// operational port exposes nothing but the probes.
-pub(crate) async fn serve_probes(listener: tokio::net::TcpListener, state: Arc<HealthState>) {
+///
+/// The loop carries the same four guards as the main accept loop in
+/// `server/serve.rs` — a connection cap acquired *before* `accept()`, a
+/// complete-headers deadline, a bounded read buffer, and a classified,
+/// backed-off accept error. The probe port answers two fixed paths, but
+/// "narrow" is not "bounded": without these, held-open connections and a
+/// persistent `EMFILE` were an unmetered descriptor hole and a 100% CPU
+/// spin.
+///
+/// Probe connections are watched, not detached: each one is registered
+/// with this loop's own `GracefulShutdown`, and when `stop` fires (after
+/// the main drain — readiness must be observable as "draining" while it
+/// happens) the loop stops accepting and finishes any in-flight probe
+/// answer before returning.
+pub(crate) async fn serve_probes(
+    listener: tokio::net::TcpListener,
+    state: Arc<HealthState>,
+    guards: ProbeGuards,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) {
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use hyper_util::server::graceful::GracefulShutdown;
+    use tokio::sync::Semaphore;
+
+    let slots = Arc::new(Semaphore::new(guards.max_connections.max(1)));
+    // Identical for every connection: built once, cloned per accept.
+    let http = {
+        let mut builder = hyper::server::conn::http1::Builder::new();
+        builder
+            .timer(TokioTimer::new())
+            .header_read_timeout(guards.header_read)
+            .max_buf_size(guards.max_buf_size);
+        builder
+    };
+    let graceful = GracefulShutdown::new();
+
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            continue;
+        let accepted = tokio::select! {
+            accepted = async {
+                // Acquire before accept — the ordering is what stops the
+                // loop from taking a connection it has no slot for.
+                // Invariant: acquire fails only on a closed semaphore,
+                // and nothing ever closes this one.
+                #[allow(clippy::expect_used)]
+                let permit = slots
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("probe connection semaphore is never closed");
+                (permit, listener.accept().await)
+            } => accepted,
+            _ = &mut stop => break,
+        };
+        let (permit, accepted) = accepted;
+        let stream = match accepted {
+            Ok((stream, _peer)) => stream,
+            Err(err) => {
+                crate::server::accept_error_backoff("probe listener", &err).await;
+                continue;
+            }
         };
         let state = state.clone();
+        let http = http.clone();
+        // Subscribed at accept time, like the main loop: a drain that
+        // starts mid-connection is seen by this connection rather than
+        // arriving one version late.
+        let watcher = graceful.watcher();
         tokio::spawn(async move {
+            // Held until the connection closes: the cap bounds live
+            // connections, not merely concurrent accepts.
+            let _permit = permit;
             let svc =
                 hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                     let state = state.clone();
@@ -94,11 +175,14 @@ pub(crate) async fn serve_probes(listener: tokio::net::TcpListener, state: Arc<H
                         )
                     }
                 });
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
-                .await;
+            let conn = http.serve_connection(TokioIo::new(stream), svc);
+            let _ = watcher.watch(conn).await;
         });
     }
+
+    // Stop accepting (releasing the port), then finish what is in flight.
+    drop(listener);
+    graceful.shutdown().await;
 }
 
 #[cfg(test)]

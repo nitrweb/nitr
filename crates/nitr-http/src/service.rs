@@ -99,6 +99,7 @@ impl Service<Request<Incoming>> for Svc {
             // Replaced with the configured bounds by the handler.
             limits: Default::default(),
             cached_form: None,
+            body_limit: u64::MAX,
         };
 
         Box::pin(

@@ -114,8 +114,10 @@ fn cookie_token(req: &Value, config: &Config) -> Option<String> {
 
 /// The middleware handler around one request.
 async fn handle(lua: Lua, config: Arc<Config>, next: Function, req: Value) -> mlua::Result<Value> {
-    let req_id: String = match &req {
-        Value::UserData(ud) => ud.get("id")?,
+    // Both fields come out of the single match that proves the shape, so
+    // no later code needs to re-match the value it already checked.
+    let (req_id, method): (String, String) = match &req {
+        Value::UserData(ud) => (ud.get("id")?, ud.get("method")?),
         other => {
             return Err(mlua::Error::RuntimeError(format!(
                 "nitr.csrf middleware expects the request object, got {}",
@@ -135,10 +137,6 @@ async fn handle(lua: Lua, config: Arc<Config>, next: Function, req: Value) -> ml
         token: token.clone(),
     });
 
-    let method: String = match &req {
-        Value::UserData(ud) => ud.get("method")?,
-        _ => unreachable!("checked above"),
-    };
     let safe = matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE");
 
     let resp = if safe {

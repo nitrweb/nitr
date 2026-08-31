@@ -33,6 +33,13 @@ pub struct HealthConfig {
     /// A separate address to serve the endpoints on, keeping them off the
     /// public port. When unset they answer on the main listener.
     pub bind: Option<SocketAddr>,
+    /// Connection cap for the separate probe listener (`bind`), deliberately
+    /// far below `[limits] max_connections`: a prober opens one connection,
+    /// not a thousand, and inheriting the main cap would let the probe port
+    /// consume the process's whole file-descriptor budget on its own.
+    /// Ignored when the probes answer on the main listener, which has its
+    /// own cap.
+    pub max_connections: usize,
 }
 
 impl Default for HealthConfig {
@@ -42,6 +49,7 @@ impl Default for HealthConfig {
             liveness: "/healthz".into(),
             readiness: "/readyz".into(),
             bind: None,
+            max_connections: 64,
         }
     }
 }

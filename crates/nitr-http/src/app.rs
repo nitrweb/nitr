@@ -24,8 +24,18 @@ use nitr_core::{Error, Result, Runtime};
 /// Named registry slot holding each state's compiled [`AppState`].
 const APP_STATE_KEY: &str = "nitr::app_state";
 
-/// Route-registration method names exposed on the app object.
-const METHOD_NAMES: &[&str] = &["get", "post", "put", "delete", "patch", "head", "options"];
+/// Route-registration methods exposed on the app object, each name paired
+/// with its `Method` so the mapping is total by construction — no lookup
+/// that could miss, nothing to declare unreachable.
+const METHOD_NAMES: &[(&str, Method)] = &[
+    ("get", Method::GET),
+    ("post", Method::POST),
+    ("put", Method::PUT),
+    ("delete", Method::DELETE),
+    ("patch", Method::PATCH),
+    ("head", Method::HEAD),
+    ("options", Method::OPTIONS),
+];
 
 /// Locks the app definition; the mutex exists only to satisfy `Sync` (a
 /// Lua state is single-threaded), so contention/poisoning cannot occur in
@@ -33,19 +43,6 @@ const METHOD_NAMES: &[&str] = &["get", "post", "put", "delete", "patch", "head",
 fn lock(def: &Mutex<AppDef>) -> mlua::Result<std::sync::MutexGuard<'_, AppDef>> {
     def.lock()
         .map_err(|_| mlua::Error::RuntimeError("the app definition lock is poisoned".into()))
-}
-
-fn method_of(name: &str) -> Method {
-    match name {
-        "get" => Method::GET,
-        "post" => Method::POST,
-        "put" => Method::PUT,
-        "delete" => Method::DELETE,
-        "patch" => Method::PATCH,
-        "head" => Method::HEAD,
-        "options" => Method::OPTIONS,
-        other => unreachable!("unknown route method name `{other}`"),
-    }
 }
 
 /// A route as registered by the script: zero or more middleware followed by
@@ -94,8 +91,8 @@ pub(crate) struct LuaApp(Mutex<AppDef>);
 
 impl UserData for LuaApp {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        for name in METHOD_NAMES {
-            let method = method_of(name);
+        for (name, method) in METHOD_NAMES {
+            let method = method.clone();
             methods.add_method(
                 *name,
                 // `middleware..., handler` optionally followed by an options

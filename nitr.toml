@@ -257,6 +257,9 @@ dir = "scripts/templates"
 #liveness = "/healthz"
 #readiness = "/readyz"
 #bind = "127.0.0.1:9090"   # optional: keep the probes off the public port
+#max_connections = 64      # the probe listener's own connection cap, far
+                           # below [limits] max_connections on purpose — a
+                           # prober opens one connection, not a thousand
 
 # Log output. "json" emits one object per line with the request/error
 # fields as real keys, for log shippers; "text" (default) is for humans.

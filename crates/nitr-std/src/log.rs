@@ -26,23 +26,47 @@ fn fields_json(fields: Option<Table>) -> Option<String> {
     )
 }
 
+/// The four Lua-facing log levels, as a closed enum so the dispatch below
+/// is exhaustive by type — no name is re-matched, nothing to declare
+/// unreachable. (`tracing::event!` needs a const level per call site, so
+/// a dynamic `tracing::Level` cannot replace the dispatch.)
+#[derive(Clone, Copy)]
+enum LuaLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
 /// Creates the `log` global table with `debug`/`info`/`warn`/`error`.
 pub(crate) fn create_log_table(lua: &Lua) -> mlua::Result<Table> {
     let table = lua.create_table()?;
-    for level in ["debug", "info", "warn", "error"] {
+    for (name, level) in [
+        ("debug", LuaLevel::Debug),
+        ("info", LuaLevel::Info),
+        ("warn", LuaLevel::Warn),
+        ("error", LuaLevel::Error),
+    ] {
         table.set(
-            level,
+            name,
             lua.create_function(move |_, (msg, fields): (String, Option<Table>)| {
                 match (level, fields_json(fields)) {
-                    ("debug", Some(f)) => tracing::debug!(target: "lua", fields = %f, "{msg}"),
-                    ("debug", None) => tracing::debug!(target: "lua", "{msg}"),
-                    ("info", Some(f)) => tracing::info!(target: "lua", fields = %f, "{msg}"),
-                    ("info", None) => tracing::info!(target: "lua", "{msg}"),
-                    ("warn", Some(f)) => tracing::warn!(target: "lua", fields = %f, "{msg}"),
-                    ("warn", None) => tracing::warn!(target: "lua", "{msg}"),
-                    ("error", Some(f)) => tracing::error!(target: "lua", fields = %f, "{msg}"),
-                    ("error", None) => tracing::error!(target: "lua", "{msg}"),
-                    _ => unreachable!("unknown log level"),
+                    (LuaLevel::Debug, Some(f)) => {
+                        tracing::debug!(target: "lua", fields = %f, "{msg}")
+                    }
+                    (LuaLevel::Debug, None) => tracing::debug!(target: "lua", "{msg}"),
+                    (LuaLevel::Info, Some(f)) => {
+                        tracing::info!(target: "lua", fields = %f, "{msg}")
+                    }
+                    (LuaLevel::Info, None) => tracing::info!(target: "lua", "{msg}"),
+                    (LuaLevel::Warn, Some(f)) => {
+                        tracing::warn!(target: "lua", fields = %f, "{msg}")
+                    }
+                    (LuaLevel::Warn, None) => tracing::warn!(target: "lua", "{msg}"),
+                    (LuaLevel::Error, Some(f)) => {
+                        tracing::error!(target: "lua", fields = %f, "{msg}")
+                    }
+                    (LuaLevel::Error, None) => tracing::error!(target: "lua", "{msg}"),
                 }
                 Ok(())
             })?,

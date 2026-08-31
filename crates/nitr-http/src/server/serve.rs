@@ -110,6 +110,18 @@ impl Server {
             current_pool(&self.pool).size()
         );
 
+        // hyper enforces a floor of 8 KiB on its read buffer.
+        let max_buf_size = self.cfg.limits.max_header_bytes.max(8 * 1024);
+        // Complete-headers deadline (`[limits] header_read_ms`); `None`
+        // disables it. Enforced by hyper per connection: an expired one
+        // is simply closed — no request exists yet to answer. Under TLS it
+        // also bounds the handshake: the same question ("how long may a
+        // client take to say what it wants?"), asked one layer down.
+        let header_read = match self.cfg.limits.header_read_ms {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        };
+
         // Health endpoints: on the main listener by default, or on their
         // own address so the probes stay off the public port.
         let health_state = self.cfg.health.enabled.then(|| {
@@ -118,7 +130,36 @@ impl Server {
                 ready: self.ready.clone(),
             })
         });
+        // The probe listener carries the main listener's guards — its own
+        // (smaller) connection cap, and the same header deadline and read
+        // buffer, because "how long may a client take to say what it
+        // wants?" has one answer per process.
+        let probe_guards = crate::health::ProbeGuards {
+            max_connections: self.cfg.health.max_connections,
+            header_read,
+            max_buf_size,
+        };
+        // The probe transport is a decision, not an accident: the probe
+        // port stays plaintext even under `[tls]`, because a prober that
+        // must complete a TLS handshake fails exactly when liveness must
+        // still answer — during certificate trouble. The startup line says
+        // so instead of implying it with a bare `http://`; the decision
+        // and its threat-model entry belong to the TLS-surface work
+        // (audits/3-remediation, T-6). One closure serves both listener
+        // branches, so their wording cannot drift apart.
+        let tls_enabled = self.cfg.tls.enabled;
+        let log_probe_endpoint = move |addr: &str| {
+            if tls_enabled {
+                tracing::info!(
+                    "health endpoints on http://{addr} (plaintext; TLS terminates on the \
+                     main listener only)"
+                );
+            } else {
+                tracing::info!("health endpoints on http://{addr}");
+            }
+        };
         let mut probe_task = None;
+        let mut probe_stop = None;
         let main_health = match (&health_state, self.health_listener.take()) {
             // An adopted probe listener wins over binding `[health] bind`
             // ourselves — the same rule the main listener follows — so the
@@ -134,10 +175,14 @@ impl Server {
                     .local_addr()
                     .map(|a| a.to_string())
                     .unwrap_or_else(|_| "<unknown>".into());
-                tracing::info!("health endpoints on http://{addr}");
+                log_probe_endpoint(&addr);
+                let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+                probe_stop = Some(stop_tx);
                 probe_task = Some(tokio::spawn(crate::health::serve_probes(
                     probe_listener,
                     state.clone(),
+                    probe_guards,
+                    stop_rx,
                 )));
                 None
             }
@@ -146,10 +191,21 @@ impl Server {
                     let probe_listener = TcpListener::bind(addr).await.map_err(|err| {
                         Error::Config(format!("unable to bind [health] bind = {addr}: {err}"))
                     })?;
-                    tracing::info!("health endpoints on http://{addr}");
+                    // The bound address, not the configured one: with a
+                    // port-0 bind the config value is not where we serve —
+                    // the same rule the main listener's line follows.
+                    let bound = probe_listener
+                        .local_addr()
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|_| addr.to_string());
+                    log_probe_endpoint(&bound);
+                    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+                    probe_stop = Some(stop_tx);
                     probe_task = Some(tokio::spawn(crate::health::serve_probes(
                         probe_listener,
                         state.clone(),
+                        probe_guards,
+                        stop_rx,
                     )));
                     None
                 }
@@ -161,17 +217,6 @@ impl Server {
         // Connection cap: the listener stops accepting while at the limit
         // instead of queueing unbounded connections.
         let conn_slots = Arc::new(Semaphore::new(self.cfg.limits.max_connections.max(1)));
-        // hyper enforces a floor of 8 KiB on its read buffer.
-        let max_buf_size = self.cfg.limits.max_header_bytes.max(8 * 1024);
-        // Complete-headers deadline (`[limits] header_read_ms`); `None`
-        // disables it. Enforced by hyper per connection: an expired one
-        // is simply closed — no request exists yet to answer. Under TLS it
-        // also bounds the handshake: the same question ("how long may a
-        // client take to say what it wants?"), asked one layer down.
-        let header_read = match self.cfg.limits.header_read_ms {
-            0 => None,
-            ms => Some(Duration::from_millis(ms)),
-        };
         // Identical for every connection, so it is built once and cloned
         // into each task rather than rebuilt per accept.
         let http = {
@@ -203,7 +248,7 @@ impl Server {
                     let (stream, peer_addr) = match accepted {
                         Ok(x) => x,
                         Err(err) => {
-                            tracing::error!("failed to accept connection: {err}");
+                            accept_error_backoff("listener", &err).await;
                             continue;
                         }
                     };
@@ -304,8 +349,27 @@ impl Server {
             _ = deadline => false,
         };
 
-        if let Some(task) = probe_task {
-            task.abort();
+        // The probe listener stayed up through the drain — readiness had
+        // to be observable as "draining" while it happened — and drains
+        // now: `serve_probes` watches every in-flight probe connection
+        // with its own `GracefulShutdown`, so stopping it finishes open
+        // probe answers instead of severing them. The deadline is tight
+        // because a probe response is one fixed-body round trip.
+        if let Some(mut task) = probe_task {
+            if let Some(stop) = probe_stop.take() {
+                let _ = stop.send(());
+            }
+            if tokio::time::timeout(Duration::from_secs(1), &mut task)
+                .await
+                .is_err()
+            {
+                // Aborting kills the accept/drain task only; the
+                // per-connection tasks are independent spawns and simply
+                // run to completion on their own (in the binary, until
+                // process exit moments later).
+                tracing::warn!("probe listener did not drain within 1s, abandoning the drain");
+                task.abort();
+            }
         }
 
         if drained {
@@ -317,6 +381,40 @@ impl Server {
             // exiting 0 and hiding it.
             tracing::warn!("drain deadline of {total:?} expired, aborting remaining connections");
             Err(Error::ShutdownTimeout)
+        }
+    }
+}
+
+/// How long an accept loop pauses after a non-client accept failure.
+///
+/// Fixed rather than exponential on purpose: the failure this exists for
+/// is descriptor exhaustion (`EMFILE`/`ENFILE`), which clears when a
+/// descriptor frees, not on a schedule — and exponential backoff adds
+/// state to a loop whose whole virtue is having none.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Classifies, logs, and (for one class) backs off one `accept()` failure.
+/// Both accept loops — the main listener's and the probe listener's — go
+/// through here, so the level split and the delay cannot drift apart.
+///
+/// Exactly two classes, deliberately. `ConnectionAborted`,
+/// `ConnectionReset` and `Interrupted` are client-caused and self-clearing
+/// (the peer gave up between the kernel completing the handshake and this
+/// process accepting it): `debug`, retry at once. *Everything else* is
+/// treated as resource trouble and paced: Rust has no stable `ErrorKind`
+/// for `EMFILE`/`ENFILE` — they surface as an uncategorized kind plus a
+/// raw OS error — so they cannot be named directly, and without the sleep
+/// a persistent one busy-spins the accept loop at 100% CPU. If this match
+/// ever grows a third case, it has stopped being insurance.
+pub(crate) async fn accept_error_backoff(listener: &str, err: &std::io::Error) {
+    use std::io::ErrorKind;
+    match err.kind() {
+        ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset | ErrorKind::Interrupted => {
+            tracing::debug!("{listener}: client gone before accept: {err}");
+        }
+        _ => {
+            tracing::warn!("{listener}: failed to accept connection: {err}");
+            tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
         }
     }
 }

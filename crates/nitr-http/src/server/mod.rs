@@ -71,6 +71,7 @@ mod serve;
 pub use builder::ServerBuilder;
 pub(crate) use pool::current_pool;
 use pool::{build_runtimes, new_pool};
+pub(crate) use serve::accept_error_backoff;
 
 impl Server {
     /// Creates a [`ServerBuilder`] with default configuration.
