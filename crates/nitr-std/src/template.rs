@@ -37,10 +37,35 @@ impl UserData for LuaTemplate<'_> {
     }
 }
 
+/// Whether a template name renders with HTML auto-escaping.
+///
+/// minijinja's default escapes only `.html`/`.htm`/`.xml` (after stripping
+/// a trailing `.j2`), so `hello.j2` — the shape the scaffold and every
+/// example teach — rendered `{{ name }}` verbatim: the first request field
+/// or database row that reached a template was reflected or stored XSS.
+/// The default here is the other way round: everything escapes unless
+/// the name says plain text.
+fn auto_escape_for(name: &str) -> minijinja::AutoEscape {
+    let stem = name
+        .strip_suffix(".j2")
+        .or_else(|| name.strip_suffix(".jinja"))
+        .or_else(|| name.strip_suffix(".jinja2"))
+        .unwrap_or(name);
+    let plain = [
+        ".txt", ".text", ".md", ".csv", ".json", ".yaml", ".yml", ".toml",
+    ];
+    if plain.iter().any(|ext| stem.ends_with(ext)) {
+        minijinja::AutoEscape::None
+    } else {
+        minijinja::AutoEscape::Html
+    }
+}
+
 /// Templating function support.
 pub(crate) fn create_template_fn(lua: &Lua, dir: &Path) -> mlua::Result<AnyUserData> {
     let mut env = Environment::new();
     env.set_loader(path_loader(dir));
+    env.set_auto_escape_callback(auto_escape_for);
 
     let env = Arc::new(env);
     lua.create_userdata(LuaTemplate(env))
@@ -89,6 +114,36 @@ mod tests {
             err.to_string().contains("nested deeper than 128 levels"),
             "got: {err}"
         );
+    }
+
+    /// HTML escaping is the default for any name that is not plain text,
+    /// `.j2`-suffixed or not.
+    #[test]
+    fn templates_escape_html_unless_named_as_plain_text() {
+        use mlua::ObjectLike as _;
+
+        let lua = Lua::new();
+        let mut env = Environment::new();
+        env.set_auto_escape_callback(auto_escape_for);
+        for name in ["page.j2", "page.html", "page", "mail.html.j2"] {
+            env.add_template(name, "{{ x }}").expect("add");
+        }
+        env.add_template("mail.txt.j2", "{{ x }}").expect("add");
+        env.add_template("data.json", "{{ x }}").expect("add");
+        let templ = lua
+            .create_userdata(LuaTemplate(Arc::new(env)))
+            .expect("userdata");
+        let ctx = lua.create_table().expect("table");
+        ctx.set("x", "<b>&</b>").expect("set");
+
+        for name in ["page.j2", "page.html", "page", "mail.html.j2"] {
+            let out: String = templ.call_method("render", (name, &ctx)).expect("render");
+            assert_eq!(out, "&lt;b&gt;&amp;&lt;&#x2f;b&gt;", "{name} must escape");
+        }
+        for name in ["mail.txt.j2", "data.json"] {
+            let out: String = templ.call_method("render", (name, &ctx)).expect("render");
+            assert_eq!(out, "<b>&</b>", "{name} is plain text");
+        }
     }
 
     /// The node budget reaches `render` too: a shared-subtree context is

@@ -5,7 +5,7 @@
 
 use mlua::{
     FromLuaMulti, Function, HookTriggers, IntoLuaMulti, Lua, LuaOptions, LuaSerdeExt as _, StdLib,
-    Table, Thread, Value, VmState,
+    Table, Thread, Value, Variadic, VmState, chunk::ChunkMode,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,6 +34,57 @@ const HOOK_INSTRUCTION_INTERVAL: u32 = 4000;
 /// instruction hook (with its precise error message) fires first for
 /// CPU-bound overruns.
 const EXEC_TIMEOUT_GRACE: Duration = Duration::from_millis(100);
+
+/// The base-library patches every state carries, applied once at
+/// construction before any script loads.
+///
+/// **Text-only `load`.** Lua 5.4 performs no bytecode verification, so a
+/// hand-patched binary chunk (out-of-range register or constant indices)
+/// is type confusion inside the VM and, from there, arbitrary memory
+/// access in the process — a complete escape from the sandbox the memory
+/// limit and instruction hook enforce. The stock `load` defaults its mode
+/// to `"bt"`; this wrapper pins it to `"t"` whatever the caller asked for,
+/// and `string.dump` goes too, since producing bytecode is the other half
+/// of that primitive. The wrapper preserves the argument count: an
+/// explicit `nil` environment is not the same as an absent one.
+///
+/// **An uncatchable budget error.** The instruction hook raises an
+/// ordinary Lua error when the deadline passes, and the count restarts at
+/// every fire, so `while true do pcall(function() while true do end end)
+/// end` catches every trip inside the inner function and never lets the
+/// outer loop accumulate enough instructions to trip on its own — one
+/// request then holds a pooled state and a worker thread forever, past
+/// every timeout, because nothing ever yields. `pcall`, `xpcall` and
+/// `coroutine.resume` are the three doors a caught error can come back
+/// through; each is wrapped so a failure caught *after* the deadline is
+/// re-raised as the budget error. The wrappers are Lua functions rather
+/// than Rust callbacks so a body that yields (an async builtin inside
+/// `pcall`) keeps working. Startup runs with the deadline unset, so the
+/// wrappers are inert until a budgeted call begins.
+const PRELUDE: &str = r##"
+local tripped, budget_msg = ...
+local raw_load, raw_pcall, raw_xpcall = load, pcall, xpcall
+local select, error = select, error
+
+load = function(chunk, name, _, ...)
+    if select("#", ...) > 0 then
+        return raw_load(chunk, name, "t", (...))
+    end
+    return raw_load(chunk, name, "t")
+end
+if string then string.dump = nil end
+
+local function guard(ok, ...)
+    if not ok and tripped() then error(budget_msg, 0) end
+    return ok, ...
+end
+pcall = function(...) return guard(raw_pcall(...)) end
+xpcall = function(...) return guard(raw_xpcall(...)) end
+if coroutine then
+    local raw_resume = coroutine.resume
+    coroutine.resume = function(...) return guard(raw_resume(...)) end
+end
+"##;
 
 /// The Lua runtime that provides an interface to execute Lua scripts and manage Lua state.
 /// It allows for registering Rust extension modules on the `nitr` namespace,
@@ -180,17 +231,43 @@ impl Runtime {
             package.set("loadlib", Value::Nil)?;
             package.set("cpath", "")?;
 
-            // Confine `require`'s search path to the configured directory.
-            // Only the pinning is conditional: without a directory there is
-            // nothing to pin to.
+            // Confine `require` to the configured directory. Only the
+            // pinning is conditional: without a directory there is nothing
+            // to pin to.
+            //
+            // `package.path` is set for anything that reads it, but it is
+            // not what confines: the stock file searcher would honor a
+            // script's later reassignment of `package.path`, and it loads
+            // whatever it finds in whatever mode — bytecode included. The
+            // searcher installed here owns the directory itself, maps the
+            // module name to a path without ever consulting `package.path`,
+            // and compiles text only.
             if let Some(dir) = &opts.package_dir {
-                let dir = dir.to_string_lossy();
-                package.set("path", format!("{dir}/?.lua;{dir}/?/init.lua"))?;
+                let shown = dir.to_string_lossy();
+                package.set("path", format!("{shown}/?.lua;{shown}/?/init.lua"))?;
+                let searchers: Table = package.get("searchers")?;
+                let preload: Value = searchers.get(1)?;
+                let confined = lua.create_table()?;
+                confined.set(1, preload)?;
+                confined.set(2, confined_searcher(&lua, dir.clone())?)?;
+                package.set("searchers", confined)?;
             }
         }
 
         let deadline = Arc::new(AtomicU64::new(u64::MAX));
         let epoch = Instant::now();
+
+        // See `PRELUDE`. The tripped check reads the same deadline the hook
+        // does, so the two cannot disagree about whether the budget is gone.
+        let tripped = {
+            let deadline = deadline.clone();
+            lua.create_function(move |_, ()| {
+                Ok(epoch.elapsed().as_nanos() as u64 > deadline.load(Ordering::Relaxed))
+            })?
+        };
+        lua.load(PRELUDE)
+            .set_name("=nitr-prelude")
+            .call::<()>((tripped, crate::error::EXEC_BUDGET_MSG))?;
 
         // Instruction-count hook: the only mechanism that can stop a
         // CPU-bound loop (`while true do end` never reaches an await point,
@@ -395,7 +472,7 @@ impl Runtime {
         f: Function,
         args: impl IntoLuaMulti,
     ) -> Result<R> {
-        let thread = self.handler_thread(f)?;
+        let thread = self.handler_thread(f.clone())?;
         let result = match self.opts.exec_timeout {
             Some(timeout) => {
                 self.deadline.store(
@@ -405,19 +482,49 @@ impl Runtime {
                 // The async timeout covers the disjoint failure mode: time
                 // spent suspended in async I/O, where no Lua instructions
                 // execute and the hook cannot fire.
-                tokio::time::timeout(
+                let timed = tokio::time::timeout(
                     timeout + EXEC_TIMEOUT_GRACE,
                     thread.clone().into_async::<R>(args)?,
                 )
-                .await
-                .map_err(|_| Error::Timeout)?
+                .await;
+                match timed {
+                    Ok(result) => result,
+                    Err(_) => {
+                        // The coroutine is still suspended inside whatever
+                        // builtin it was awaiting, and the pending Rust
+                        // future — with everything it holds, an open SQLite
+                        // transaction among them — lives on that coroutine's
+                        // stack. Dropping the thread handle would leave both
+                        // to a later collection cycle the script cannot
+                        // force (`collectgarbage` is gone), so the state
+                        // could serve its next request with the previous
+                        // one's work still in flight. Close the stack now
+                        // and collect, so the future is dropped here.
+                        let _ = thread.reset(f);
+                        let _ = self.lua.gc_collect();
+                        self.thread = Some(thread);
+                        self.clear_deadline();
+                        return Err(Error::Timeout);
+                    }
+                }
             }
             None => thread.clone().into_async::<R>(args)?.await,
         };
         // Keep the coroutine for the next request (reset() also recovers
         // errored threads on Lua 5.4).
         self.thread = Some(thread);
+        self.clear_deadline();
         self.classify(result)
+    }
+
+    /// Lifts the deadline once a budgeted call has returned. The state is
+    /// idle between calls, and Lua that runs outside a call — a dev-mode
+    /// reload, an embedder's own `eval` — must not inherit a deadline the
+    /// last request already blew through: the hook would fire within 4000
+    /// instructions and the `pcall` guard would re-raise on every caught
+    /// error, so the "next" request would fail before it started.
+    fn clear_deadline(&self) {
+        self.deadline.store(u64::MAX, Ordering::Relaxed);
     }
 
     /// Calls a Lua function under the instruction-hook deadline only — no
@@ -439,6 +546,7 @@ impl Runtime {
         }
         let result = thread.clone().into_async::<R>(args)?.await;
         self.thread = Some(thread);
+        self.clear_deadline();
         self.classify(result)
     }
 
@@ -472,4 +580,65 @@ impl Runtime {
     pub fn dev_mode(&self) -> bool {
         self.opts.dev_mode
     }
+}
+
+/// The `require` searcher for a confined state: `a.b` resolves to
+/// `<dir>/a/b.lua` or `<dir>/a/b/init.lua`, nothing else.
+///
+/// The module name is restricted to a dotted identifier before it touches
+/// a path, so no spelling of a name can name a parent directory or an
+/// absolute location; the directory is captured at construction rather
+/// than read back from `package.path`, so a script cannot widen the search
+/// by reassigning that string. Chunks compile as text only, for the same
+/// reason `load` does (see [`PRELUDE`]).
+fn confined_searcher(lua: &Lua, dir: PathBuf) -> mlua::Result<Function> {
+    lua.create_function(move |lua, name: String| {
+        let well_formed = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            && name.split('.').all(|segment| !segment.is_empty());
+        if !well_formed {
+            let note = format!(
+                "\n\tmodule name '{name}' is not a dotted identifier (letters, digits and '_' \
+                 between dots)"
+            );
+            return Ok(Variadic::from_iter([Value::String(
+                lua.create_string(note)?,
+            )]));
+        }
+        let rel = name.replace('.', "/");
+        let mut tried = String::new();
+        for candidate in [
+            dir.join(format!("{rel}.lua")),
+            dir.join(&rel).join("init.lua"),
+        ] {
+            match std::fs::read(&candidate) {
+                Ok(data) => {
+                    let loader = lua
+                        .load(data)
+                        .set_name(format!("@{}", candidate.display()))
+                        .set_mode(ChunkMode::Text)
+                        .into_function()?;
+                    let path = lua.create_string(candidate.to_string_lossy().as_bytes())?;
+                    return Ok(Variadic::from_iter([
+                        Value::Function(loader),
+                        Value::String(path),
+                    ]));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    tried.push_str(&format!("\n\tno file '{}'", candidate.display()));
+                }
+                Err(err) => {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "failed to read module '{name}' at {}: {err}",
+                        candidate.display()
+                    )));
+                }
+            }
+        }
+        Ok(Variadic::from_iter([Value::String(
+            lua.create_string(tried)?,
+        )]))
+    })
 }

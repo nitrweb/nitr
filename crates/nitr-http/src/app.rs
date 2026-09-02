@@ -159,25 +159,23 @@ impl UserData for LuaApp {
         });
 
         // app:static(mount, dir, opts?): served entirely in Rust; opts is
-        // an optional table { spa = bool, cache_control = "..." }.
+        // an optional table { spa = bool, cache_control = "...",
+        // dotfiles = bool }.
         methods.add_method(
             "static",
             |_, this, (mount, dir, opts): (String, String, Option<mlua::Table>)| {
-                let (spa, cache_control) = match opts {
+                let (spa, cache_control, dotfiles) = match opts {
                     Some(opts) => (
                         opts.get::<Option<bool>>("spa")?.unwrap_or(false),
                         opts.get::<Option<String>>("cache_control")?,
+                        opts.get::<Option<bool>>("dotfiles")?.unwrap_or(false),
                     ),
-                    None => (false, None),
+                    None => (false, None, false),
                 };
-                lock(&this.0)?
-                    .statics
-                    .push(crate::static_files::StaticMount::new(
-                        mount,
-                        dir,
-                        spa,
-                        cache_control,
-                    ));
+                lock(&this.0)?.statics.push(
+                    crate::static_files::StaticMount::new(mount, dir, spa, cache_control)
+                        .dotfiles(dotfiles),
+                );
                 Ok(())
             },
         );

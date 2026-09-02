@@ -60,6 +60,22 @@ struct Entry {
     touched: u64,
 }
 
+/// Longest key accepted, so a request-derived key cannot dominate an
+/// entry's cost.
+const MAX_KEY_BYTES: usize = 1024;
+
+/// The longest TTL honored, in seconds (~10 years): anything past it is
+/// indistinguishable from "never expires" and is clamped rather than let
+/// near `Instant`'s arithmetic limit.
+const MAX_TTL_SECS: u64 = 10 * 365 * 24 * 60 * 60;
+
+impl Entry {
+    /// What one entry costs against the byte bound: key and value both.
+    fn cost(key: &str, value: &[u8]) -> u64 {
+        (key.len() + value.len()) as u64
+    }
+}
+
 impl Entry {
     fn is_live(&self, now: Instant) -> bool {
         self.expires_at.is_none_or(|at| at > now)
@@ -135,7 +151,7 @@ impl Cache {
                     // counter ever drifts, a wrap near `u64::MAX` would make
                     // eviction expel everything forever; flooring at zero
                     // merely over-admits until entries cycle out.
-                    inner.bytes = inner.bytes.saturating_sub(entry.value.len() as u64);
+                    inner.bytes = inner.bytes.saturating_sub(Entry::cost(key, &entry.value));
                 }
                 inner.misses += 1;
                 Ok(None)
@@ -148,7 +164,17 @@ impl Cache {
     }
 
     fn set_raw(&self, key: String, value: Vec<u8>, ttl: Option<u64>) -> mlua::Result<()> {
-        let size = value.len() as u64;
+        if key.len() > MAX_KEY_BYTES {
+            return Err(mlua::Error::RuntimeError(format!(
+                "cache key is {} bytes; keys are bounded to {MAX_KEY_BYTES} (hash a long \
+                 key first)",
+                key.len()
+            )));
+        }
+        // The key is part of what the entry costs: a script keying on a
+        // request-derived string would otherwise fill memory with keys
+        // the byte bound never saw.
+        let size = Entry::cost(&key, &value);
         if size > self.opts.max_bytes {
             return Err(mlua::Error::RuntimeError(format!(
                 "cache value for `{key}` is {size} bytes, larger than the whole \
@@ -157,18 +183,26 @@ impl Cache {
             )));
         }
         let ttl = ttl.unwrap_or(self.opts.default_ttl);
+        // `Instant + Duration` panics on overflow; a `ttl` a script computed
+        // from request data must not be able to reach that. Anything past
+        // the clamp is "effectively forever" and behaves like it.
+        let expires_at = (ttl > 0)
+            .then(|| Instant::now().checked_add(Duration::from_secs(ttl.min(MAX_TTL_SECS))))
+            .flatten();
         let touched = self.tick();
         let mut inner = self.lock()?;
 
         if let Some(previous) = inner.entries.remove(&key) {
-            inner.bytes = inner.bytes.saturating_sub(previous.value.len() as u64);
+            inner.bytes = inner
+                .bytes
+                .saturating_sub(Entry::cost(&key, &previous.value));
         }
         inner.bytes += size;
         inner.entries.insert(
             key,
             Entry {
                 value,
-                expires_at: (ttl > 0).then(|| Instant::now() + Duration::from_secs(ttl)),
+                expires_at,
                 touched,
             },
         );
@@ -180,10 +214,10 @@ impl Cache {
     /// first and then the least recently used.
     fn evict(&self, inner: &mut Inner) {
         let now = Instant::now();
-        inner.entries.retain(|_, entry| {
+        inner.entries.retain(|key, entry| {
             let live = entry.is_live(now);
             if !live {
-                inner.bytes = inner.bytes.saturating_sub(entry.value.len() as u64);
+                inner.bytes = inner.bytes.saturating_sub(Entry::cost(key, &entry.value));
             }
             live
         });
@@ -198,7 +232,9 @@ impl Cache {
                 break;
             };
             if let Some(entry) = inner.entries.remove(&victim) {
-                inner.bytes = inner.bytes.saturating_sub(entry.value.len() as u64);
+                inner.bytes = inner
+                    .bytes
+                    .saturating_sub(Entry::cost(&victim, &entry.value));
                 inner.evictions += 1;
             }
         }
@@ -245,7 +281,7 @@ impl UserData for Cache {
             let mut inner = cache.lock()?;
             match inner.entries.remove(&key) {
                 Some(entry) => {
-                    inner.bytes = inner.bytes.saturating_sub(entry.value.len() as u64);
+                    inner.bytes = inner.bytes.saturating_sub(Entry::cost(&key, &entry.value));
                     Ok(true)
                 }
                 None => Ok(false),
@@ -380,7 +416,8 @@ mod tests {
 
         let inner = c.inner.lock().expect("lock");
         assert_eq!(inner.entries.len(), 1);
-        assert_eq!(inner.bytes, 7);
+        // Key and value both count.
+        assert_eq!(inner.bytes, Entry::cost("a", b"{\"n\":1}"));
         assert_eq!((inner.hits, inner.misses), (1, 1));
     }
 
@@ -392,7 +429,7 @@ mod tests {
             .expect("overwrite");
         let inner = c.inner.lock().expect("lock");
         assert_eq!(inner.entries.len(), 1);
-        assert_eq!(inner.bytes, 10);
+        assert_eq!(inner.bytes, Entry::cost("k", &[b'y'; 10]));
     }
 
     #[test]

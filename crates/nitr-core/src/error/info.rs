@@ -63,8 +63,12 @@ pub struct ErrorInfo {
     /// The classified failure: `"lua"` (a script error), `"nitr"` (a
     /// `nitr.*` builtin or Nitr's own boundary), `"module"` (a registered
     /// extension module), `"timeout"`, `"memory"`, or `"panic"`. The set is
-    /// closed — Lua cannot forge a kind — so branching on it is stable in a
-    /// way matching on message text never is.
+    /// closed, so branching on it is stable in a way matching on message
+    /// text never is — but it is *classification*, not provenance: `"nitr"`
+    /// and `"timeout"` are recognized by message shape, so a script that
+    /// raises `"nitr.db: ..."` or the budget message verbatim lands in
+    /// those kinds too. It is fit for logging and error pages; no
+    /// security decision may rest on it.
     pub kind: &'static str,
     /// The message with any position prefix and traceback stripped.
     pub message: String,

@@ -40,9 +40,10 @@
 //! * **`cert` is the chain, not just the leaf.** Clients that do not
 //!   already hold your intermediate cannot build a path to a trusted
 //!   root, and the failure looks like "works on my machine".
-//! * **The key is read once, at startup.** A renewed certificate takes
-//!   effect on restart; `SIGHUP` reloads the Lua pool, not the
-//!   certificate.
+//! * **A renewed certificate takes effect on `SIGHUP`** (or
+//!   `nitr reload`): the reload re-reads both files and swaps them in
+//!   only when the new pair validates, keeping the old material
+//!   otherwise. No restart needed.
 //! * **Binding 443 needs a privilege the process should not keep.** Use a
 //!   socket-activation supervisor, `CAP_NET_BIND_SERVICE`, or a reverse
 //!   proxy — see `deploy/` for the systemd unit.

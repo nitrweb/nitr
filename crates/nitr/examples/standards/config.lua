@@ -1,5 +1,6 @@
 -- Runs once at startup; the returned table is snapshotted into every Lua
--- state and reachable from handlers as `nitr.cfg`.
+-- state and reachable from handlers as `nitr.cfg`. The upload root is
+-- `[multipart] upload_dir` (set in main.rs), which `part:save` enforces.
 return {
-    upload_dir = "crates/nitr/examples/standards/uploads",
+    app_name = "standards-example",
 }

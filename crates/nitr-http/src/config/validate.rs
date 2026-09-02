@@ -12,6 +12,15 @@ use nitr_core::{Error, Result};
 
 use super::Config;
 
+/// Most Lua states one process will build; each is a full VM with its
+/// own memory budget.
+const MAX_WORKERS: usize = 4096;
+
+/// Most connection slots a listener will reserve. Far under
+/// `tokio::sync::Semaphore::MAX_PERMITS`, which is where a larger value
+/// panics.
+const MAX_CONNECTIONS: usize = 1 << 20;
+
 impl Config {
     /// Rejects configurations that parse but cannot be honored.
     ///
@@ -36,6 +45,29 @@ impl Config {
             if !matches!(name.as_str(), "br" | "gzip") {
                 return Err(Error::Config(format!(
                     "unknown [compression] algorithm `{name}`: expected \"br\" or \"gzip\""
+                )));
+            }
+        }
+        // Ceilings on the counts that size kernel or runtime objects: a
+        // stray zero in `max_connections = 10000000000` would otherwise
+        // bind the port and then panic inside `Semaphore::new`, and a
+        // `workers` typo would try to build that many Lua states.
+        for (name, value, ceiling) in [
+            ("workers", self.workers, MAX_WORKERS),
+            (
+                "[limits] max_connections",
+                self.limits.max_connections,
+                MAX_CONNECTIONS,
+            ),
+            (
+                "[health] max_connections",
+                self.health.max_connections,
+                MAX_CONNECTIONS,
+            ),
+        ] {
+            if value > ceiling {
+                return Err(Error::Config(format!(
+                    "{name} = {value} is above the supported maximum of {ceiling}"
                 )));
             }
         }
@@ -319,18 +351,35 @@ impl Config {
         // symptom is a 500 on a request nobody can reproduce. Existence
         // is not writability: a mis-owned or read-only-mounted directory
         // passes every check above.
+        //
+        // `create_new`, never `create`: the upload root may be shared with
+        // other local users, and a pre-planted symlink named like the
+        // probe would have been *truncated through* by a plain create.
+        // The name carries a random component for the same reason — a pid
+        // is guessable — and an `AlreadyExists` is retried, not trusted.
         if let Some(dir) = &self.multipart.upload_dir {
-            let probe = dir.join(format!(".nitr-write-probe-{}", std::process::id()));
-            match std::fs::File::create(&probe) {
-                Ok(file) => {
-                    drop(file);
-                    let _ = std::fs::remove_file(&probe);
-                }
-                Err(err) => {
-                    return Err(Error::Config(format!(
-                        "[multipart] upload_dir {} exists but cannot be written to: {err}",
-                        dir.display()
-                    )));
+            let mut attempts = 0;
+            loop {
+                let probe = dir.join(format!(
+                    ".nitr-write-probe-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::now_v7().simple()
+                ));
+                match std::fs::File::create_new(&probe) {
+                    Ok(file) => {
+                        drop(file);
+                        let _ = std::fs::remove_file(&probe);
+                        break;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && attempts < 3 => {
+                        attempts += 1;
+                    }
+                    Err(err) => {
+                        return Err(Error::Config(format!(
+                            "[multipart] upload_dir {} exists but cannot be written to: {err}",
+                            dir.display()
+                        )));
+                    }
                 }
             }
         }
@@ -351,6 +400,54 @@ impl Config {
                 upload.display(),
                 package.display()
             )));
+        }
+        // An upload root inside the templates directory: an upload whose
+        // name matches a template replaces it — stored script injection
+        // through the renderer, and in dev mode a reload per upload.
+        if let (Some(upload), Some(templates)) = (&self.multipart.upload_dir, &self.templating.dir)
+            && let (Ok(upload), Ok(templates)) = (upload.canonicalize(), templates.canonicalize())
+            && upload.starts_with(&templates)
+        {
+            return Err(Error::Config(format!(
+                "[multipart] upload_dir {} is inside [templating] dir {}: an uploaded \
+                 file could replace a template. Put the upload root outside it.",
+                upload.display(),
+                templates.display()
+            )));
+        }
+        // A static root that encloses the scripts or the templates serves
+        // them: `[static] dir = "."` with `mount = "/"` answers
+        // `GET /app.lua` and `GET /nitr.toml` (the env file beside them is
+        // covered by the dotfile rule, these two are not).
+        if let Some(static_dir) = &self.static_files.dir
+            && let Ok(static_dir) = static_dir.canonicalize()
+        {
+            let enclosed: [(&str, Option<PathBuf>); 2] = [
+                (
+                    "the handler script's directory",
+                    self.package_dir().canonicalize().ok(),
+                ),
+                (
+                    "[templating] dir",
+                    self.templating
+                        .dir
+                        .as_ref()
+                        .and_then(|p| p.canonicalize().ok()),
+                ),
+            ];
+            for (what, dir) in enclosed {
+                if let Some(dir) = dir
+                    && dir.starts_with(&static_dir)
+                {
+                    return Err(Error::Config(format!(
+                        "[static] dir {} encloses {what} ({}): the scripts and configuration \
+                         would be served as static files. Point [static] dir at a directory \
+                         that holds only public assets.",
+                        static_dir.display(),
+                        dir.display()
+                    )));
+                }
+            }
         }
         // The database file itself may not exist yet (SQLite creates it),
         // but its parent directory must, SQLite will not create that.

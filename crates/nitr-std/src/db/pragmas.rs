@@ -88,7 +88,8 @@ impl SqlitePragmas {
     }
 }
 
-/// Opens a SQLite connection with the pragmas applied.
+/// Opens a SQLite connection with the pragmas applied and the statement
+/// authorizer installed.
 pub fn open(path: &std::path::Path, pragmas: &SqlitePragmas) -> Result<Connection> {
     let conn = Connection::open(path).map_err(|err| {
         Error::Config(format!(
@@ -97,7 +98,28 @@ pub fn open(path: &std::path::Path, pragmas: &SqlitePragmas) -> Result<Connectio
         ))
     })?;
     pragmas.apply(&conn, path)?;
+    conn.authorizer(Some(authorize))
+        .map_err(|err| Error::Config(format!("failed to install the SQL authorizer: {err}")))?;
     Ok(conn)
+}
+
+/// The statement authorizer: the one place SQL can reach the filesystem
+/// is `ATTACH` (and `VACUUM INTO`, which attaches its output file), and a
+/// script must not — `ATTACH '/var/lib/other.db'` would read or write any
+/// SQLite file the process can, and any SQL-injection bug in a handler
+/// would become file access. Every other action is allowed unchanged.
+///
+/// A plain `VACUUM` attaches a temporary database with an *empty*
+/// filename; that is permitted so operators keep the maintenance
+/// statement, and it is the reason this is an authorizer rather than
+/// `SQLITE_LIMIT_ATTACHED = 0`, which would refuse `VACUUM` too.
+fn authorize(ctx: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization {
+    use rusqlite::hooks::{AuthAction, Authorization};
+    match ctx.action {
+        AuthAction::Attach { filename: "" } => Authorization::Allow,
+        AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
+        _ => Authorization::Allow,
+    }
 }
 
 #[cfg(test)]
@@ -112,6 +134,35 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nitr-pragma-{}-{id}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir.join(name)
+    }
+
+    /// `ATTACH` and `VACUUM INTO` are the filesystem doors in SQL; both
+    /// are refused, while plain `VACUUM` (an empty-filename attach under
+    /// the hood) still works.
+    #[test]
+    fn sql_cannot_attach_other_database_files() {
+        let path = temp_db("attach.db");
+        let other = path.with_file_name("other.db");
+        let conn = open(&path, &SqlitePragmas::default()).expect("open");
+        conn.execute_batch("CREATE TABLE t (x)").expect("create");
+
+        for sql in [
+            format!("ATTACH DATABASE '{}' AS x", other.display()),
+            "ATTACH DATABASE ':memory:' AS m".to_string(),
+            format!("VACUUM INTO '{}'", other.display()),
+        ] {
+            let err = conn.execute_batch(&sql).expect_err(&sql);
+            assert!(
+                err.to_string().contains("authoriz"),
+                "`{sql}` must be refused by the authorizer, got: {err}"
+            );
+        }
+        assert!(!other.exists(), "no file may be created through SQL");
+
+        conn.execute_batch("VACUUM")
+            .expect("plain VACUUM stays available");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(path.parent().expect("dir"));
     }
 
     #[test]

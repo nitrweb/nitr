@@ -28,7 +28,7 @@ const DEFAULT_CONFIG_FILE: &str = "nitr.toml";
 #[command(
     name = "nitr",
     disable_version_flag = true,
-    after_help = "Signals:\n  SIGHUP           Zero-downtime reload: rebuilds the Lua runtime pool"
+    after_help = "Signals:\n  SIGHUP           Zero-downtime reload: rebuilds the Lua runtime pool and re-reads TLS certificates"
 )]
 struct Cli {
     /// Print the version and exit.
@@ -185,11 +185,67 @@ fn init_logging(cfg: Option<&Config>, dev: bool) {
 struct Pidfile(PathBuf);
 
 impl Pidfile {
+    /// Claims the pidfile. Never written through an existing path: a
+    /// plain `fs::write` followed a pre-planted symlink and silently
+    /// replaced a live instance's file (whose `Drop` then deleted ours).
+    /// An existing file is honored when its pid is alive and refused as
+    /// a second instance; a stale one (a crash, an OOM kill) is replaced.
     fn write(path: &Path) -> anyhow::Result<Self> {
-        std::fs::write(path, format!("{}\n", std::process::id()))
+        use std::io::Write as _;
+        let create = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+        };
+        let mut file = match create() {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Some(pid) = read_pid(path)
+                    && pid != std::process::id()
+                    && process_alive(pid)
+                {
+                    bail!(
+                        "the pidfile {} names a running process ({pid}); is another \
+                         instance already up? Stop it, or point `pidfile` elsewhere",
+                        path.display()
+                    );
+                }
+                std::fs::remove_file(path).with_context(|| {
+                    format!("cannot replace the stale pidfile {}", path.display())
+                })?;
+                create().with_context(|| format!("cannot create the pidfile {}", path.display()))?
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("cannot create the pidfile {}", path.display()));
+            }
+        };
+        writeln!(file, "{}", std::process::id())
             .with_context(|| format!("cannot write the pidfile {}", path.display()))?;
         Ok(Self(path.to_path_buf()))
     }
+}
+
+/// The pid a pidfile names, when it holds one.
+fn read_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Whether a process with this pid exists (`kill -0`).
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    false
 }
 
 impl Drop for Pidfile {
@@ -214,9 +270,36 @@ fn reload(cfg: &Config) -> anyhow::Result<()> {
         .trim()
         .parse()
         .with_context(|| format!("the pidfile {} does not contain a pid", path.display()))?;
+    // `kill -HUP 0` signals the caller's whole process group and pid 1 is
+    // init: neither is ever a server this file could name.
+    if pid < 2 || pid == std::process::id() {
+        bail!(
+            "the pidfile {} names pid {pid}, which cannot be a running server",
+            path.display()
+        );
+    }
 
     #[cfg(unix)]
     {
+        // The pid may have been reused since the file was written (a
+        // crash leaves the file behind). Where the kernel says what runs
+        // under it, insist that it is this program before signalling: a
+        // process named like ours (`nitr`, or whatever a `nitr build`
+        // artifact was called — the bundle is this same executable).
+        let own_comm = std::fs::read_to_string("/proc/self/comm")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            && !comm.trim().contains("nitr")
+            && comm.trim() != own_comm
+        {
+            bail!(
+                "pid {pid} from the pidfile {} is `{}`, not a nitr server; the file is \
+                 stale — remove it",
+                path.display(),
+                comm.trim()
+            );
+        }
         let status = std::process::Command::new("kill")
             .args(["-HUP", &pid.to_string()])
             .status()

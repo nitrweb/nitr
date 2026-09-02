@@ -1,7 +1,7 @@
 -- Server-Sent Events: nitr.sse(fn) builds a streaming text/event-stream
 -- response; send(event, data) writes one event (tables are JSON-encoded).
 --
--- `nitr.time` is a custom Rust module registered by main.rs via
+-- `nitr.ext.time` is a custom Rust module registered by main.rs via
 -- ServerBuilder::module() — nitr.ext.time.sleep(ms) suspends this state's
 -- coroutine on the tokio timer, so the pacing costs no execution budget
 -- and blocks nothing.

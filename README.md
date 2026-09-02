@@ -182,7 +182,7 @@ The `nitr.*` standard library provides building blocks — enable the features y
 | `nitr.json:encode(v)` / `nitr.json:decode(s)` | JSON codec (serde); callable as the response helper above |
 | `nitr.fetch(method, url, opts?)` → `client:send()` | HTTP client (shared pool, timeouts, SSRF policy with a guarded resolver, per-hop redirect checks, opt-in `retry = { attempts, backoff }` on idempotent methods, per-request outbound budget). Response: `.status`, `.headers`, `.url`, `:text()`, `:json()`, `:read()` |
 | `nitr.cache:get/set/delete/clear/remember/stats` | Bounded TTL+LRU cache shared by every state. Entries are plain data, so no Lua value crosses between states; per-process, so not a session store |
-| `nitr.await_all({...})` | Run several `fetch` handles concurrently, capped by `fetch.max_concurrent` |
+| `nitr.await_all(h1, h2, ...)` | Run several `fetch` (or `query_async`) handles concurrently, capped by `fetch.max_concurrent` |
 | `nitr.template:render(name, data?)` | minijinja templates from `[templating] dir` |
 | `nitr.db:execute/query/query_row/query_one(sql, params?)` | SQLite (`database` file); queries run on a blocking thread pool with a prepared-statement cache |
 | `nitr.db:transaction(fn)` | Atomic transaction (nestable via savepoints); rolls back on error. Use the `tx` handle inside the body — the outer `nitr.db` refuses to run while a transaction is open, rather than silently joining it |

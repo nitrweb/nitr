@@ -3,16 +3,18 @@
 // See https://nitrweb.com/ for more information
 // Copyright (C) 2024-present Jose Quintana <joseluisq.net>
 
-use rusqlite::{Connection, params_from_iter};
+use rusqlite::{Connection, OptionalExtension as _, params_from_iter};
 
 use crate::db::types::{SqlRow, SqlValue, read_row};
 
-/// Runs a query expected to return at least one row and returns the first.
+/// Runs a query and returns its first row, or `None` when it produced no
+/// rows — the documented `query_row` contract (`nil`, not an error, for an
+/// empty result), so `if row then` works as written.
 pub(crate) fn call(
     conn: &Connection,
     sql: &str,
     params: &[SqlValue],
-) -> Result<SqlRow, rusqlite::Error> {
+) -> Result<Option<SqlRow>, rusqlite::Error> {
     let mut stmt = conn.prepare_cached(sql)?;
     let columns = stmt
         .column_names()
@@ -21,4 +23,5 @@ pub(crate) fn call(
         .collect::<Vec<_>>();
 
     stmt.query_row(params_from_iter(params), |row| read_row(&columns, row))
+        .optional()
 }

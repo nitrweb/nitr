@@ -46,12 +46,20 @@ pub struct StdConfig {
 pub struct TestingConfig {
     /// Directory `nitr test` discovers `*.lua` test files in.
     pub dir: PathBuf,
+    /// The SQLite file tests run against when a `[database]` is
+    /// configured. Unset means a fresh private file per run, with the
+    /// migrations applied — never `[database] path`: a test's
+    /// `before_each` is typically a `DELETE FROM ...`, and `nitr test`
+    /// on a host whose `nitr.toml` names the live database must not
+    /// empty it.
+    pub database: Option<PathBuf>,
 }
 
 impl Default for TestingConfig {
     fn default() -> Self {
         Self {
             dir: PathBuf::from("tests"),
+            database: None,
         }
     }
 }

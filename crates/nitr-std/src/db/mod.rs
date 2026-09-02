@@ -47,11 +47,20 @@ pub(crate) struct LuaTransaction {
 /// Runs a blocking database operation on the blocking thread pool so it
 /// stalls a blocking-pool thread instead of an async worker. Only plain
 /// `Send` data crosses the boundary — never a Lua handle.
+///
+/// `outer` says the statement comes from the `nitr.db` handle, i.e. from
+/// outside any `db:transaction` scope. Such a statement must run in
+/// autocommit mode; if the connection is still inside a transaction, that
+/// transaction was abandoned — its `db:transaction` future was dropped
+/// mid-flight by the handler's timeout — and it is rolled back first,
+/// rather than silently joined. Statements from a `tx` handle pass
+/// `false`: being inside a transaction is their whole point.
 async fn run_blocking<T, F>(
     conn: Conn,
     kind: &'static str,
     sql: String,
     params: Vec<SqlValue>,
+    outer: bool,
     f: F,
 ) -> mlua::Result<T>
 where
@@ -75,6 +84,18 @@ where
         let conn = conn.lock().map_err(|_| {
             mlua::Error::RuntimeError("failed to lock the database connection".into())
         })?;
+        if outer && !conn.is_autocommit() {
+            tracing::warn!(
+                "rolling back a transaction a previous request left open on this connection \
+                 (its handler was cut off mid-transaction)"
+            );
+            conn.execute_batch("ROLLBACK").map_err(|err| {
+                mlua::Error::RuntimeError(format!(
+                    "failed to roll back an abandoned transaction: {}",
+                    redact(&err)
+                ))
+            })?;
+        }
         // The same policy as the span above, and for the same reason: this
         // message becomes an ordinary Lua error, so it reaches the
         // operator's log through the handler's error path *and* reaches
@@ -142,8 +163,8 @@ fn stmt_tag(sql: &str) -> String {
 }
 
 /// Executes a control statement (`BEGIN`, `COMMIT`, `SAVEPOINT ...`).
-async fn exec_batch(conn: Conn, sql: String) -> mlua::Result<()> {
-    run_blocking(conn, "tx", sql, Vec::new(), |conn, sql, _| {
+async fn exec_batch(conn: Conn, sql: String, outer: bool) -> mlua::Result<()> {
+    run_blocking(conn, "tx", sql, Vec::new(), outer, |conn, sql, _| {
         conn.execute_batch(sql)
     })
     .await
@@ -153,8 +174,9 @@ async fn exec_batch(conn: Conn, sql: String) -> mlua::Result<()> {
 /// that exposes a connection — shared between `db` and transactions.
 ///
 /// `conn_of` may refuse: the outer `nitr.db` handle does so while a
-/// transaction is open on the same connection.
-fn add_stmt_methods<T, M>(methods: &mut M, conn_of: fn(&T) -> mlua::Result<Conn>)
+/// transaction is open on the same connection. `outer` is forwarded to
+/// [`run_blocking`].
+fn add_stmt_methods<T, M>(methods: &mut M, conn_of: fn(&T) -> mlua::Result<Conn>, outer: bool)
 where
     T: UserData + 'static,
     M: UserDataMethods<T>,
@@ -166,7 +188,8 @@ where
         async move {
             let (sql, params) = args;
             let params = params_from_table(params.as_ref())?;
-            let affected = run_blocking(conn?, "execute", sql, params, execute::call).await?;
+            let affected =
+                run_blocking(conn?, "execute", sql, params, outer, execute::call).await?;
             Ok(affected)
         }
     });
@@ -178,8 +201,12 @@ where
             async move {
                 let (sql, params) = args;
                 let params = params_from_table(params.as_ref())?;
-                let row = run_blocking(conn?, "query_row", sql, params, query_row::call).await?;
-                row_to_lua(&lua, row)
+                let row =
+                    run_blocking(conn?, "query_row", sql, params, outer, query_row::call).await?;
+                match row {
+                    Some(row) => row_to_lua(&lua, row).map(Value::Table),
+                    None => Ok(Value::Nil),
+                }
             }
         },
     );
@@ -191,7 +218,8 @@ where
             async move {
                 let (sql, params) = args;
                 let params = params_from_table(params.as_ref())?;
-                let row = run_blocking(conn?, "query_one", sql, params, query_one::call).await?;
+                let row =
+                    run_blocking(conn?, "query_one", sql, params, outer, query_one::call).await?;
                 row_to_lua(&lua, row)
             }
         },
@@ -202,7 +230,7 @@ where
         async move {
             let (sql, params) = args;
             let params = params_from_table(params.as_ref())?;
-            let rows = run_blocking(conn?, "query", sql, params, query::call).await?;
+            let rows = run_blocking(conn?, "query", sql, params, outer, query::call).await?;
             let table = lua.create_table()?;
             for (i, row) in rows.into_iter().enumerate() {
                 table.raw_set(i + 1, row_to_lua(&lua, row)?)?;
@@ -243,6 +271,8 @@ pub struct PendingQuery {
     kind: QueryKind,
     sql: String,
     params: Vec<SqlValue>,
+    /// Built from the outer `nitr.db` handle (see [`run_blocking`]).
+    outer: bool,
 }
 
 impl PendingQuery {
@@ -253,22 +283,29 @@ impl PendingQuery {
             kind,
             sql,
             params,
+            outer,
         } = self;
         match kind {
             QueryKind::Execute => {
-                let affected = run_blocking(conn, "execute", sql, params, execute::call).await?;
+                let affected =
+                    run_blocking(conn, "execute", sql, params, outer, execute::call).await?;
                 Ok(Value::Integer(affected as i64))
             }
             QueryKind::QueryRow => {
-                let row = run_blocking(conn, "query_row", sql, params, query_row::call).await?;
-                row_to_lua(lua, row).map(Value::Table)
+                let row =
+                    run_blocking(conn, "query_row", sql, params, outer, query_row::call).await?;
+                match row {
+                    Some(row) => row_to_lua(lua, row).map(Value::Table),
+                    None => Ok(Value::Nil),
+                }
             }
             QueryKind::QueryOne => {
-                let row = run_blocking(conn, "query_one", sql, params, query_one::call).await?;
+                let row =
+                    run_blocking(conn, "query_one", sql, params, outer, query_one::call).await?;
                 row_to_lua(lua, row).map(Value::Table)
             }
             QueryKind::Query => {
-                let rows = run_blocking(conn, "query", sql, params, query::call).await?;
+                let rows = run_blocking(conn, "query", sql, params, outer, query::call).await?;
                 let table = lua.create_table()?;
                 for (i, row) in rows.into_iter().enumerate() {
                     table.raw_set(i + 1, row_to_lua(lua, row)?)?;
@@ -313,7 +350,7 @@ impl UserData for LuaPendingQuery {
 }
 
 /// Registers `query_async` on a userdata type that exposes a connection.
-fn add_async_query_method<T, M>(methods: &mut M, conn_of: fn(&T) -> mlua::Result<Conn>)
+fn add_async_query_method<T, M>(methods: &mut M, conn_of: fn(&T) -> mlua::Result<Conn>, outer: bool)
 where
     T: UserData + 'static,
     M: UserDataMethods<T>,
@@ -327,6 +364,7 @@ where
                 kind: QueryKind::parse(kind.as_deref())?,
                 sql,
                 params: params_from_table(params.as_ref())?,
+                outer,
             }))))
         },
     );
@@ -335,6 +373,15 @@ where
 /// Runs the transaction body between `begin` and `commit`/`rollback`,
 /// passing a fresh [`LuaTransaction`] scope and re-raising body errors
 /// after rolling back.
+///
+/// The scope is invalidated once the body returns, so a `tx` a script
+/// stashed somewhere cannot run statements after its transaction ended
+/// — which would silently bypass the outer handle's transaction guard.
+///
+/// A `COMMIT` that fails (`SQLITE_BUSY` past the busy timeout, a full
+/// disk) leaves SQLite's transaction open; it is rolled back here so the
+/// connection is in autocommit mode again when the error reaches Lua,
+/// instead of every later statement quietly joining a doomed transaction.
 async fn run_transaction(
     lua: &Lua,
     conn: Conn,
@@ -342,23 +389,48 @@ async fn run_transaction(
     begin: String,
     commit: String,
     rollback: String,
+    outer: bool,
 ) -> mlua::Result<Value> {
-    exec_batch(conn.clone(), begin).await?;
+    exec_batch(conn.clone(), begin, outer).await?;
     let scope = lua.create_userdata(LuaTransaction {
         conn: conn.clone(),
         savepoints: AtomicUsize::new(0),
     })?;
-    match f.call_async::<Value>(&scope).await {
+    let result = f.call_async::<Value>(&scope).await;
+    let _ = scope.take::<LuaTransaction>();
+    match result {
         Ok(value) => {
-            exec_batch(conn, commit).await?;
+            if let Err(commit_err) = exec_batch(conn.clone(), commit, false).await {
+                if let Err(rollback_err) = exec_batch(conn, rollback, false).await {
+                    tracing::error!("rollback after a failed commit failed: {rollback_err}");
+                }
+                return Err(commit_err);
+            }
             Ok(value)
         }
         Err(err) => {
-            if let Err(rollback_err) = exec_batch(conn, rollback).await {
+            if let Err(rollback_err) = exec_batch(conn, rollback, false).await {
                 tracing::error!("transaction rollback failed: {rollback_err}");
             }
             Err(err)
         }
+    }
+}
+
+/// Holds `in_transaction` for the lifetime of one `db:transaction` call.
+///
+/// The flag used to be cleared by a plain store after the body — which
+/// never ran when the handler's timeout dropped the future mid-await. The
+/// state then went back to the pool with the flag stuck, and every later
+/// `nitr.db` call on it was refused for good, while SQLite's write lock
+/// stayed held against every other state. A guard clears the flag on
+/// every exit, the dropped-future one included; the transaction itself
+/// is rolled back by the next outer statement (see [`run_blocking`]).
+struct TxGuard(TxFlag);
+
+impl Drop for TxGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -370,25 +442,33 @@ impl UserData for LuaDatabase {
         // would roll back with it, and a read would see uncommitted rows.
         // Phase 6 documented this as a footgun; documenting a trap is not
         // the same as removing it.
-        add_stmt_methods(methods, |db: &LuaDatabase| {
-            if db.in_transaction.load(Ordering::Acquire) {
-                return Err(mlua::Error::RuntimeError(
-                    "a transaction is open on this connection: use the `tx` handle passed \
-                     to db:transaction(function(tx) ... end), not `nitr.db`. Statements on \
-                     the outer handle would join the transaction without saying so."
-                        .into(),
-                ));
-            }
-            Ok(db.conn.clone())
-        });
-        add_async_query_method(methods, |db: &LuaDatabase| {
-            if db.in_transaction.load(Ordering::Acquire) {
-                return Err(mlua::Error::RuntimeError(
-                    "a transaction is open on this connection: use the `tx` handle".into(),
-                ));
-            }
-            Ok(db.conn.clone())
-        });
+        add_stmt_methods(
+            methods,
+            |db: &LuaDatabase| {
+                if db.in_transaction.load(Ordering::Acquire) {
+                    return Err(mlua::Error::RuntimeError(
+                        "a transaction is open on this connection: use the `tx` handle passed \
+                         to db:transaction(function(tx) ... end), not `nitr.db`. Statements \
+                         on the outer handle would join the transaction without saying so."
+                            .into(),
+                    ));
+                }
+                Ok(db.conn.clone())
+            },
+            true,
+        );
+        add_async_query_method(
+            methods,
+            |db: &LuaDatabase| {
+                if db.in_transaction.load(Ordering::Acquire) {
+                    return Err(mlua::Error::RuntimeError(
+                        "a transaction is open on this connection: use the `tx` handle".into(),
+                    ));
+                }
+                Ok(db.conn.clone())
+            },
+            true,
+        );
 
         // db:transaction(function(tx) ... end): commits when the function
         // returns, rolls back (and re-raises) when it errors.
@@ -403,17 +483,17 @@ impl UserData for LuaDatabase {
                             .into(),
                     ));
                 }
-                let result = run_transaction(
+                let _guard = TxGuard(flag);
+                run_transaction(
                     &lua,
                     conn,
                     f,
                     "BEGIN".into(),
                     "COMMIT".into(),
                     "ROLLBACK".into(),
+                    true,
                 )
-                .await;
-                flag.store(false, Ordering::Release);
-                result
+                .await
             }
         });
     }
@@ -421,8 +501,8 @@ impl UserData for LuaDatabase {
 
 impl UserData for LuaTransaction {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        add_stmt_methods(methods, |tx: &LuaTransaction| Ok(tx.conn.clone()));
-        add_async_query_method(methods, |tx: &LuaTransaction| Ok(tx.conn.clone()));
+        add_stmt_methods(methods, |tx: &LuaTransaction| Ok(tx.conn.clone()), false);
+        add_async_query_method(methods, |tx: &LuaTransaction| Ok(tx.conn.clone()), false);
 
         // Nested transactions become savepoints: rolling back the inner
         // scope keeps the outer transaction alive.
@@ -438,6 +518,7 @@ impl UserData for LuaTransaction {
                     format!("SAVEPOINT {name}"),
                     format!("RELEASE {name}"),
                     format!("ROLLBACK TO {name}; RELEASE {name}"),
+                    false,
                 )
                 .await
             }

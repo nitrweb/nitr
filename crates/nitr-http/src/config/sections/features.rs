@@ -104,6 +104,9 @@ pub struct StaticConfig {
     pub spa: bool,
     /// `Cache-Control` header value for served files.
     pub cache_control: Option<String>,
+    /// Serve files and directories whose name starts with `.` (default
+    /// `false`). `.well-known/` is served regardless.
+    pub dotfiles: bool,
 }
 
 /// Template rendering (`[templating]` section) for the `template`

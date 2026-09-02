@@ -198,7 +198,8 @@ path = "scripts/file.db"
 #enabled = true
 #requests = 100              # allowed requests per window and client IP
 #window = 60                 # window length in seconds
-#trust_forwarded_for = false # key by X-Forwarded-For (only behind a proxy)
+#trust_forwarded_for = false # key by the *last* X-Forwarded-For entry (the one
+                             # the proxy appended); only behind a trusted proxy
 
 # Outbound-request policy for the `nitr.fetch` builtin. By default requests to
 # loopback/private/link-local addresses are refused (SSRF protection) and
@@ -232,6 +233,7 @@ path = "scripts/file.db"
 #mount = "/"                 # URL prefix
 #spa = false                 # serve index.html for unknown paths
 #cache_control = "public, max-age=3600"
+#dotfiles = false            # serve .-prefixed names (.well-known/ always is)
 
 # Template rendering for the `nitr.template` builtin (minijinja).
 # Optional: without `dir` the builtin is unavailable — there is no default
@@ -242,6 +244,8 @@ dir = "scripts/templates"
 # The `nitr test` runner.
 #[testing]
 #dir = "tests"             # where *.lua test files are discovered
+#database = "test.db"      # SQLite file tests run against; unset = a fresh
+                           # private file per run (never [database] path)
 
 # Environment handling: a dotenv-style file loaded at startup, and what
 # the opt-in `nitr.env` builtin may read. The file's values never override

@@ -55,6 +55,9 @@ pub struct Server {
     /// The shared `nitr.cache`, held here so a reload hands the new pool
     /// the same storage rather than starting cold.
     cache: Option<nitr_std::Cache>,
+    /// Set while a pool rebuild is running on its own task, so a second
+    /// `SIGHUP` in the meantime coalesces instead of building twice.
+    reloading: Arc<AtomicBool>,
     /// The TLS acceptor built from `[tls] cert`/`key`, or `None` on a
     /// plaintext listener. Built in [`ServerBuilder::build`] — so a
     /// broken pair fails the build rather than every handshake on an
@@ -118,40 +121,49 @@ impl Server {
     /// capacity, the listen address and worker count. A reload re-runs
     /// the configuration *script* and re-reads the certificate *files*;
     /// everything else needs a restart.
-    async fn reload(&self) {
+    ///
+    /// The rebuild runs on its own task. It constructs `workers` Lua
+    /// states, compiles the handler into each and awaits the
+    /// configuration script — seconds, on a large pool with a script that
+    /// opens a database — and it used to run inline in the accept loop's
+    /// `select!`, during which no connection was accepted and a `SIGTERM`
+    /// went unanswered. A reload requested while one is running is
+    /// coalesced: the running one already reads the current files.
+    fn reload(&self) {
         #[cfg(feature = "tls")]
         self.reload_tls();
+        if self.reloading.swap(true, Ordering::AcqRel) {
+            tracing::info!("reload requested while one is in progress; coalescing");
+            return;
+        }
         tracing::info!("reload requested: rebuilding the runtime pool");
-        match build_runtimes(
-            &self.cfg,
-            self.builtins,
-            &self.setup_fns,
-            &self.modules,
-            self.cache.as_ref(),
-        )
-        .await
-        {
-            Ok(runtimes) => {
-                let fresh = Arc::new(new_pool(
-                    runtimes,
-                    &self.cfg,
-                    self.builtins,
-                    &self.setup_fns,
-                    &self.modules,
-                    self.cache.clone(),
-                ));
-                match self.pool.write() {
-                    Ok(mut pool) => {
-                        *pool = fresh;
-                        tracing::info!("reload complete: new runtime pool is live");
+        let cfg = self.cfg.clone();
+        let builtins = self.builtins;
+        let setup_fns = self.setup_fns.clone();
+        let modules = self.modules.clone();
+        let cache = self.cache.clone();
+        let pool = self.pool.clone();
+        let reloading = self.reloading.clone();
+        tokio::spawn(async move {
+            match build_runtimes(&cfg, builtins, &setup_fns, &modules, cache.as_ref()).await {
+                Ok(runtimes) => {
+                    let fresh = Arc::new(new_pool(
+                        runtimes, &cfg, builtins, &setup_fns, &modules, cache,
+                    ));
+                    match pool.write() {
+                        Ok(mut pool) => {
+                            *pool = fresh;
+                            tracing::info!("reload complete: new runtime pool is live");
+                        }
+                        Err(_) => tracing::error!("reload failed: pool lock is poisoned"),
                     }
-                    Err(_) => tracing::error!("reload failed: pool lock is poisoned"),
+                }
+                Err(err) => {
+                    tracing::error!("reload failed, keeping the current pool: {err}");
                 }
             }
-            Err(err) => {
-                tracing::error!("reload failed, keeping the current pool: {err}");
-            }
-        }
+            reloading.store(false, Ordering::Release);
+        });
     }
 
     /// Re-reads `[tls] cert`/`key` from their configured paths and swaps

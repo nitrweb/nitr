@@ -171,8 +171,13 @@ pub(crate) async fn check_url(url: &Url, opts: &FetchOptions) -> mlua::Result<()
 
 /// Special-purpose address ranges refused unless private networks are
 /// explicitly allowed: loopback, RFC1918, link-local (including cloud
-/// metadata endpoints), CGNAT, unspecified, broadcast, and their IPv6
-/// counterparts (ULA, link-local, v4-mapped forms).
+/// metadata endpoints), CGNAT, unspecified, broadcast, multicast, the
+/// reserved and benchmarking blocks, and their IPv6 counterparts (ULA,
+/// link-local, multicast) — plus every IPv6 form that *embeds* an IPv4
+/// address (v4-mapped, v4-compatible, NAT64 `64:ff9b::/96`, 6to4
+/// `2002::/16`), judged by the address it embeds: a NAT64 gateway on an
+/// IPv6-only host would otherwise deliver `64:ff9b::a9fe:a9fe` straight
+/// to the metadata endpoint.
 fn is_forbidden_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -182,18 +187,50 @@ fn is_forbidden_ip(ip: IpAddr) -> bool {
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                // "This network" 0.0.0.0/8: Linux delivers any of it to
+                // loopback, so `0.0.0.1` is `127.0.0.1` with extra steps.
+                || octets[0] == 0
                 // CGNAT 100.64.0.0/10
                 || (octets[0] == 100 && (64..128).contains(&octets[1]))
+                // IETF protocol assignments 192.0.0.0/24
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                // Benchmarking 198.18.0.0/15
+                || (octets[0] == 198 && (18..20).contains(&octets[1]))
+                // Reserved 240.0.0.0/4 (broadcast handled above)
+                || octets[0] >= 240
         }
         IpAddr::V6(v6) => {
+            let seg = v6.segments();
             v6.is_loopback()
                 || v6.is_unspecified()
+                || v6.is_multicast()
                 // Unique-local fc00::/7
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (seg[0] & 0xfe00) == 0xfc00
                 // Link-local fe80::/10
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                || v6.to_ipv4_mapped().is_some_and(|v4| is_forbidden_ip(v4.into()))
+                || (seg[0] & 0xffc0) == 0xfe80
+                || embedded_ipv4(v6).is_some_and(|v4| is_forbidden_ip(v4.into()))
         }
+    }
+}
+
+/// The IPv4 address an IPv6 address carries, for the transition forms
+/// that carry one.
+fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let seg = v6.segments();
+    let tail = |hi: u16, lo: u16| std::net::Ipv4Addr::from(((hi as u32) << 16) | lo as u32);
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    match seg {
+        // IPv4-compatible ::a.b.c.d (deprecated, still routed by some stacks)
+        [0, 0, 0, 0, 0, 0, hi, lo] => Some(tail(hi, lo)),
+        // NAT64 well-known prefix 64:ff9b::/96
+        [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] => Some(tail(hi, lo)),
+        // 6to4 2002:a.b.c.d::/48
+        [0x2002, hi, lo, ..] => Some(tail(hi, lo)),
+        _ => None,
     }
 }
 
@@ -207,6 +244,33 @@ mod tests {
 
     #[test]
     fn special_purpose_addresses_are_forbidden() {
+        // Transition forms embedding a forbidden IPv4, and the v4 blocks
+        // the first version of this list missed.
+        for forbidden in [
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b::7f00:1",
+            "::7f00:1",
+            "2002:a9fe:a9fe::",
+            "ff02::1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "0.0.0.1",
+            "0.1.2.3",
+            "192.0.0.8",
+            "198.18.0.1",
+        ] {
+            assert!(
+                is_forbidden_ip(ip(forbidden)),
+                "{forbidden} must be forbidden"
+            );
+        }
+        for allowed in ["64:ff9b::0808:0808", "2002:0808:0808::", "2606:4700::1111"] {
+            assert!(
+                !is_forbidden_ip(ip(allowed)),
+                "{allowed} embeds a public address"
+            );
+        }
+
         for bad in [
             "127.0.0.1",
             "10.1.2.3",

@@ -142,8 +142,9 @@ function App:static(mount, dir, opts) end
 
 ---One part of a multipart upload, delivered to the `req:multipart` callback.
 ---@class nitr.Part
----@field name string|nil Form field name.
----@field filename string|nil Client-supplied file name.
+---@field name string Form field name (`""` when the part carries none).
+---@field filename string|nil Client-supplied file name, raw; nil for an ordinary field.
+---@field safe_filename string|nil `filename` reduced to a single safe path segment; nil exactly when `filename` is.
 ---@field content_type string|nil Part content type.
 local Part = {}
 
@@ -156,7 +157,8 @@ function Part:text() end
 ---@return integer
 function Part:save(path) end
 
----Drains and drops the part.
+---Drains and drops the part; returns the bytes skipped.
+---@return integer
 function Part:discard() end
 
 ---An unsent outbound request from `nitr.fetch`; send it, or hand it to `nitr.await_all`.
@@ -309,10 +311,10 @@ function nitr.dbg(value) end
 ---@return nitr.FetchHandle
 function nitr.fetch(method, url, opts) end
 
----Runs fetch handles (and `db:query_async` handles) concurrently; returns their results in order. (std feature: `fetch`)
----@param handles table
----@return table
-function nitr.await_all(handles) end
+---Runs fetch handles (and `db:query_async` handles) concurrently, passed as separate arguments (`nitr.await_all(h1, h2)`), and returns their results as multiple values in the same order. Capped by `[fetch] max_concurrent`. (std feature: `fetch`)
+---@param ... nitr.FetchHandle|table
+---@return ...
+function nitr.await_all(...) end
 
 ---The minijinja template engine, loading from `[templating] dir`. (std feature: `template`)
 nitr.template = {}
@@ -338,16 +340,16 @@ function nitr.db:execute(sql, params) end
 ---@return table[]
 function nitr.db:query(sql, params) end
 
----The first row, or nil.
+---The first row as a column→value table, or nil when the query returns no rows.
 ---@param sql string
 ---@param params? table
 ---@return table|nil
 function nitr.db:query_row(sql, params) end
 
----The first column of the first row.
+---The row of a query that must return exactly one row (a column→value table); raises when it returns none or more than one.
 ---@param sql string
 ---@param params? table
----@return any
+---@return table
 function nitr.db:query_one(sql, params) end
 
 ---Runs `fn` atomically; rolls back on error. Nestable (savepoints). Use `tx`, not the outer `nitr.db`.
@@ -485,25 +487,26 @@ nitr.cache = {}
 ---@return any
 function nitr.cache:get(key) end
 
----Stores a value (ttl in seconds).
+---Stores a value; `opts` is `{ ttl = seconds }`.
 ---@param key string
 ---@param value any
----@param ttl? integer
-function nitr.cache:set(key, value, ttl) end
+---@param opts? table
+function nitr.cache:set(key, value, opts) end
 
----Removes a key.
+---Removes a key; whether it was there.
 ---@param key string
+---@return boolean
 function nitr.cache:delete(key) end
 
 ---Empties the cache.
 function nitr.cache:clear() end
 
----The cached value, or `fn()`'s result, stored and returned.
+---The cached value, or `fn()`'s result, stored and returned. Call as `remember(key, fn)` or `remember(key, { ttl = seconds }, fn)`.
 ---@param key string
----@param ttl integer|nil
----@param fn fun(): any
+---@param opts table|fun(): any
+---@param fn fun(): any|nil
 ---@return any
-function nitr.cache:remember(key, ttl, fn) end
+function nitr.cache:remember(key, opts, fn) end
 
 ---Hit/miss/entry counters.
 ---@return table
@@ -654,7 +657,7 @@ function nitr.env.has(name) end
 ---@return number|nil
 function nitr.env.number(name, default) end
 
----Reads a flag: 1/true/yes/on and 0/false/no/off (any case); anything else answers the default.
+---Reads a flag: 1/true/yes/on and 0/false/no/off (any case); empty means false, anything else answers the default.
 ---@param name string
 ---@param default? boolean
 ---@return boolean|nil

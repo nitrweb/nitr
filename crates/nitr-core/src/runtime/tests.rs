@@ -161,7 +161,7 @@ fn the_default_library_set_carries_no_ambient_authority() {
         assert!(!value.is_nil(), "`{name}` must be available by default");
     }
 
-    // `load` is a deliberate keep, not an oversight: a compiled chunk runs
+    // `load` is a deliberate keep, not an oversight: a *text* chunk runs
     // under the same instruction hook and memory limit as the code that
     // compiled it, so it grants no authority the caller lacks. Asserted
     // positively so a later tidy-up cannot quietly remove it.
@@ -171,6 +171,141 @@ fn the_default_library_set_carries_no_ambient_authority() {
         .eval()
         .expect("load compiles and runs a chunk");
     assert_eq!(compiled, 42, "`load` must remain available");
+
+    // Bytecode is the exception: Lua 5.4 does not verify it, so a binary
+    // chunk is a VM escape. The mode is pinned to text whatever the caller
+    // passes, and `string.dump` — the way to produce bytecode — is gone.
+    let (ok, err): (bool, String) = rt
+        .lua()
+        .load(
+            r#"local f, err = load("\27LuaT\0\25\147\r\n\26\n", "bc", "b")
+               return f ~= nil, tostring(err)"#,
+        )
+        .eval()
+        .expect("eval");
+    assert!(!ok, "a binary chunk must not load: {err}");
+    assert!(err.contains("binary"), "the refusal must say why: {err}");
+    let dump: Value = rt.lua().load("return string.dump").eval().expect("eval");
+    assert!(dump.is_nil(), "`string.dump` must not be exposed");
+
+    // The wrapper keeps `load`'s argument shape: an explicit environment
+    // still applies, and an explicit `nil` environment still means "no
+    // globals" rather than "the default globals".
+    let (with_env, no_env): (i64, bool) = rt
+        .lua()
+        .load(
+            r#"local f = load("return x", "chunk", "t", { x = 7 })
+               local g = load("return math.pi", "chunk", "t", nil)
+               local ok = pcall(g)
+               return f(), not ok"#,
+        )
+        .eval()
+        .expect("eval");
+    assert_eq!(with_env, 7, "an explicit environment must be honored");
+    assert!(
+        no_env,
+        "an explicit nil environment must not become the globals"
+    );
+}
+
+/// The budget error must not be catchable: the hook's count restarts at
+/// every fire, so a loop that `pcall`s a spinning closure catches every
+/// trip inside the closure and never trips on its own. Without the
+/// `pcall`/`xpcall`/`coroutine.resume` wrappers this test never returns.
+#[tokio::test]
+async fn the_execution_budget_cannot_be_caught_and_ignored() {
+    for body in [
+        "while true do pcall(function() while true do end end) end",
+        "while true do xpcall(function() while true do end end, function(e) return e end) end",
+        "while true do coroutine.resume(coroutine.create(function() while true do end end)) end",
+        // The honest variant: a retry loop that can never succeed once
+        // the budget is gone.
+        "repeat local ok = pcall(function() while true do end end) until ok",
+    ] {
+        let mut rt = Runtime::new_with(RuntimeOpts {
+            libs: StdLib::MATH | StdLib::TABLE | StdLib::STRING | StdLib::COROUTINE,
+            memory_limit: MEMORY_LIMIT,
+            dev_mode: false,
+            exec_timeout: Some(Duration::from_millis(100)),
+            package_dir: None,
+        })
+        .expect("runtime");
+        let looping = eval_function(&rt, &format!("return function() {body} end"));
+        let started = Instant::now();
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            rt.call_function::<Value>(looping, Value::Nil),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("`{body}` escaped the budget and never returned"))
+        .expect_err("must trip the budget");
+        assert!(err.to_string().contains("time budget"), "`{body}`: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "`{body}` took {:?} to trip a 100 ms budget",
+            started.elapsed()
+        );
+
+        // A caught error *before* the deadline is still an ordinary
+        // caught error: the wrappers only bite once the budget is gone.
+        let caught: String = rt
+            .lua()
+            .load("local ok, e = pcall(error, 'plain') return tostring(ok) .. ':' .. e")
+            .eval()
+            .expect("eval");
+        assert_eq!(caught, "false:plain");
+    }
+}
+
+/// A handler that stalls in an async builtin past the budget: the outer
+/// timeout fires, and the state must come back clean — the suspended
+/// coroutine reset and its pending future dropped *now*, not at some
+/// later collection — so the next request on the same state does not
+/// inherit the previous one's in-flight work.
+#[tokio::test]
+async fn an_async_stall_times_out_and_the_state_recovers() {
+    let mut rt = test_runtime(Some(Duration::from_millis(100)));
+    // A future whose drop is observable, standing in for a fetch or a
+    // database transaction left mid-flight.
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct Flag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Flag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let flag = dropped.clone();
+    let stall = rt
+        .lua()
+        .create_async_function(move |_, ()| {
+            let flag = Flag(flag.clone());
+            async move {
+                let _held = flag;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(())
+            }
+        })
+        .expect("stall fn");
+    rt.lua().globals().set("stall", stall).expect("set");
+
+    let handler = eval_function(&rt, "return function() stall() return 'unreachable' end");
+    let err = rt
+        .call_function::<Value>(handler, Value::Nil)
+        .await
+        .expect_err("must time out");
+    assert!(matches!(err, Error::Timeout), "got: {err}");
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "the stalled future must be dropped when the call times out"
+    );
+    assert!(!rt.is_poisoned(), "a timeout is recoverable, not poison");
+
+    let ok = eval_function(&rt, "return function() return 'alive' end");
+    let alive: String = rt
+        .call_function(ok, Value::Nil)
+        .await
+        .expect("the state serves the next call");
+    assert_eq!(alive, "alive");
 }
 
 /// `package.loadlib` is a confinement escape that ignores `package.cpath`:
@@ -251,6 +386,42 @@ async fn require_is_confined_to_the_package_dir() {
             "require({escape:?}) must not reach outside the package dir"
         );
     }
+
+    // Reassigning `package.path` must not widen the search: the searcher
+    // owns the directory, the string is informational.
+    let widened = lua
+        .load(format!(
+            "package.path = '{}/?.lua' return require('outside').where",
+            root.to_string_lossy()
+        ))
+        .eval::<String>();
+    assert!(
+        widened.is_err(),
+        "a script must not be able to point `require` elsewhere"
+    );
+
+    // A module that is bytecode is refused: `require` compiles text only,
+    // like `load` and the script loader.
+    std::fs::write(pkg.join("compiled.lua"), b"\x1bLuaT\0\x19\x93\r\n\x1a\n")
+        .expect("write bytecode");
+    let err = lua
+        .load("return require('compiled')")
+        .eval::<Value>()
+        .expect_err("bytecode module");
+    assert!(err.to_string().contains("binary"), "got: {err}");
+
+    // Dotted names map to directories, and `init.lua` resolves.
+    std::fs::create_dir_all(pkg.join("nested/deep")).expect("mkdir nested");
+    std::fs::write(
+        pkg.join("nested/deep/init.lua"),
+        "return { where = 'init' }",
+    )
+    .expect("write init");
+    let init: String = lua
+        .load("return require('nested.deep').where")
+        .eval()
+        .expect("require init");
+    assert_eq!(init, "init");
 
     std::fs::remove_dir_all(&root).ok();
 }

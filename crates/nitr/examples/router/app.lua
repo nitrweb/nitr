@@ -1,7 +1,10 @@
 -- A small application showing the nitr.app() programming model:
 -- Rust-side routing, Lua middleware, response helpers, and cookies.
 
-local SECRET = "change-me" -- in real apps: read it from nitr.cfg
+-- Secrets come from configuration (`nitr.cfg`, filled by config.lua),
+-- never literals in the handler.
+local SECRET = nitr.cfg.secret
+local API_TOKEN = nitr.cfg.api_token
 
 local app = nitr.app()
 
@@ -16,9 +19,12 @@ app:use(function(next)
 end)
 
 -- A per-route middleware: short-circuits without calling the handler.
+-- The token is compared in constant time — `==` on a credential leaks
+-- how many leading bytes matched.
 local function auth(next)
     return function(req)
-        if req.headers["authorization"] ~= "secret" then
+        local token = nitr.auth.bearer(req)
+        if not token or not nitr.crypto.constant_time_eq(token, API_TOKEN) then
             return nitr.error(401, "Unauthorized")
         end
         return next(req)

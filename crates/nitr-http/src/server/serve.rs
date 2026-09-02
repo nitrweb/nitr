@@ -327,7 +327,7 @@ impl Server {
                         }
                     });
                 }
-                Some(()) = reload_rx.recv() => self.reload().await,
+                Some(()) = reload_rx.recv() => self.reload(),
                 _ = &mut shutdown => break,
             }
         }

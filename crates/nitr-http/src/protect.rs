@@ -9,7 +9,7 @@
 //! consume the resources first.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -21,9 +21,24 @@ use crate::handler::{HttpResponse, plain_response};
 use crate::request::LuaRequest;
 use nitr_core::Result;
 
-/// Above this many tracked client buckets, stale entries are purged on the
-/// next check (a backstop against unbounded growth from IP churn).
+/// Above this many tracked client buckets, stale entries are purged — but
+/// at most once per [`BUCKET_PURGE_INTERVAL`]. Purging on *every* check
+/// past the threshold turned the limiter into an O(n) scan under the one
+/// lock every connection serializes on: a client with a /64 (2^64 source
+/// addresses) opened a bucket per request, none evictable inside the
+/// window, and from ~10k buckets on every request in the server paid a
+/// full-map walk.
 const BUCKET_PURGE_THRESHOLD: usize = 10_000;
+
+/// Minimum spacing between two purges.
+const BUCKET_PURGE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Hard cap on tracked clients (~20 MiB of buckets). Past it a client
+/// not yet tracked is admitted *untracked* rather than refused: refusing
+/// would let an address flood deny every new visitor, while admitting
+/// costs nothing the flood could not already obtain by rotating
+/// addresses. Clients already tracked keep their budget either way.
+const MAX_BUCKETS: usize = 200_000;
 
 /// Per-server protection state, shared by all connections.
 #[derive(Debug)]
@@ -57,11 +72,12 @@ impl Protection {
                 ms => Some(Duration::from_millis(ms)),
             },
             pool_wait: Duration::from_millis(cfg.limits.pool_wait_ms),
-            rate: cfg.rate_limit.enabled.then(|| RateLimiter {
-                max: cfg.rate_limit.requests.max(1),
-                window: Duration::from_secs(cfg.rate_limit.window.max(1)),
-                trust_forwarded_for: cfg.rate_limit.trust_forwarded_for,
-                buckets: Mutex::new(HashMap::new()),
+            rate: cfg.rate_limit.enabled.then(|| {
+                RateLimiter::new(
+                    cfg.rate_limit.requests.max(1),
+                    Duration::from_secs(cfg.rate_limit.window.max(1)),
+                    cfg.rate_limit.trust_forwarded_for,
+                )
             }),
             form: crate::request::FormLimits {
                 max_parts: cfg.limits.max_form_parts.max(1),
@@ -181,7 +197,7 @@ impl Protection {
         }
 
         // Declared body size; a chunked body that lies is caught later by
-        // the state's memory limit when the handler reads it.
+        // the handler's byte-counting body guard, which answers 413.
         let declared = req
             .req
             .headers()
@@ -204,16 +220,35 @@ fn uri_len(req: &LuaRequest) -> usize {
     uri.path().len() + uri.query().map_or(0, |q| q.len() + 1)
 }
 
-/// A fixed-window request counter per client IP.
+/// A fixed-window request counter per client.
 #[derive(Debug)]
 struct RateLimiter {
     max: u32,
     window: Duration,
     trust_forwarded_for: bool,
-    buckets: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    buckets: Mutex<Buckets>,
+}
+
+/// The tracked clients and when they were last purged.
+#[derive(Debug)]
+struct Buckets {
+    map: HashMap<IpAddr, (Instant, u32)>,
+    last_purge: Instant,
 }
 
 impl RateLimiter {
+    fn new(max: u32, window: Duration, trust_forwarded_for: bool) -> Self {
+        Self {
+            max,
+            window,
+            trust_forwarded_for,
+            buckets: Mutex::new(Buckets {
+                map: HashMap::new(),
+                last_purge: Instant::now(),
+            }),
+        }
+    }
+
     /// Returns `Err(retry_after_seconds)` when the client exceeded its
     /// budget for the current window.
     fn check(&self, req: &LuaRequest) -> std::result::Result<(), u64> {
@@ -224,18 +259,30 @@ impl RateLimiter {
     /// tests drive window expiry and bucket eviction deterministically
     /// instead of sleeping against the real clock.
     fn check_at(&self, req: &LuaRequest, now: Instant) -> std::result::Result<(), u64> {
-        let ip = self.client_ip(req);
+        let key = self.client_key(req);
         let mut buckets = match self.buckets.lock() {
             Ok(guard) => guard,
             // Poisoning is unreachable in practice (no panics while held);
             // failing open beats taking the server down.
             Err(_) => return Ok(()),
         };
-        if buckets.len() > BUCKET_PURGE_THRESHOLD {
+        if buckets.map.len() > BUCKET_PURGE_THRESHOLD
+            && now.duration_since(buckets.last_purge) >= BUCKET_PURGE_INTERVAL
+        {
             let window = self.window;
-            buckets.retain(|_, (start, _)| now.duration_since(*start) < window);
+            buckets
+                .map
+                .retain(|_, (start, _)| now.duration_since(*start) < window);
+            buckets.last_purge = now;
         }
-        let bucket = buckets.entry(ip).or_insert((now, 0));
+        if buckets.map.len() >= MAX_BUCKETS && !buckets.map.contains_key(&key) {
+            tracing::debug!(
+                peer = %req.peer_addr,
+                "rate limiter at its client cap; admitting a new client untracked"
+            );
+            return Ok(());
+        }
+        let bucket = buckets.map.entry(key).or_insert((now, 0));
         if now.duration_since(bucket.0) >= self.window {
             *bucket = (now, 0);
         }
@@ -248,21 +295,42 @@ impl RateLimiter {
         Ok(())
     }
 
-    /// The IP the budget is keyed by: the first `X-Forwarded-For` entry
-    /// when explicitly trusted (behind a proxy), else the peer address.
-    fn client_ip(&self, req: &LuaRequest) -> IpAddr {
-        if self.trust_forwarded_for
+    /// The address the budget is keyed by, reduced to a bucket key.
+    ///
+    /// Behind a trusted proxy the *last* `X-Forwarded-For` entry is used —
+    /// the one that proxy appended, i.e. the address it accepted the
+    /// connection from. The first entry is whatever the client wrote:
+    /// every mainstream proxy appends rather than overwrites, so keying by
+    /// it let a client mint a fresh budget per request with one header.
+    /// A header that does not parse falls back to the peer address.
+    fn client_key(&self, req: &LuaRequest) -> IpAddr {
+        let ip = if self.trust_forwarded_for
             && let Some(ip) = req
                 .req
                 .headers()
                 .get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.split(',').next())
+                .and_then(|v| v.rsplit(',').next())
                 .and_then(|v| v.trim().parse().ok())
         {
-            return ip;
+            ip
+        } else {
+            req.peer_addr.ip()
+        };
+        bucket_key(ip)
+    }
+}
+
+/// Reduces an address to the granularity a budget is tracked at: IPv4 as
+/// is (after unmapping `::ffff:a.b.c.d`), IPv6 by its /64 — the smallest
+/// allocation a single subscriber holds, and 2^64 addresses otherwise.
+fn bucket_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
         }
-        req.peer_addr.ip()
     }
 }
 
@@ -272,12 +340,7 @@ mod tests {
     use http_body_util::BodyExt as _;
 
     fn limiter(max: u32, window_ms: u64, trust_forwarded_for: bool) -> RateLimiter {
-        RateLimiter {
-            max,
-            window: Duration::from_millis(window_ms),
-            trust_forwarded_for,
-            buckets: Mutex::new(HashMap::new()),
-        }
+        RateLimiter::new(max, Duration::from_millis(window_ms), trust_forwarded_for)
     }
 
     fn request(peer: &str, forwarded_for: Option<&str>) -> LuaRequest {
@@ -354,7 +417,7 @@ mod tests {
             assert!(limiter.check_at(&request(&ip, None), t0).is_ok());
         }
         assert!(
-            limiter.buckets.lock().expect("buckets").len() > BUCKET_PURGE_THRESHOLD,
+            limiter.buckets.lock().expect("buckets").map.len() > BUCKET_PURGE_THRESHOLD,
             "the map must actually be past the threshold for the purge to be tested"
         );
 
@@ -367,9 +430,58 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(
-            limiter.buckets.lock().expect("buckets").len(),
+            limiter.buckets.lock().expect("buckets").map.len(),
             1,
             "stale buckets must be evicted, not accumulate forever"
+        );
+    }
+
+    /// The purge is rate-limited itself: past the threshold, requests
+    /// inside the same second must not each pay a full-map scan.
+    #[test]
+    fn purges_are_spaced_out_not_paid_per_request() {
+        let limiter = limiter(100, 60_000, false);
+        let t0 = Instant::now();
+        for n in 0..=BUCKET_PURGE_THRESHOLD as u32 {
+            let ip = format!("10.{}.{}.{}", n >> 16 & 0xff, n >> 8 & 0xff, n & 0xff);
+            assert!(limiter.check_at(&request(&ip, None), t0).is_ok());
+        }
+        // Wait out the first purge, which drops nothing (all in-window)
+        // but stamps the time, then verify the next check within the
+        // interval leaves the stamp alone.
+        let t1 = t0 + BUCKET_PURGE_INTERVAL + Duration::from_millis(1);
+        assert!(limiter.check_at(&request("192.168.0.1", None), t1).is_ok());
+        let stamped = limiter.buckets.lock().expect("buckets").last_purge;
+        assert!(
+            limiter
+                .check_at(&request("192.168.0.2", None), t1 + Duration::from_millis(1))
+                .is_ok()
+        );
+        assert_eq!(
+            limiter.buckets.lock().expect("buckets").last_purge,
+            stamped,
+            "a second purge inside the interval must not run"
+        );
+    }
+
+    /// IPv6 is keyed by /64: one subscriber's whole allocation shares a
+    /// budget, so rotating the host bits buys nothing.
+    #[test]
+    fn ipv6_clients_are_keyed_by_their_64() {
+        let rl = limiter(1, 60_000, false);
+        assert!(rl.check(&request("[2001:db8:1:2::1]", None)).is_ok());
+        assert!(
+            rl.check(&request("[2001:db8:1:2:ffff::9]", None)).is_err(),
+            "the same /64 is the same client"
+        );
+        assert!(
+            rl.check(&request("[2001:db8:1:3::1]", None)).is_ok(),
+            "a different /64 is a different client"
+        );
+        // A v4-mapped address is its v4 self.
+        assert_eq!(
+            bucket_key("::ffff:10.0.0.1".parse().expect("ip")),
+            "10.0.0.1".parse::<IpAddr>().expect("ip")
         );
     }
 
@@ -427,13 +539,20 @@ mod tests {
             "spoofing the header must not buy a fresh budget"
         );
 
-        // Trusted (behind a proxy): the first entry keys the budget.
+        // Trusted (behind a proxy): the *last* entry — the one the proxy
+        // appended — keys the budget; whatever the client wrote in front
+        // of it changes nothing.
         let rl = limiter(1, 60_000, true);
         assert!(
             rl.check(&request("10.0.0.9", Some("1.1.1.1, 9.9.9.9")))
                 .is_ok()
         );
-        assert!(rl.check(&request("10.0.0.9", Some("1.1.1.1"))).is_err());
+        assert!(
+            rl.check(&request("10.0.0.9", Some("2.2.2.2, 9.9.9.9")))
+                .is_err(),
+            "a spoofed first entry must not buy a fresh budget"
+        );
+        assert!(rl.check(&request("10.0.0.9", Some("9.9.9.9"))).is_err());
         assert!(
             rl.check(&request("10.0.0.9", Some("2.2.2.2"))).is_ok(),
             "a different client gets its own budget"

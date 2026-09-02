@@ -209,8 +209,9 @@ params = [
 name = "nitr.Part"
 desc = "One part of a multipart upload, delivered to the `req:multipart` callback."
 fields = [
-  { name = "name", type = "string|nil", desc = "Form field name." },
-  { name = "filename", type = "string|nil", desc = "Client-supplied file name." },
+  { name = "name", type = "string", desc = "Form field name (`\"\"` when the part carries none)." },
+  { name = "filename", type = "string|nil", desc = "Client-supplied file name, raw; nil for an ordinary field." },
+  { name = "safe_filename", type = "string|nil", desc = "`filename` reduced to a single safe path segment; nil exactly when `filename` is." },
   { name = "content_type", type = "string|nil", desc = "Part content type." },
 ]
 
@@ -227,7 +228,8 @@ returns = [{ type = "integer" }]
 
 [[fn]]
 name = "nitr.Part:discard"
-desc = "Drains and drops the part."
+desc = "Drains and drops the part; returns the bytes skipped."
+returns = [{ type = "integer" }]
 
 [[class]]
 name = "nitr.FetchHandle"
@@ -436,9 +438,9 @@ returns = [{ type = "nitr.FetchHandle" }]
 [[fn]]
 name = "nitr.await_all"
 feature = "fetch"
-desc = "Runs fetch handles (and `db:query_async` handles) concurrently; returns their results in order."
-params = [{ name = "handles", type = "table" }]
-returns = [{ type = "table" }]
+desc = "Runs fetch handles (and `db:query_async` handles) concurrently, passed as separate arguments (`nitr.await_all(h1, h2)`), and returns their results as multiple values in the same order. Capped by `[fetch] max_concurrent`."
+params = [{ name = "...", type = "nitr.FetchHandle|table" }]
+returns = [{ type = "..." }]
 
 [[table]]
 name = "nitr.template"
@@ -455,8 +457,8 @@ desc = "The SQLite database (`database` in nitr.toml): WAL, busy timeout, foreig
 methods = [
   { name = "execute", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "integer", desc = "Affected row count." }], desc = "Runs a statement." },
   { name = "query", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "table[]" }], desc = "All rows, each a column→value table." },
-  { name = "query_row", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "table|nil" }], desc = "The first row, or nil." },
-  { name = "query_one", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "any" }], desc = "The first column of the first row." },
+  { name = "query_row", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "table|nil" }], desc = "The first row as a column→value table, or nil when the query returns no rows." },
+  { name = "query_one", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "table" }], desc = "The row of a query that must return exactly one row (a column→value table); raises when it returns none or more than one." },
   { name = "transaction", params = [{ name = "fn", type = "fun(tx: nitr.Tx): any" }], returns = [{ type = "any" }], desc = "Runs `fn` atomically; rolls back on error. Nestable (savepoints). Use `tx`, not the outer `nitr.db`." },
   { name = "query_async", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }, { name = "kind", type = "string?" }], returns = [{ type = "table", desc = "A pending handle for `nitr.await_all`." }], desc = "An unsent query to run alongside fetches." },
 ]
@@ -515,10 +517,10 @@ feature = "cache"
 desc = "The bounded TTL+LRU cache shared by every state. Entries are plain data; per-process, so not a session store."
 methods = [
   { name = "get", params = [{ name = "key", type = "string" }], returns = [{ type = "any" }], desc = "The cached value, or nil." },
-  { name = "set", params = [{ name = "key", type = "string" }, { name = "value", type = "any" }, { name = "ttl", type = "integer?" }], desc = "Stores a value (ttl in seconds)." },
-  { name = "delete", params = [{ name = "key", type = "string" }], desc = "Removes a key." },
+  { name = "set", params = [{ name = "key", type = "string" }, { name = "value", type = "any" }, { name = "opts", type = "table?" }], desc = "Stores a value; `opts` is `{ ttl = seconds }`." },
+  { name = "delete", params = [{ name = "key", type = "string" }], returns = [{ type = "boolean" }], desc = "Removes a key; whether it was there." },
   { name = "clear", desc = "Empties the cache." },
-  { name = "remember", params = [{ name = "key", type = "string" }, { name = "ttl", type = "integer|nil" }, { name = "fn", type = "fun(): any" }], returns = [{ type = "any" }], desc = "The cached value, or `fn()`'s result, stored and returned." },
+  { name = "remember", params = [{ name = "key", type = "string" }, { name = "opts", type = "table|fun(): any" }, { name = "fn", type = "fun(): any|nil" }], returns = [{ type = "any" }], desc = "The cached value, or `fn()`'s result, stored and returned. Call as `remember(key, fn)` or `remember(key, { ttl = seconds }, fn)`." },
   { name = "stats", returns = [{ type = "table" }], desc = "Hit/miss/entry counters." },
 ]
 
@@ -586,7 +588,7 @@ functions = [
   { name = "get", params = [{ name = "name", type = "string" }, { name = "default", type = "string?" }], returns = [{ type = "string|nil", desc = "The value, or the default (nil without one) when unset or not readable." }], desc = "Reads one variable." },
   { name = "has", params = [{ name = "name", type = "string" }], returns = [{ type = "boolean" }], desc = "Whether the variable is set and readable; a policy-hidden name reports false." },
   { name = "number", params = [{ name = "name", type = "string" }, { name = "default", type = "number?" }], returns = [{ type = "number|nil" }], desc = "Reads and parses a number; unset or unparseable answers the default." },
-  { name = "bool", params = [{ name = "name", type = "string" }, { name = "default", type = "boolean?" }], returns = [{ type = "boolean|nil" }], desc = "Reads a flag: 1/true/yes/on and 0/false/no/off (any case); anything else answers the default." },
+  { name = "bool", params = [{ name = "name", type = "string" }, { name = "default", type = "boolean?" }], returns = [{ type = "boolean|nil" }], desc = "Reads a flag: 1/true/yes/on and 0/false/no/off (any case); empty means false, anything else answers the default." },
 ]
 
 [[table]]

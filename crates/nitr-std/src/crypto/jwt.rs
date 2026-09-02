@@ -149,6 +149,13 @@ pub(super) fn create_jwt_table(lua: &Lua) -> mlua::Result<Table> {
                 }
             }
             let leeway: f64 = opts.get::<Option<f64>>("leeway")?.unwrap_or(0.0);
+            // NaN makes both time comparisons false and infinity makes
+            // them vacuous: either silently turns expiry off.
+            if !leeway.is_finite() || leeway < 0.0 {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "jwt.verify `leeway` must be a finite number of seconds >= 0, got {leeway}"
+                )));
+            }
 
             let token = token.to_string_lossy().to_string();
             let mut parts = token.split('.');
@@ -191,13 +198,25 @@ pub(super) fn create_jwt_table(lua: &Lua) -> mlua::Result<Table> {
             else {
                 return jwt_reject(lua, "malformed claims");
             };
+            // A present-but-non-numeric `exp`/`nbf` is not "absent": RFC
+            // 7519 requires a NumericDate, and treating `"exp": "soon"` as
+            // no expiry would verify a token its issuer meant to expire.
+            let numeric_date = |name: &str| -> Result<Option<f64>, ()> {
+                match claims.get(name) {
+                    None => Ok(None),
+                    Some(value) => value.as_f64().map(Some).ok_or(()),
+                }
+            };
+            let (Ok(exp), Ok(nbf)) = (numeric_date("exp"), numeric_date("nbf")) else {
+                return jwt_reject(lua, "malformed claims");
+            };
             let now = unix_now();
-            if let Some(exp) = claims.get("exp").and_then(|v| v.as_f64())
+            if let Some(exp) = exp
                 && now > exp + leeway
             {
                 return jwt_reject(lua, "token expired");
             }
-            if let Some(nbf) = claims.get("nbf").and_then(|v| v.as_f64())
+            if let Some(nbf) = nbf
                 && now < nbf - leeway
             {
                 return jwt_reject(lua, "token not yet valid");

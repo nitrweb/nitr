@@ -10,7 +10,7 @@
 //! curl 'http://127.0.0.1:3000/'
 //! curl 'http://127.0.0.1:3000/users/42'
 //! curl -X POST 'http://127.0.0.1:3000/users' -d '{"name":"ada"}'
-//! curl 'http://127.0.0.1:3000/admin' -H 'authorization: secret'
+//! curl 'http://127.0.0.1:3000/admin' -H 'authorization: Bearer router-example-token'
 //! curl -c - 'http://127.0.0.1:3000/login'
 //! curl 'http://127.0.0.1:3000/whoami' -b 'session=<value from /login>'
 //! curl 'http://127.0.0.1:3000/data' -H 'accept: text/html'
@@ -39,7 +39,10 @@ async fn main() -> nitr::Result {
     Server::builder()
         .listen(([127, 0, 0, 1], port).into())
         .handler_script("crates/nitr/examples/router/app.lua")
-        .builtins(Builtins::DEBUG | Builtins::JSON | Builtins::HTTP | Builtins::LOG)
+        .config_script("crates/nitr/examples/router/config.lua")
+        .builtins(
+            Builtins::DEBUG | Builtins::JSON | Builtins::HTTP | Builtins::LOG | Builtins::CRYPTO,
+        )
         .build()
         .await?
         .serve()

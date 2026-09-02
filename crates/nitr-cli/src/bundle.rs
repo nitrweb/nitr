@@ -82,26 +82,44 @@ pub fn load() -> anyhow::Result<Option<Config>> {
         tar.hash(&mut h);
         h.finish()
     };
-    let root = std::env::temp_dir().join(format!("nitr-app-{key:016x}"));
-    let marker = root.join(".nitr-extracted");
-    if !marker.is_file() {
-        // Extract into a fresh directory, then rename: a crash mid-extract
-        // must not leave a half-populated directory that later runs trust.
-        let staging =
-            std::env::temp_dir().join(format!("nitr-app-{key:016x}.{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&staging);
-        std::fs::create_dir_all(&staging)?;
-        extract(&tar, &staging)?;
-        std::fs::File::create(staging.join(".nitr-extracted"))?;
-        match std::fs::rename(&staging, &root) {
-            Ok(()) => {}
-            // A concurrent start won the race; its extraction is complete.
-            Err(_) if marker.is_file() => {
-                let _ = std::fs::remove_dir_all(&staging);
+    // Reuse is only safe inside a directory this user owns and nobody
+    // else can enter. The old home was `$TMPDIR/nitr-app-<key>`: the key
+    // is computable by anyone who can read the executable, and a shared
+    // temp directory lets any local user create that path first — with a
+    // marker, their own `nitr.toml` and `app.lua` — and have the next
+    // start run *their* application as the operator. So: the user's
+    // cache directory (mode 0700) when there is one, and otherwise a
+    // fresh private directory per run that is never looked up by name.
+    let root = match cache_root() {
+        Some(cache) => {
+            let root = cache.join(format!("app-{key:016x}"));
+            if !root.join(MARKER).is_file() {
+                // Extract into a fresh directory, then rename: a crash
+                // mid-extract must not leave a half-populated directory
+                // that later runs trust.
+                let staging = fresh_private_dir(&cache, &format!("app-{key:016x}"))?;
+                extract(&tar, &staging)?;
+                std::fs::File::create(staging.join(MARKER))?;
+                match std::fs::rename(&staging, &root) {
+                    Ok(()) => {}
+                    // A concurrent start won the race; its extraction is
+                    // complete.
+                    Err(_) if root.join(MARKER).is_file() => {
+                        let _ = std::fs::remove_dir_all(&staging);
+                    }
+                    Err(err) => {
+                        return Err(err).context("cannot finalize the bundle extraction");
+                    }
+                }
             }
-            Err(err) => return Err(err).context("cannot finalize the bundle extraction"),
+            root
         }
-    }
+        None => {
+            let root = fresh_private_dir(&std::env::temp_dir(), "nitr-app")?;
+            extract(&tar, &root)?;
+            root
+        }
+    };
 
     let mut cfg = Config::from_file(&root.join(CONFIG_NAME))?;
     cfg.rebase(&root);
@@ -121,6 +139,77 @@ pub fn load() -> anyhow::Result<Option<Config>> {
     }
     cfg.dev_mode = false;
     Ok(Some(cfg))
+}
+
+/// Marks a completed extraction.
+const MARKER: &str = ".nitr-extracted";
+
+/// The user's private cache for extracted bundles:
+/// `$XDG_CACHE_HOME/nitr/apps`, else `$HOME/.cache/nitr/apps`, created
+/// mode 0700. `None` when neither variable names an absolute path or the
+/// directory cannot be created.
+fn cache_root() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".cache"))
+                .filter(|p| p.is_absolute())
+        })?;
+    let root = base.join("nitr").join("apps");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(&root).ok()?;
+    // `recursive` tolerates a pre-existing directory; make sure the one
+    // that exists is private, or the reuse guarantee is gone.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&root).ok()?.permissions().mode();
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).ok()?;
+        }
+    }
+    Some(root)
+}
+
+/// Creates a new directory under `parent` with a unique name, mode 0700,
+/// failing rather than adopting one that already exists (that is the
+/// property a shared temp directory cannot otherwise give).
+fn fresh_private_dir(parent: &Path, prefix: &str) -> anyhow::Result<PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    for attempt in 0..16u32 {
+        let dir = parent.join(format!(
+            "{prefix}.{}.{nanos:x}.{attempt}",
+            std::process::id()
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("cannot create {} for the bundle", dir.display()));
+            }
+        }
+    }
+    bail!(
+        "cannot find a free extraction directory under {}",
+        parent.display()
+    )
 }
 
 /// Extracts the bundle archive into `staging`, validating every entry.
@@ -307,10 +396,22 @@ pub fn build(cfg_path: &Path, cfg: &Config, output: &Path) -> anyhow::Result<()>
 }
 
 /// All `*.lua` files under `dir`, recursively, in stable order.
+///
+/// Symlinked directories are followed (a shared module tree is a
+/// legitimate layout) but each real directory is entered once: `ln -s .
+/// loop` in the application directory used to spin the walk forever
+/// while the archive grew.
 fn lua_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
+    let mut visited = std::collections::HashSet::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
+        let real = dir
+            .canonicalize()
+            .with_context(|| format!("cannot resolve the directory {}", dir.display()))?;
+        if !visited.insert(real) {
+            continue;
+        }
         let entries = std::fs::read_dir(&dir)
             .with_context(|| format!("cannot read the directory {}", dir.display()))?;
         for entry in entries {

@@ -94,16 +94,27 @@ app:post("/signup", function(req)
 end)
 
 -- AEAD: hand a client an opaque, tamper-proof value and get it back.
-local VAULT_KEY = nitr.crypto.random_bytes(32)
+--
+-- The key must be the same in every pooled Lua state (a `random_bytes`
+-- here would be a different key per state, so a box sealed by one state
+-- would not open in another), and the AAD must be something the client
+-- presents identically next time: `req.remote_addr` is `ip:port` and the
+-- port changes per connection, so only the address is used.
+-- `seal` wants exactly 32 key bytes; the digest is 64 hex characters, so
+-- half of it is the key (a real application reads a key from `nitr.cfg`).
+local VAULT_KEY = nitr.crypto.sha256("stdlib-example-vault-key"):sub(1, 32)
+local function client_ip(req)
+    return req.remote_addr:match("^(.*):%d+$") or req.remote_addr
+end
 
 app:get("/seal", function(req)
-    local box = nitr.crypto.seal(VAULT_KEY, "flag{warm-pool}", req.remote_addr)
+    local box = nitr.crypto.seal(VAULT_KEY, "flag{warm-pool}", client_ip(req))
     return nitr.json({ box = box })
 end)
 
 app:get("/open", function(req)
     -- The AAD binds the box to this client; another address gets nil.
-    local opened = nitr.crypto.open(VAULT_KEY, req.query.box or "", req.remote_addr)
+    local opened = nitr.crypto.open(VAULT_KEY, req.query.box or "", client_ip(req))
     if not opened then
         return nitr.error(400, { code = "TAMPERED_OR_MISSING" })
     end

@@ -14,6 +14,10 @@
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// The first second `httpdate` cannot format (year 10000): its
+/// `From<SystemTime>` panics from there on.
+const MAX_HTTP_DATE_SECS: u64 = 253_402_300_800;
+
 use chrono::format::{Item, StrftimeItems};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use mlua::{Lua, Table, Value};
@@ -70,7 +74,7 @@ pub(crate) fn create_time_table(lua: &Lua) -> mlua::Result<Table> {
     // Seconds (with sub-second precision) on a monotonic clock, for
     // measuring durations. The wall clock is wrong for that job — it jumps
     // under NTP adjustments — and Lua offers no alternative. The origin is
-    // process start, so only differences are meaningful.
+    // the first call, so only differences are meaningful.
     time.set(
         "monotonic",
         lua.create_function(|_, ()| {
@@ -116,6 +120,13 @@ pub(crate) fn create_time_table(lua: &Lua) -> mlua::Result<Table> {
             let ts = u64::try_from(ts).map_err(|_| {
                 mlua::Error::RuntimeError(format!("HTTP dates cannot express {ts} (before 1970)"))
             })?;
+            // `httpdate` panics past the year 9999; refuse the same range
+            // it would, as an error a script can catch.
+            if ts >= MAX_HTTP_DATE_SECS {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "HTTP dates cannot express {ts} (past the year 9999)"
+                )));
+            }
             Ok(httpdate::fmt_http_date(
                 UNIX_EPOCH + Duration::from_secs(ts),
             ))

@@ -68,7 +68,21 @@ async fn main() -> nitr::Result {
     }
     drop(conn);
 
-    let config_script = std::env::temp_dir().join("nitr-data-io-config.lua");
+    // A fixed name in the shared temp directory is a file someone else
+    // may have written first — and this one is *executed* as Lua. A
+    // private, per-run directory instead.
+    let scratch = std::env::temp_dir().join(format!("nitr-data-io-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        builder.create(&scratch)?;
+    }
+    let config_script = scratch.join("config.lua");
     std::fs::write(
         &config_script,
         format!("return {{ upstream = \"http://{upstream}/\" }}"),

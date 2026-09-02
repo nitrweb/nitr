@@ -38,11 +38,26 @@ impl Runtime {
         let mut wrapped = Vec::with_capacity(data.len() + 7);
         wrapped.extend_from_slice(b"return ");
         wrapped.extend_from_slice(&data);
-        let expr_err = match self.lua.load(wrapped).set_name(&name).into_function() {
+        // Text only, like every other chunk the runtime compiles: a script
+        // file that is precompiled bytecode is refused rather than trusted
+        // (see `PRELUDE` in the parent module for why bytecode is unsafe).
+        let expr_err = match self
+            .lua
+            .load(wrapped)
+            .set_name(&name)
+            .set_mode(mlua::chunk::ChunkMode::Text)
+            .into_function()
+        {
             Ok(f) => return Ok(f),
             Err(err) => err,
         };
-        match self.lua.load(data).set_name(&name).into_function() {
+        match self
+            .lua
+            .load(data)
+            .set_name(&name)
+            .set_mode(mlua::chunk::ChunkMode::Text)
+            .into_function()
+        {
             Ok(f) => Ok(f),
             Err(block_err) => {
                 let line = |err: &mlua::Error| {

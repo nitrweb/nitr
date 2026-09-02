@@ -88,6 +88,24 @@ async fn main() -> nitr::Result {
     // and `max_file_bytes` covers each file within it.
     cfg.limits.max_body_bytes = 16 * 1024 * 1024;
     cfg.limits.max_file_bytes = 8 * 1024 * 1024;
+    // `part:save` only writes under this root; without it every file part
+    // is refused. It cannot live inside the example directory: an upload
+    // root under the handler's directory is refused at startup (`require`
+    // is pinned there, so an uploaded `.lua` would be a loadable module).
+    // A private per-run directory keeps it out of the way.
+    let uploads = std::env::temp_dir().join(format!("nitr-standards-uploads-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&uploads);
+    {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        builder.create(&uploads)?;
+    }
+    println!("uploads are saved under {}", uploads.display());
+    cfg.multipart.upload_dir = Some(uploads);
 
     Server::builder()
         .config(cfg)
@@ -105,7 +123,6 @@ async fn main() -> nitr::Result {
 fn write_assets() -> nitr::Result {
     let public = std::path::Path::new(DIR).join("public");
     std::fs::create_dir_all(&public)?;
-    std::fs::create_dir_all(std::path::Path::new(DIR).join("uploads"))?;
 
     // A file worth seeking into.
     let alphabet: String = (0..4000u32)

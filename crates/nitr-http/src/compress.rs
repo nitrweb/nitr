@@ -190,7 +190,7 @@ impl Compression {
         crate::cors::append_vary(headers, "accept-encoding");
         // An ETag identifies a representation, and this is a different one.
         if let Some(etag) = headers.get(header::ETAG).and_then(|v| v.to_str().ok()) {
-            let weakened = format!("W/{}-{}", etag.trim_start_matches("W/"), encoding.token());
+            let weakened = weaken_etag(etag, encoding.token());
             if let Ok(value) = HeaderValue::from_str(&weakened) {
                 headers.insert(header::ETAG, value);
             }
@@ -215,10 +215,29 @@ impl Compression {
         if headers.contains_key(header::CONTENT_ENCODING) {
             return false;
         }
+        // `no-transform` is the application saying the bytes are the
+        // representation — a signed payload, a byte-exact download.
+        if headers
+            .get_all(header::CACHE_CONTROL)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .any(|directive| directive.trim().eq_ignore_ascii_case("no-transform"))
+        {
+            return false;
+        }
         // A known-small body is not worth a compressor. An unknown length
         // (a stream) is compressed: refusing would exclude exactly the
-        // responses where compression pays best.
-        if let Some(len) = resp.body().size_hint().exact()
+        // responses where compression pays best. The declared length is
+        // consulted before the body's own hint: a `HEAD` answered from
+        // the static path carries the file's `Content-Length` over an
+        // empty body, and it must reach the same decision as the `GET`
+        // it describes.
+        let declared = headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        if let Some(len) = declared.or_else(|| resp.body().size_hint().exact())
             && len < self.min_size
         {
             return false;
@@ -241,6 +260,19 @@ impl Compression {
                 Some(prefix) => content_type.starts_with(prefix),
                 None => *pattern == content_type,
             })
+    }
+}
+
+/// The weak validator for an encoded representation: `"abc"` under gzip
+/// becomes `W/"abc-gzip"` — a well-formed entity-tag (the suffix stays
+/// inside the quotes), and the shape `crate::request::is_fresh` knows to
+/// map back to the identity tag on the next conditional request.
+#[cfg(feature = "compression")]
+pub(crate) fn weaken_etag(etag: &str, token: &str) -> String {
+    let strong = etag.trim_start_matches("W/");
+    match strong.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        Some(inner) => format!("W/\"{inner}-{token}\""),
+        None => format!("W/\"{}-{token}\"", strong.trim_matches('"')),
     }
 }
 
@@ -551,6 +583,6 @@ mod tests {
         resp.headers_mut()
             .insert(header::ETAG, HeaderValue::from_static("\"abc\""));
         let out = p.apply(resp, Some(Encoding::Gzip));
-        assert_eq!(out.headers()[header::ETAG], "W/\"abc\"-gzip");
+        assert_eq!(out.headers()[header::ETAG], "W/\"abc-gzip\"");
     }
 }

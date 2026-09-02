@@ -137,7 +137,7 @@ async fn execute(
     let RequestSpec {
         mut method,
         mut url,
-        headers,
+        mut headers,
         mut body,
         timeout,
         ..
@@ -198,7 +198,17 @@ async fn execute(
                 "fetch exceeded {MAX_REDIRECTS} redirects for `{url}`"
             )));
         }
-        url = url.join(&location).into_lua_err()?;
+        let next = url.join(&location).into_lua_err()?;
+        // Redirects are followed by hand (so every hop is policy-checked),
+        // which means reqwest's own rule for cross-origin hops does not
+        // run: credentials addressed to the first origin must not be
+        // replayed to whoever it redirected to. An upstream with an open
+        // redirect — or a compromised one — would otherwise receive the
+        // script's bearer token or cookie on a plate.
+        if !same_origin(&url, &next) {
+            strip_sensitive_headers(&mut headers);
+        }
+        url = next;
         // Like browsers: 301/302/303 switch to GET and drop the body;
         // 307/308 preserve the method and body.
         if matches!(
@@ -210,6 +220,23 @@ async fn execute(
             method = HttpMethod::GET;
             body = None;
         }
+    }
+}
+
+/// Whether two URLs share scheme, host and port — the boundary across
+/// which credentials stop travelling.
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str().map(str::to_ascii_lowercase) == b.host_str().map(str::to_ascii_lowercase)
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// Drops the headers that carry credentials before a cross-origin hop,
+/// the same set reqwest's redirect policy removes.
+fn strip_sensitive_headers(headers: &mut HeaderMap) {
+    use reqwest::header::{AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION, WWW_AUTHENTICATE};
+    for name in [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION, WWW_AUTHENTICATE] {
+        headers.remove(name);
     }
 }
 
@@ -296,7 +323,12 @@ fn parse_spec(method: String, url: String, arg: Option<Table>) -> mlua::Result<R
                 body = Some(Bytes::copy_from_slice(&raw.as_bytes()));
             }
             if let Some(secs) = table.get::<Option<f64>>("timeout")? {
-                timeout = Some(Duration::from_secs_f64(secs.max(0.0)));
+                // `from_secs_f64` panics on `math.huge`/NaN; `try_from`
+                // reports them. A negative value means "no wait".
+                let requested = Duration::try_from_secs_f64(secs.max(0.0)).map_err(|_| {
+                    mlua::Error::RuntimeError(format!("fetch timeout `{secs}` is not a duration"))
+                })?;
+                timeout = Some(requested);
             }
             if let Some(table) = table.get::<Option<Table>>("retry")? {
                 retry = Some(parse_retry(&table)?);
@@ -336,6 +368,9 @@ pub(crate) fn create_fetch_fn(lua: &Lua, opts: Arc<FetchOptions>) -> mlua::Resul
     lua.create_function(
         move |lua, (method, url, arg): (String, String, Option<Table>)| {
             let mut spec = parse_spec(method, url, arg)?;
+            // A script may shorten its wait, never lengthen it past the
+            // operator's `[fetch] timeout`: the policy is a ceiling.
+            spec.timeout = spec.timeout.map(|t| t.min(opts.timeout));
             if opts.propagate_trace_context
                 && let Some(value) = traceparent(lua)
             {
@@ -442,6 +477,55 @@ mod tests {
             timeout: None,
             retry: None,
         }
+    }
+
+    /// A cross-origin redirect must not carry the first origin's
+    /// credentials along; a same-origin one keeps them.
+    #[test]
+    fn credentials_stop_at_the_origin_boundary() {
+        let a: Url = "https://api.example.com/x".parse().expect("url");
+        let same: Url = "https://api.example.com:443/y".parse().expect("url");
+        let other: Url = "https://evil.example/".parse().expect("url");
+        let scheme: Url = "http://api.example.com/x".parse().expect("url");
+        assert!(same_origin(&a, &same));
+        assert!(!same_origin(&a, &other));
+        assert!(
+            !same_origin(&a, &scheme),
+            "a scheme downgrade is a new origin"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer t"));
+        headers.insert("cookie", HeaderValue::from_static("s=1"));
+        headers.insert("x-custom", HeaderValue::from_static("kept"));
+        strip_sensitive_headers(&mut headers);
+        assert!(headers.get("authorization").is_none());
+        assert!(headers.get("cookie").is_none());
+        assert_eq!(headers.get("x-custom").expect("kept"), "kept");
+    }
+
+    /// The timeout option must neither panic on a non-finite value nor
+    /// widen the operator's ceiling.
+    #[test]
+    fn timeout_option_is_total_and_capped() {
+        let lua = Lua::new();
+        for bad in ["math.huge", "0/0", "1e300"] {
+            let opts: Table = lua
+                .load(format!("return {{ timeout = {bad} }}"))
+                .eval()
+                .expect("opts");
+            let result = parse_spec("GET".into(), "https://example.com/".into(), Some(opts));
+            // NaN maxes to 0 (a legal zero wait); the rest must error.
+            if bad != "0/0" {
+                assert!(result.is_err(), "`timeout = {bad}` must be refused");
+            }
+        }
+        let opts: Table = lua.load("return { timeout = 3600 }").eval().expect("opts");
+        let spec =
+            parse_spec("GET".into(), "https://example.com/".into(), Some(opts)).expect("spec");
+        let policy = FetchOptions::default();
+        let capped = spec.timeout.map(|t| t.min(policy.timeout));
+        assert_eq!(capped, Some(policy.timeout));
     }
 
     #[test]

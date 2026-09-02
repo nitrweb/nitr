@@ -88,6 +88,20 @@ fn depth_walk(value: &Value, remaining: usize, budget: &mut usize) -> mlua::Resu
         )));
     }
     *budget -= 1;
+    // mlua serializes a string that is not UTF-8 as *bytes*, which
+    // serde_json writes as an array of numbers — so a session field set
+    // to `nitr.crypto.random_bytes(16)` came back on the next request as a
+    // table of sixteen integers, with no error at save time. Refuse it
+    // here, where every serializer already passes through.
+    if let Value::String(s) = value
+        && s.to_str().is_err()
+    {
+        return Err(mlua::Error::RuntimeError(
+            "json value contains a string that is not valid UTF-8: encode binary data \
+             first (nitr.base64.encode or nitr.crypto.hex)"
+                .into(),
+        ));
+    }
     let Value::Table(table) = value else {
         return Ok(());
     };
@@ -152,8 +166,8 @@ pub(crate) fn dag_table(lua: &Lua, levels: usize) -> Value {
 /// diagnose is worse than one that says it could not render.
 pub(crate) fn create_debug_fn(lua: &Lua) -> mlua::Result<Function> {
     lua.create_function(|_, value: Value| {
-        if check_json_bounds(&value).is_err() {
-            tracing::debug!("[lua] <value too deeply nested to print>");
+        if let Err(err) = check_json_bounds(&value) {
+            tracing::debug!("[lua] <value not rendered: {err}>");
             return Ok(());
         }
         tracing::debug!("[lua] {value:#?}");
@@ -306,6 +320,20 @@ mod tests {
         assert_eq!(message, "nope");
         assert_eq!(kind, "lua");
         assert!(twice_same, "a structured value passes through unchanged");
+    }
+
+    /// Binary strings are refused rather than silently becoming arrays.
+    #[test]
+    fn binary_strings_are_refused_not_serialized_as_byte_arrays() {
+        let lua = Lua::new();
+        let raw = lua.create_string(b"\xff\xfe").expect("string");
+        let err = check_json_bounds(&Value::String(raw.clone())).expect_err("binary");
+        assert!(err.to_string().contains("UTF-8"), "got: {err}");
+        let nested = lua.create_table().expect("table");
+        nested.set("k", raw).expect("set");
+        assert!(check_json_bounds(&Value::Table(nested)).is_err());
+        let text = lua.create_string("caf\u{e9}").expect("string");
+        check_json_bounds(&Value::String(text)).expect("UTF-8 passes");
     }
 
     #[test]

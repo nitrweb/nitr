@@ -175,9 +175,19 @@ pub(crate) fn register(lua: &Lua, nitr: &Table) -> mlua::Result<()> {
 }
 
 /// Formats one Server-Sent Event: string data is taken verbatim (split
-/// into one `data:` line per newline, per the SSE wire format); any other
-/// value is JSON-encoded.
+/// into one `data:` line per line break, per the SSE wire format); any
+/// other value is JSON-encoded.
+///
+/// The event stream grammar ends a line at `\r\n`, `\n` *or a bare `\r`*,
+/// so data is split on all three — a `\r` left inside a `data:` line would
+/// let request text start a `retry:` or `event:` field of its own. The
+/// event name is one line by definition and is refused if it is not.
 fn format_event(event: &str, data: Value) -> mlua::Result<String> {
+    if event.contains(['\r', '\n']) {
+        return Err(mlua::Error::RuntimeError(
+            "an SSE event name cannot contain a line break".into(),
+        ));
+    }
     let data = match data {
         Value::String(s) => s.to_string_lossy().to_string(),
         other => {
@@ -186,7 +196,7 @@ fn format_event(event: &str, data: Value) -> mlua::Result<String> {
         }
     };
     let mut out = format!("event: {event}\n");
-    for line in data.split('\n') {
+    for line in data.replace("\r\n", "\n").split(['\r', '\n']) {
         out.push_str("data: ");
         out.push_str(line);
         out.push('\n');
@@ -284,6 +294,24 @@ pub fn best_match(accept: &str, offered: &[&str]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every line terminator the SSE grammar knows splits data, so no
+    /// value can inject a field; the event name is a single line.
+    #[test]
+    fn sse_framing_cannot_be_broken_out_of() {
+        let lua = Lua::new();
+        let data = |s: &str| Value::String(lua.create_string(s).expect("string"));
+        assert_eq!(
+            format_event("msg", data("hi\rretry: 1\revent: admin")).expect("event"),
+            "event: msg\ndata: hi\ndata: retry: 1\ndata: event: admin\n\n"
+        );
+        assert_eq!(
+            format_event("msg", data("a\r\nb\nc")).expect("event"),
+            "event: msg\ndata: a\ndata: b\ndata: c\n\n"
+        );
+        assert!(format_event("x\nretry: 1", data("d")).is_err());
+        assert!(format_event("x\r", data("d")).is_err());
+    }
 
     #[test]
     fn accept_header_negotiation_honors_quality_and_wildcards() {

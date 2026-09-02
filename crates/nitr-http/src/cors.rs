@@ -147,9 +147,13 @@ impl Cors {
         let Ok(requested) = requested.to_str() else {
             return false;
         };
-        self.methods
-            .to_str()
-            .is_ok_and(|allowed| allowed.split(", ").any(|m| m == requested))
+        // Case-insensitive like the header check below: `methods =
+        // ["post"]` must approve a browser's `POST`.
+        self.methods.to_str().is_ok_and(|allowed| {
+            allowed
+                .split(", ")
+                .any(|m| m.eq_ignore_ascii_case(requested.trim()))
+        })
     }
 
     fn headers_allowed(&self, headers: &HeaderMap) -> bool {

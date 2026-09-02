@@ -215,8 +215,15 @@ pub struct RateLimitConfig {
     pub requests: u32,
     /// Window length in seconds.
     pub window: u64,
-    /// Key the budget by the first `X-Forwarded-For` entry instead of the
-    /// peer address. Enable only behind a trusted proxy.
+    /// Key the budget by the **last** `X-Forwarded-For` entry — the
+    /// address the proxy in front appended, i.e. the client it accepted
+    /// the connection from — instead of the peer address. Enable only
+    /// behind a trusted proxy. The last entry is the right one whether
+    /// the proxy overwrites the header or (as nginx, Caddy, Traefik and
+    /// HAProxy do by default) appends to whatever the client sent; the
+    /// first entry is client-written and would hand every request a
+    /// fresh budget. With more than one proxy hop the budget keys by the
+    /// nearest hop's client, not the origin client.
     pub trust_forwarded_for: bool,
 }
 
@@ -249,7 +256,8 @@ pub struct TlsConfig {
     /// any intermediates a client needs to build the chain.
     pub cert: Option<PathBuf>,
     /// PEM file holding the matching private key (PKCS#8, PKCS#1 or
-    /// SEC1). Read once at startup and never again.
+    /// SEC1). Read at startup and again on each reload (`SIGHUP`), which
+    /// swaps in renewed material only when the pair validates.
     pub key: Option<PathBuf>,
     /// Oldest protocol version accepted: `"1.2"` or `"1.3"`. Unset means
     /// the floor, TLS 1.2, which is what a public endpoint wants;

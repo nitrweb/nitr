@@ -26,6 +26,18 @@ const MAX_SESSION_JSON: usize = 2800;
 /// would shadow the methods, so they are rejected rather than saved.
 const RESERVED: &[&str] = &["save", "clear"];
 
+/// The payload key carrying the session's expiry (unix seconds). Written
+/// when `max_age` is set and enforced on load, so a captured cookie stops
+/// working when the session it carries has aged out — `Max-Age` alone is
+/// advice to the browser, and an attacker's client takes none.
+const EXPIRES_KEY: &str = "_exp";
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
 /// Cookie attributes for a session cookie: HttpOnly always (a session is
 /// server state, scripts in the page have no business reading it),
 /// site-wide, SameSite=Lax; the caller's `cookie` options may extend but
@@ -46,15 +58,27 @@ fn cookie_opts(lua: &Lua, base: Option<&Table>, max_age: Option<i64>) -> mlua::R
     Ok(opts)
 }
 
-/// Copies the verified cookie payload (a JSON object) into `session`.
-fn load_into(lua: &Lua, session: &Table, payload: &str) -> mlua::Result<()> {
+/// Copies the verified cookie payload (a JSON object) into `session`,
+/// unless the payload carries an expiry that has passed — then the
+/// session starts empty, exactly as if the cookie had not been sent.
+fn load_into(lua: &Lua, session: &Table, payload: &str, now: i64) -> mlua::Result<()> {
     let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(payload)
     else {
         // A cookie that verifies but does not decode was produced by an
         // older secret sharing the name, or by tooling; start empty.
         return Ok(());
     };
+    if let Some(exp) = map.get(EXPIRES_KEY) {
+        // A malformed expiry is treated as expired: the only way the key
+        // exists is that this code wrote it, so anything else is damage.
+        if exp.as_i64().is_none_or(|exp| now >= exp) {
+            return Ok(());
+        }
+    }
     for (key, value) in map {
+        if key == EXPIRES_KEY {
+            continue;
+        }
         use mlua::LuaSerdeExt as _;
         session.set(key, lua.to_value(&value)?)?;
     }
@@ -62,8 +86,9 @@ fn load_into(lua: &Lua, session: &Table, payload: &str) -> mlua::Result<()> {
 }
 
 /// Serializes the session's own fields to JSON, rejecting values that
-/// cannot live in a cookie and names that would shadow the methods.
-fn serialize(session: &Table) -> mlua::Result<String> {
+/// cannot live in a cookie and names that would shadow the methods. With
+/// a `max_age`, the expiry rides inside the signed payload.
+fn serialize(session: &Table, max_age: Option<i64>, now: i64) -> mlua::Result<String> {
     for reserved in RESERVED {
         if !session.raw_get::<Value>(*reserved)?.is_nil() {
             return Err(mlua::Error::RuntimeError(format!(
@@ -71,13 +96,30 @@ fn serialize(session: &Table) -> mlua::Result<String> {
             )));
         }
     }
+    if !session.raw_get::<Value>(EXPIRES_KEY)?.is_nil() {
+        return Err(mlua::Error::RuntimeError(format!(
+            "`{EXPIRES_KEY}` is reserved on a session (it carries the expiry)"
+        )));
+    }
     let session = Value::Table(session.clone());
     crate::utils::check_json_bounds(&session)?;
-    let json = serde_json::to_string(&session).map_err(|err| {
+    let mut json = serde_json::to_value(&session).map_err(|err| {
         mlua::Error::RuntimeError(format!(
             "session values must be JSON-serializable (strings, numbers, booleans, tables): {err}"
         ))
     })?;
+    // An empty session stays empty (`{}` is what makes `save` delete the
+    // cookie); the expiry only rides along with actual data.
+    if let (Some(max_age), serde_json::Value::Object(map)) = (max_age, &mut json)
+        && max_age > 0
+        && !map.is_empty()
+    {
+        map.insert(
+            EXPIRES_KEY.into(),
+            serde_json::Value::from(now.saturating_add(max_age)),
+        );
+    }
+    let json = json.to_string();
     if json.len() > MAX_SESSION_JSON {
         return Err(mlua::Error::RuntimeError(format!(
             "the session is {} bytes serialized; the whole session travels in a signed \
@@ -113,7 +155,7 @@ pub(crate) fn create_session_fn(lua: &Lua) -> mlua::Result<mlua::Function> {
             && let Some(raw) = cookies.get(&name)
             && let Some(payload) = http::verify(&name, raw, &secret)
         {
-            load_into(lua, &session, &payload)?;
+            load_into(lua, &session, &payload, unix_now())?;
         }
 
         // Methods live on the metatable, so `pairs(session)` (and the
@@ -131,7 +173,7 @@ pub(crate) fn create_session_fn(lua: &Lua) -> mlua::Result<mlua::Function> {
                             resp.type_name()
                         )));
                     };
-                    let json = serialize(&session)?;
+                    let json = serialize(&session, max_age, unix_now())?;
                     let empty = json == "{}" || json == "[]";
                     let cookie = if empty {
                         // An empty session deletes its cookie.
@@ -291,8 +333,45 @@ mod tests {
         let lua = Lua::new();
         let session = lua.create_table().expect("table");
         // Verified-but-not-JSON (old secret sharing the name, tooling).
-        load_into(&lua, &session, "not json at all").expect("load");
-        load_into(&lua, &session, "[1,2,3]").expect("load");
+        load_into(&lua, &session, "not json at all", 0).expect("load");
+        load_into(&lua, &session, "[1,2,3]", 0).expect("load");
         assert_eq!(session.len().expect("len"), 0);
+    }
+
+    /// `max_age` is enforced by the server, not only advised to the
+    /// browser: the expiry travels inside the signed payload and a
+    /// replayed cookie past it loads an empty session.
+    #[test]
+    fn sessions_expire_server_side_when_max_age_is_set() {
+        let lua = Lua::new();
+        let session = lua.create_table().expect("table");
+        session.set("user", "ada").expect("set");
+        let json = serialize(&session, Some(3600), 1_000_000).expect("serialize");
+        assert!(json.contains("\"_exp\":1003600"), "got: {json}");
+
+        // Before the expiry: loads, and the marker itself stays hidden.
+        let fresh = lua.create_table().expect("table");
+        load_into(&lua, &fresh, &json, 1_003_599).expect("load");
+        assert_eq!(fresh.get::<String>("user").expect("user"), "ada");
+        assert!(fresh.get::<Value>("_exp").expect("get").is_nil());
+
+        // At and after the expiry: empty, as if no cookie had been sent.
+        let stale = lua.create_table().expect("table");
+        load_into(&lua, &stale, &json, 1_003_600).expect("load");
+        assert_eq!(stale.len().expect("len"), 0);
+
+        // Without `max_age` nothing is written and nothing expires.
+        let forever = serialize(&session, None, 1_000_000).expect("serialize");
+        assert!(!forever.contains("_exp"), "got: {forever}");
+
+        // A cleared session with `max_age` is still `{}`, so `save`
+        // deletes the cookie instead of issuing one that holds an expiry.
+        let empty = lua.create_table().expect("table");
+        assert_eq!(serialize(&empty, Some(3600), 0).expect("serialize"), "{}");
+
+        // A script cannot set the marker itself.
+        session.set("_exp", 1).expect("set");
+        let err = serialize(&session, None, 0).expect_err("reserved");
+        assert!(err.to_string().contains("reserved"), "got: {err}");
     }
 }

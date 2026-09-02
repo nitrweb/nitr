@@ -133,8 +133,16 @@ pub(crate) fn build_response(
                 Error::Script("the response `cookies` field is not a cookie builder".into())
             })?;
             for value in cookies.values() {
-                let value = HeaderValue::from_str(&value)
-                    .map_err(|_| Error::Script(format!("invalid Set-Cookie value `{value}`")))?;
+                // The name only: the value is a signed session payload or
+                // a CSRF token, and this message reaches the error log and
+                // the development error page.
+                let value = HeaderValue::from_str(&value).map_err(|_| {
+                    let name = value.split('=').next().unwrap_or_default();
+                    Error::Script(format!(
+                        "invalid Set-Cookie value for cookie `{name}` (a control character \
+                         in one of its attributes?)"
+                    ))
+                })?;
                 resp.headers_mut().append(hyper::header::SET_COOKIE, value);
             }
         }

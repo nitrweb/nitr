@@ -36,11 +36,22 @@ async fn main() -> nitr::Result {
 
     let mut cfg = Config::default();
     // This example fetches its own endpoints over loopback, which the
-    // SSRF policy refuses by default.
+    // SSRF policy refuses by default — so the allow-list is what refuses
+    // everything else, and the upstream base is handed to the script via
+    // its configuration rather than read from the `Host` header.
     cfg.fetch.allow_private_networks = true;
+    cfg.fetch.allowed_hosts = Some(vec!["127.0.0.1".into()]);
+    let upstream = format!("http://127.0.0.1:{port}");
 
     Server::builder()
         .config(cfg)
+        // `nitr.ext.example.upstream`: the base URL the dashboard fetches
+        // from, decided here rather than read from the request.
+        .module("example", move |lua| {
+            let t = lua.create_table()?;
+            t.set("upstream", upstream.as_str())?;
+            Ok(t)
+        })
         .listen(([127, 0, 0, 1], port).into())
         .handler_script("crates/nitr/examples/aggregate/app.lua")
         .config_script("crates/nitr/examples/aggregate/config.lua")

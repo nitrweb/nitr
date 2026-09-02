@@ -113,7 +113,9 @@ end)
 -- there is no second lookup for a malicious DNS server to answer
 -- differently.
 app:get("/ssrf", function(req)
-    local target = req.query.url or "http://169.254.169.254/latest/meta-data/"
+    -- A fixed target: taking it from the query would make this route a
+    -- port scanner for whatever the allow-list admits.
+    local target = "http://169.254.169.254/latest/meta-data/"
     local ok, err = pcall(function() nitr.fetch("get", target):send() end)
     return nitr.json({ blocked = not ok, err = tostring(err) })
 end)

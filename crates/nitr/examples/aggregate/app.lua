@@ -15,7 +15,11 @@ end)
 -- time is the slower of the two, not their sum. nitr.fetch(...) builds an
 -- unsent request handle; nitr.await_all sends them together.
 app:get("/dashboard", function(req)
-    local base = "http://" .. req.headers.host
+    -- The upstream base comes from configuration, never from the request:
+    -- `req.headers.host` is whatever the client sent, and building a fetch
+    -- target from it turns this handler into an open proxy for any address
+    -- the server can reach.
+    local base = nitr.ext.example.upstream
     local profile, stats = nitr.await_all(
         nitr.fetch("GET", base .. "/api/profile"),
         nitr.fetch("GET", base .. "/api/stats", { timeout = 5 })
@@ -36,6 +40,10 @@ end)
 app:post("/transfer", function(req)
     local from, to = req.query.from, req.query.to
     local amount = tonumber(req.query.amount) or 0
+    -- A negative amount would move money the other way.
+    if amount <= 0 or from == to then
+        return nitr.error(400, { code = "INVALID_TRANSFER" })
+    end
 
     local reason
     local ok = pcall(function()

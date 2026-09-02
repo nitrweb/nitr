@@ -136,13 +136,14 @@ bitflags::bitflags! {
 impl Builtins {
     /// The minimal default feature set enabled when the configuration has
     /// no explicit `[std] features` list: the JSON codec, the HTTP response
-    /// helpers, structured logging, safe time, and validation. These need
-    /// no external resources (templates directory, database file, outbound
-    /// network) and keep the standard library lightweight; everything else
-    /// is opt-in. `time` and `validate` are here because they replace the
-    /// dangerous alternatives (`os.date`, hand-rolled input checks) — a
-    /// default that omitted them would push scripts toward widening the
-    /// sandbox instead.
+    /// helpers, structured logging, safe time, validation, base64, path
+    /// handling, and URL utilities. These need no external resources
+    /// (templates directory, database file, outbound network) and keep the
+    /// standard library lightweight; everything else is opt-in. `time` and
+    /// `validate` are here because they replace the dangerous alternatives
+    /// (`os.date`, hand-rolled input checks) — a default that omitted them
+    /// would push scripts toward widening the sandbox instead; `base64`,
+    /// `path` and `url` are pure string transforms with the same rationale.
     pub const fn minimal() -> Self {
         Self::JSON
             .union(Self::HTTP)

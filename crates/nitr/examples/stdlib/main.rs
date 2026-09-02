@@ -22,7 +22,7 @@
 //! curl 'http://127.0.0.1:3000/utils'
 //! ```
 
-use nitr::{Builtins, Server};
+use nitr::{Builtins, Config, Server};
 
 #[tokio::main]
 async fn main() -> nitr::Result {
@@ -39,7 +39,17 @@ async fn main() -> nitr::Result {
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
 
+    // `/password` runs argon2id on whatever is posted: tens of
+    // milliseconds and ~19 MiB per call, outside the Lua budget. Left
+    // unthrottled that is a CPU and memory amplifier anyone can drive, so
+    // the example enables the rate limiter the way a login endpoint must.
+    let mut cfg = Config::default();
+    cfg.rate_limit.enabled = true;
+    cfg.rate_limit.requests = 30;
+    cfg.rate_limit.window = 60;
+
     Server::builder()
+        .config(cfg)
         .listen(([127, 0, 0, 1], port).into())
         .handler_script("crates/nitr/examples/stdlib/app.lua")
         .builtins(Builtins::minimal() | Builtins::LOG | Builtins::CRYPTO)

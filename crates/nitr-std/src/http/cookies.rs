@@ -210,6 +210,15 @@ pub(crate) fn build_cookie(
     value: &str,
     opts: Option<&Table>,
 ) -> mlua::Result<String> {
+    // The `cookie` crate serializes without encoding anything, so a value
+    // taken from a request (`res.cookies:set("lang", req.query.lang)`)
+    // could carry `; Domain=.example.com; SameSite=None` straight into the
+    // header. RFC 6265's grammar is enforced here instead: a name is a
+    // token, a value has no separators, and the path/domain attributes
+    // cannot start a new attribute. CRLF is caught again downstream by
+    // the header-value check, but by then the damage is a whole header.
+    check_cookie_name(name)?;
+    check_cookie_value(value)?;
     let mut builder = cookie::Cookie::build((name.to_owned(), value.to_owned()));
     let explicit_secure = match opts {
         Some(opts) => opts.get::<Option<bool>>("secure")?,
@@ -223,9 +232,11 @@ pub(crate) fn build_cookie(
             builder = builder.http_only(true);
         }
         if let Some(path) = opts.get::<Option<String>>("path")? {
+            check_cookie_attribute("path", &path)?;
             builder = builder.path(path);
         }
         if let Some(domain) = opts.get::<Option<String>>("domain")? {
+            check_cookie_attribute("domain", &domain)?;
             builder = builder.domain(domain);
         }
         if let Some(secs) = opts.get::<Option<i64>>("max_age")? {
@@ -245,6 +256,54 @@ pub(crate) fn build_cookie(
         }
     }
     Ok(builder.build().to_string())
+}
+
+/// RFC 6265 `token`: printable ASCII minus the separators.
+fn check_cookie_name(name: &str) -> mlua::Result<()> {
+    const SEPARATORS: &[u8] = b"()<>@,;:\\\"/[]?={} \t";
+    let ok = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && !SEPARATORS.contains(&b));
+    if ok {
+        Ok(())
+    } else {
+        Err(mlua::Error::RuntimeError(format!(
+            "invalid cookie name {name:?}: a name is one or more ASCII characters other \
+             than controls, whitespace and ()<>@,;:\\\"/[]?={{}}"
+        )))
+    }
+}
+
+/// RFC 6265 `cookie-octet`: no controls, whitespace, quotes, commas,
+/// semicolons or backslashes. Values that need those are the caller's to
+/// encode (base64 or percent-encoding) — signed cookies already are.
+fn check_cookie_value(value: &str) -> mlua::Result<()> {
+    let ok = value
+        .bytes()
+        .all(|b| b.is_ascii_graphic() && !matches!(b, b'"' | b',' | b';' | b'\\'));
+    if ok {
+        Ok(())
+    } else {
+        Err(mlua::Error::RuntimeError(
+            "invalid cookie value: values may not contain controls, whitespace, quotes, \
+             commas, semicolons or backslashes — encode it first (nitr.base64, or a signed \
+             cookie)"
+                .into(),
+        ))
+    }
+}
+
+/// `Path`/`Domain` attribute values: anything printable except `;`, which
+/// would start a new attribute.
+fn check_cookie_attribute(attr: &str, value: &str) -> mlua::Result<()> {
+    if value.bytes().all(|b| b.is_ascii_graphic() && b != b';') {
+        Ok(())
+    } else {
+        Err(mlua::Error::RuntimeError(format!(
+            "invalid cookie {attr} {value:?}: controls, whitespace and ';' are not allowed"
+        )))
+    }
 }
 
 /// Encodes and signs a cookie value: `b64(value) . b64(hmac)`, with the
@@ -383,6 +442,39 @@ mod tests {
             "None",
             "same_site is deliberately overridable"
         );
+    }
+
+    /// A value or attribute taken from a request cannot smuggle further
+    /// attributes into the header.
+    #[test]
+    fn cookie_parts_that_would_inject_attributes_are_refused() {
+        let lua = mlua::Lua::new();
+        for (name, value) in [
+            ("lang", "en; Domain=.example.com; SameSite=None"),
+            ("lang", "a b"),
+            ("lang", "x\"y"),
+            ("lang", "a,b"),
+            ("lang", "back\\slash"),
+            ("bad name", "v"),
+            ("bad=name", "v"),
+            ("", "v"),
+        ] {
+            let err = build_cookie(&lua, name, value, None).expect_err("injection");
+            assert!(
+                err.to_string().contains("invalid cookie"),
+                "{name}={value}: {err}"
+            );
+        }
+        for attr in ["path", "domain"] {
+            let opts = lua.create_table().expect("table");
+            opts.set(attr, "/x; Secure").expect("set");
+            let err = build_cookie(&lua, "n", "v", Some(&opts)).expect_err(attr);
+            assert!(err.to_string().contains(attr), "{err}");
+        }
+        // Ordinary and signed values pass, including base64url alphabet.
+        for value in ["", "abc", "a-b_c.d~e=", "ZmZm.YWJj"] {
+            build_cookie(&lua, "ok", value, None).expect("plain value");
+        }
     }
 
     #[test]

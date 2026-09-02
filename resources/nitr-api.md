@@ -72,9 +72,9 @@ Debug-prints a value (structure included) to the log; returns it unchanged.
 
 An outbound HTTP request (SSRF-guarded, redirect-checked). Options: `headers`, `query`, `json`, `body`, `timeout`, `retry`. Returns an unsent handle.
 
-### `nitr.await_all(handles) -> table` (std feature: `fetch`)
+### `nitr.await_all(...) -> ...` (std feature: `fetch`)
 
-Runs fetch handles (and `db:query_async` handles) concurrently; returns their results in order.
+Runs fetch handles (and `db:query_async` handles) concurrently, passed as separate arguments (`nitr.await_all(h1, h2)`), and returns their results as multiple values in the same order. Capped by `[fetch] max_concurrent`.
 
 ### `nitr.template` (std feature: `template`)
 
@@ -88,8 +88,8 @@ The SQLite database (`database` in nitr.toml): WAL, busy timeout, foreign keys o
 
 - `nitr.db:execute(sql, params) -> integer` — Runs a statement.
 - `nitr.db:query(sql, params) -> table[]` — All rows, each a column→value table.
-- `nitr.db:query_row(sql, params) -> table|nil` — The first row, or nil.
-- `nitr.db:query_one(sql, params) -> any` — The first column of the first row.
+- `nitr.db:query_row(sql, params) -> table|nil` — The first row as a column→value table, or nil when the query returns no rows.
+- `nitr.db:query_one(sql, params) -> table` — The row of a query that must return exactly one row (a column→value table); raises when it returns none or more than one.
 - `nitr.db:transaction(fn) -> any` — Runs `fn` atomically; rolls back on error. Nestable (savepoints). Use `tx`, not the outer `nitr.db`.
 - `nitr.db:query_async(sql, params, kind) -> table` — An unsent query to run alongside fetches.
 
@@ -136,10 +136,10 @@ HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list
 The bounded TTL+LRU cache shared by every state. Entries are plain data; per-process, so not a session store.
 
 - `nitr.cache:get(key) -> any` — The cached value, or nil.
-- `nitr.cache:set(key, value, ttl)` — Stores a value (ttl in seconds).
-- `nitr.cache:delete(key)` — Removes a key.
+- `nitr.cache:set(key, value, opts)` — Stores a value; `opts` is `{ ttl = seconds }`.
+- `nitr.cache:delete(key) -> boolean` — Removes a key; whether it was there.
 - `nitr.cache:clear()` — Empties the cache.
-- `nitr.cache:remember(key, ttl, fn) -> any` — The cached value, or `fn()`'s result, stored and returned.
+- `nitr.cache:remember(key, opts, fn) -> any` — The cached value, or `fn()`'s result, stored and returned. Call as `remember(key, fn)` or `remember(key, { ttl = seconds }, fn)`.
 - `nitr.cache:stats() -> table` — Hit/miss/entry counters.
 
 ### `nitr.time` (std feature: `time`)
@@ -195,7 +195,7 @@ Read-only environment variable access. Opt-in; reads are filtered by `[env] allo
 - `nitr.env.get(name, default) -> string|nil` — Reads one variable.
 - `nitr.env.has(name) -> boolean` — Whether the variable is set and readable; a policy-hidden name reports false.
 - `nitr.env.number(name, default) -> number|nil` — Reads and parses a number; unset or unparseable answers the default.
-- `nitr.env.bool(name, default) -> boolean|nil` — Reads a flag: 1/true/yes/on and 0/false/no/off (any case); anything else answers the default.
+- `nitr.env.bool(name, default) -> boolean|nil` — Reads a flag: 1/true/yes/on and 0/false/no/off (any case); empty means false, anything else answers the default.
 
 ### `nitr.test` (available in `nitr test` files)
 
@@ -280,12 +280,13 @@ The application: routes, middleware, error handling, static mounts. Return it fr
 
 One part of a multipart upload, delivered to the `req:multipart` callback.
 
-- `name: string|nil` — Form field name.
-- `filename: string|nil` — Client-supplied file name.
+- `name: string` — Form field name (`""` when the part carries none).
+- `filename: string|nil` — Client-supplied file name, raw; nil for an ordinary field.
+- `safe_filename: string|nil` — `filename` reduced to a single safe path segment; nil exactly when `filename` is.
 - `content_type: string|nil` — Part content type.
 - `:text() -> string` — Reads a non-file field as a string (bounded by `[limits] max_field_bytes`).
 - `:save(path) -> integer` — Streams a file part to `path` without entering the Lua heap; returns the bytes written.
-- `:discard()` — Drains and drops the part.
+- `:discard() -> integer` — Drains and drops the part; returns the bytes skipped.
 
 ### `nitr.FetchHandle`
 

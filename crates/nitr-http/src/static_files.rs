@@ -44,6 +44,8 @@ pub struct StaticMount {
     pub(crate) spa: bool,
     /// Explicit `Cache-Control` header value for served files.
     pub(crate) cache_control: Option<String>,
+    /// Serve files and directories whose name starts with `.`.
+    pub(crate) dotfiles: bool,
 }
 
 impl StaticMount {
@@ -66,7 +68,17 @@ impl StaticMount {
             dir: dir.into(),
             spa,
             cache_control,
+            dotfiles: false,
         }
+    }
+
+    /// Whether dotfiles are served (default: no). `.env`, `.git/`,
+    /// `.htpasswd` and their kind are exactly what lands in a served
+    /// directory by accident, and nothing a browser needs starts with a
+    /// dot — except `.well-known/`, which is always served.
+    pub fn dotfiles(mut self, allow: bool) -> Self {
+        self.dotfiles = allow;
+        self
     }
 
     /// The request path relative to this mount, when it applies.
@@ -90,12 +102,15 @@ pub(crate) fn base_mounts(cfg: &crate::config::Config) -> Vec<StaticMount> {
         .dir
         .as_ref()
         .map(|dir| {
-            vec![StaticMount::new(
-                cfg.static_files.mount.clone().unwrap_or_else(|| "/".into()),
-                dir.clone(),
-                cfg.static_files.spa,
-                cfg.static_files.cache_control.clone(),
-            )]
+            vec![
+                StaticMount::new(
+                    cfg.static_files.mount.clone().unwrap_or_else(|| "/".into()),
+                    dir.clone(),
+                    cfg.static_files.spa,
+                    cfg.static_files.cache_control.clone(),
+                )
+                .dotfiles(cfg.static_files.dotfiles),
+            ]
         })
         .unwrap_or_default()
 }
@@ -124,7 +139,7 @@ pub(crate) async fn try_serve(
 
     for mount in candidates {
         let rel = mount.relative(&decoded)?;
-        let Some(file) = resolve(&mount.dir, rel).await else {
+        let Some(file) = resolve_in(mount, rel).await else {
             // Unknown path inside an SPA mount falls back to its index.
             if mount.spa
                 && let Some(index) = resolve(&mount.dir, "index.html").await
@@ -136,6 +151,28 @@ pub(crate) async fn try_serve(
         return Some(serve_file(req, mount, &file, compression).await);
     }
     None
+}
+
+/// [`resolve`] under a mount's dotfile policy: a path with a `.`-prefixed
+/// component is refused before the filesystem is consulted, unless the
+/// mount serves dotfiles or the path is under `.well-known/`.
+async fn resolve_in(mount: &StaticMount, rel: &str) -> Option<PathBuf> {
+    let rel_path = rel.trim_start_matches('/');
+    let hidden = rel_path
+        .split(['/', '\\'])
+        .any(|segment| segment.starts_with('.'));
+    if hidden && !mount.dotfiles && !is_well_known(rel_path) {
+        return None;
+    }
+    resolve(&mount.dir, rel).await
+}
+
+/// Whether the path is `.well-known` or inside it, with nothing else in
+/// it hidden (`.well-known/.secret` is refused; `.well-known/../.env` is
+/// a `..`, refused by the lexical rule anyway).
+fn is_well_known(rel: &str) -> bool {
+    let mut segments = rel.split(['/', '\\']);
+    segments.next() == Some(".well-known") && segments.all(|s| !s.starts_with('.'))
 }
 
 /// The traversal defense as one call, for the `static_resolve` fuzz
@@ -154,7 +191,7 @@ pub async fn resolve_for_fuzzing(mount: &StaticMount, url_path: &str) -> Option<
         .decode_utf8()
         .ok()?;
     let rel = mount.relative(&decoded)?;
-    resolve(&mount.dir, rel).await
+    resolve_in(mount, rel).await
 }
 
 /// Resolves a relative URL path to a regular file inside `dir`, or `None`
@@ -381,7 +418,10 @@ async fn stream_file(
         let mut remaining = count;
         let mut buf = vec![0u8; FILE_CHUNK];
         while remaining > 0 {
-            let want = (remaining as usize).min(FILE_CHUNK);
+            // Clamp in `u64` first: on a 32-bit target `remaining as usize`
+            // truncates, and a > 4 GiB span could clamp to a zero-length
+            // read that ends the stream short of its `Content-Length`.
+            let want = remaining.min(FILE_CHUNK as u64) as usize;
             match file.read(&mut buf[..want]).await {
                 Ok(0) => break,
                 Ok(n) => {
@@ -519,6 +559,39 @@ mod tests {
             );
         }
         assert_eq!(resolve(&dir, "missing.txt").await, None);
+    }
+
+    /// Dotfiles are refused by default, `.well-known/` excepted, and a
+    /// mount can opt in.
+    #[tokio::test]
+    async fn dotfiles_are_hidden_unless_the_mount_says_otherwise() {
+        let root = TestRoot::new("dotfiles");
+        let dir = root.path.join("mount");
+        std::fs::create_dir_all(dir.join(".git")).expect("mkdir");
+        std::fs::create_dir_all(dir.join(".well-known/acme-challenge")).expect("mkdir");
+        std::fs::write(dir.join(".env"), b"SECRET=1").expect("write");
+        std::fs::write(dir.join(".git/config"), b"[core]").expect("write");
+        std::fs::write(dir.join(".well-known/acme-challenge/token"), b"ok").expect("write");
+        std::fs::write(dir.join(".well-known/.hidden"), b"no").expect("write");
+        std::fs::write(dir.join("index.html"), b"<p>").expect("write");
+
+        let mount = StaticMount::new("/", &dir, false, None);
+        for hidden in [".env", ".git/config", "/.env", ".well-known/.hidden"] {
+            assert_eq!(
+                resolve_in(&mount, hidden).await,
+                None,
+                "{hidden} must be hidden"
+            );
+        }
+        assert!(
+            resolve_in(&mount, ".well-known/acme-challenge/token")
+                .await
+                .is_some()
+        );
+        assert!(resolve_in(&mount, "index.html").await.is_some());
+
+        let open = StaticMount::new("/", &dir, false, None).dotfiles(true);
+        assert!(resolve_in(&open, ".env").await.is_some());
     }
 
     /// Symlink policy: a link whose canonical target leaves the mount is

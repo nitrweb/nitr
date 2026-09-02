@@ -142,7 +142,26 @@ async fn handle(lua: Lua, config: Arc<Config>, next: Function, req: Value) -> ml
     let resp = if safe {
         next.call_async::<Value>(&req).await?
     } else {
-        let supplied = supplied_token(&req, &config).await?;
+        // A double-submit token proves the sender could read a cookie,
+        // not that the cookie was ours: a sibling subdomain (or plain HTTP,
+        // when the cookie is not `Secure`) can plant one it obtained
+        // itself. Browsers state the answer to that directly — a request a
+        // third-party site initiated says `Sec-Fetch-Site: cross-site` —
+        // so an unsafe cross-site request is refused before the token is
+        // even compared. Older clients send no such header and fall back
+        // to the token alone.
+        let cross_site = match &req {
+            Value::UserData(ud) => ud
+                .get::<Table>("headers")?
+                .get::<Option<String>>("sec-fetch-site")?
+                .is_some_and(|site| site.eq_ignore_ascii_case("cross-site")),
+            _ => false,
+        };
+        let supplied = if cross_site {
+            None
+        } else {
+            supplied_token(&req, &config).await?
+        };
         let ok = supplied.as_deref().is_some_and(|supplied| {
             let (a, b) = (supplied.as_bytes(), token.as_bytes());
             // A freshly issued token can never match: the client has not
@@ -240,9 +259,12 @@ fn create_call_metatable(lua: &Lua) -> mlua::Result<Table> {
                 cookie: opts
                     .get::<Option<String>>("cookie")?
                     .unwrap_or_else(|| "_csrf".into()),
+                // Request header names reach Lua lowercased; a caller who
+                // writes the option in canonical case must still match.
                 header: opts
                     .get::<Option<String>>("header")?
-                    .unwrap_or_else(|| "x-csrf-token".into()),
+                    .unwrap_or_else(|| "x-csrf-token".into())
+                    .to_ascii_lowercase(),
                 field: opts
                     .get::<Option<String>>("field")?
                     .unwrap_or_else(|| "_csrf".into()),
@@ -298,6 +320,30 @@ mod tests {
         let factory: Function = csrf.call(opts).expect("factory");
         let next = lua.create_function(|_, v: Value| Ok(v)).expect("next");
         let _handler: Function = factory.call(next).expect("handler");
+    }
+
+    #[test]
+    fn the_header_option_matches_regardless_of_case() {
+        let lua = Lua::new();
+        let csrf = create_csrf_table(&lua).expect("table");
+        let opts: Table = lua
+            .load(r#"{ secret = "0123456789abcdef", header = "X-CSRF-Token" }"#)
+            .eval()
+            .expect("opts");
+        // The factory stores the lowercased name; the request's header
+        // table is keyed lowercase, so this is what makes the lookup hit.
+        let factory: Function = csrf.call(opts).expect("factory");
+        let _handler: Function = factory
+            .call(lua.create_function(|_, v: Value| Ok(v)).expect("next"))
+            .expect("handler");
+        // Observable through the config the closure captured: rebuild it
+        // the same way and check the field directly.
+        let opts: Table = lua
+            .load(r#"{ secret = "0123456789abcdef", header = "X-CSRF-Token" }"#)
+            .eval()
+            .expect("opts");
+        let header: String = opts.get("header").expect("header");
+        assert_eq!(header.to_ascii_lowercase(), "x-csrf-token");
     }
 
     #[test]

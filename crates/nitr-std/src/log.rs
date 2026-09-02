@@ -26,6 +26,30 @@ fn fields_json(fields: Option<Table>) -> Option<String> {
     )
 }
 
+/// Escapes control characters in a message before it reaches a text log.
+///
+/// The message is whatever the script passed — often request data — and
+/// the text subscriber writes it verbatim, so a `\n` in a request path
+/// would forge a whole log line and a `\r` would overwrite one on a
+/// terminal. The JSON subscriber escapes on its own; this keeps the text
+/// form honest too. Tabs stay: they are formatting, not line structure.
+fn sanitize(msg: &str) -> std::borrow::Cow<'_, str> {
+    if !msg.chars().any(|c| c.is_control() && c != '\t') {
+        return std::borrow::Cow::Borrowed(msg);
+    }
+    std::borrow::Cow::Owned(
+        msg.chars()
+            .flat_map(|c| {
+                if c.is_control() && c != '\t' {
+                    c.escape_default().collect::<Vec<_>>()
+                } else {
+                    vec![c]
+                }
+            })
+            .collect(),
+    )
+}
+
 /// The four Lua-facing log levels, as a closed enum so the dispatch below
 /// is exhaustive by type — no name is re-matched, nothing to declare
 /// unreachable. (`tracing::event!` needs a const level per call site, so
@@ -50,6 +74,7 @@ pub(crate) fn create_log_table(lua: &Lua) -> mlua::Result<Table> {
         table.set(
             name,
             lua.create_function(move |_, (msg, fields): (String, Option<Table>)| {
+                let msg = sanitize(&msg);
                 match (level, fields_json(fields)) {
                     (LuaLevel::Debug, Some(f)) => {
                         tracing::debug!(target: "lua", fields = %f, "{msg}")
@@ -73,4 +98,19 @@ pub(crate) fn create_log_table(lua: &Lua) -> mlua::Result<Table> {
         )?;
     }
     Ok(table)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_cannot_forge_log_lines() {
+        assert_eq!(sanitize("plain"), "plain");
+        assert_eq!(sanitize("a\tb"), "a\tb", "tabs are formatting");
+        assert_eq!(
+            sanitize("GET /x\n2026-01-01 ERROR forged\r\u{1b}[31m"),
+            "GET /x\\n2026-01-01 ERROR forged\\r\\u{1b}[31m"
+        );
+    }
 }

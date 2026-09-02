@@ -45,8 +45,51 @@ fn collect_outcomes(lua: &mlua::Lua) -> anyhow::Result<Vec<TestOutcome>> {
     Ok(out)
 }
 
-pub(crate) async fn run_tests(cfg: Config, filter: Option<&str>) -> anyhow::Result<usize> {
+/// A per-run test database, removed (with its WAL sidecars) when the run
+/// ends.
+struct ScratchDb(PathBuf);
+
+impl Drop for ScratchDb {
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = self.0.as_os_str().to_os_string();
+            name.push(suffix);
+            let _ = std::fs::remove_file(name);
+        }
+    }
+}
+
+pub(crate) async fn run_tests(mut cfg: Config, filter: Option<&str>) -> anyhow::Result<usize> {
     let tests_dir = cfg.testing.dir.clone();
+    // Never the configured database: see `TestingConfig::database`. The
+    // private file gets the migrations the live one would have, so a test
+    // sees the schema and not an empty file.
+    let _scratch = match &mut cfg.database {
+        Some(db) => {
+            let path = match &cfg.testing.database {
+                Some(path) => path.clone(),
+                None => std::env::temp_dir().join(format!(
+                    "nitr-test-{}-{:x}.db",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_nanos())
+                )),
+            };
+            db.path = path.clone();
+            #[cfg(feature = "db")]
+            if let Some(dir) = db.migrations()
+                && dir.is_dir()
+            {
+                let conn = nitr::stdlib::db_open(&db.path, &db.pragmas())?;
+                nitr::stdlib::migrate::run(&conn, &dir).with_context(|| {
+                    format!("cannot migrate the test database {}", path.display())
+                })?;
+            }
+            cfg.testing.database.is_none().then_some(ScratchDb(path))
+        }
+        None => None,
+    };
     let mut files: Vec<PathBuf> = std::fs::read_dir(&tests_dir)
         .with_context(|| format!("cannot read the tests directory {}", tests_dir.display()))?
         .filter_map(|entry| entry.ok().map(|e| e.path()))

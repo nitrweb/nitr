@@ -155,6 +155,11 @@ app:post("/register", function(req)
     if #body.password > nitr.crypto.max_password_bytes then
         return nitr.json({ error = "password too long" }, 400)
     end
+    -- An existing account is not overwritten: otherwise anyone could
+    -- re-register a known user with a password of their choosing.
+    if users[body.user] then
+        return nitr.json({ error = "user already exists" }, 409)
+    end
     users[body.user] = nitr.crypto.password_hash(body.password)
     -- In-memory, and therefore per pooled Lua state: a real application
     -- writes the hash to the database instead. Nothing else changes.
