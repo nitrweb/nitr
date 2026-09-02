@@ -96,6 +96,12 @@ pub struct SqlitePragmas {
     pub foreign_keys: bool,
     /// `cache_size` per connection; negative values are KiB.
     pub cache_size: i64,
+    /// Most rows one `query` may return. A result past it is an error,
+    /// not a truncation: every row is materialized into memory on the
+    /// blocking thread and then copied into the Lua state, so an unbounded
+    /// `SELECT *` (or an attacker-chosen `LIMIT` a handler interpolated)
+    /// was a memory amplifier with no ceiling.
+    pub max_rows: usize,
 }
 
 impl Default for SqlitePragmas {
@@ -106,6 +112,7 @@ impl Default for SqlitePragmas {
             synchronous: "normal".into(),
             foreign_keys: true,
             cache_size: -2_000,
+            max_rows: 10_000,
         }
     }
 }

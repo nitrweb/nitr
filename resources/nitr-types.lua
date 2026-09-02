@@ -74,7 +74,7 @@ local Response = {}
 ---@class nitr.ResponseCookies
 local ResponseCookies = {}
 
----Adds a cookie. Options: `http_only`, `secure`, `path`, `domain`, `max_age` (seconds), `same_site` ("Strict"/"Lax"/"None").
+---Adds a cookie. The name must be an RFC 6265 token and the value a cookie-octet string (no whitespace, quotes, commas, semicolons or backslashes — encode with `nitr.base64` or a signed cookie first); anything else raises. Options: `http_only`, `secure`, `path`, `domain`, `max_age` (seconds), `same_site` ("Strict"/"Lax"/"None").
 ---@param name string
 ---@param value string
 ---@param opts? table
@@ -134,7 +134,7 @@ function App:use(mw) end
 ---@param handler fun(err: table, req: nitr.Request): nitr.Response|table
 function App:on_error(handler) end
 
----Mounts a static directory, served in Rust. Options: `{ spa = boolean, cache_control = string }`.
+---Mounts a static directory, served in Rust. Options: `{ spa = boolean, cache_control = string, dotfiles = boolean }` — dotfiles are hidden unless `dotfiles = true` (`.well-known/` is always served).
 ---@param mount string
 ---@param dir string
 ---@param opts? table
@@ -274,7 +274,7 @@ function nitr.error(code, body) end
 ---@return string
 function nitr.etag(value, weak) end
 
----As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field). Options: `secret` (required), `cookie` (the cookie NAME, default `_csrf`), `header`, `field`, and `cookie_opts` (the cookie ATTRIBUTES, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set). Note `nitr.session` spells its attribute table `cookie` — here that key is the name. (std feature: `http`)
+---As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field). Options: `secret` (required), `cookie` (the cookie NAME, default `_csrf`), `header`, `field`, and `cookie_opts` (the cookie ATTRIBUTES, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set). Note `nitr.session` spells its attribute table `cookie` — here that key is the name. Unsafe requests a browser marks `Sec-Fetch-Site: cross-site` are refused before the token is checked, unless `cookie_opts.same_site = "None"` (the setting that means to accept cross-site posts). (std feature: `http`)
 ---@class nitr.csrf
 ---@overload fun(opts: table): fun
 nitr.csrf = {}
@@ -319,7 +319,7 @@ function nitr.await_all(...) end
 ---The minijinja template engine, loading from `[templating] dir`. (std feature: `template`)
 nitr.template = {}
 
----Renders a template.
+---Renders a template. HTML auto-escaping is on unless the name (before any `.j2`) ends in a plain-text extension (`.txt`, `.md`, `.csv`, `.json`, `.yaml`, `.toml`). Loading and rendering happen off the async worker.
 ---@param name string
 ---@param data? table
 ---@return string
@@ -334,7 +334,7 @@ nitr.db = {}
 ---@return integer _ Affected row count.
 function nitr.db:execute(sql, params) end
 
----All rows, each a column→value table.
+---All rows, each a column→value table. A result larger than `[database] max_rows` (default 10000) raises rather than truncating.
 ---@param sql string
 ---@param params? table
 ---@return table[]

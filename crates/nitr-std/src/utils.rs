@@ -74,10 +74,23 @@ pub(crate) const MAX_JSON_NODES: usize = 1_000_000;
 /// hanging.
 pub(crate) fn check_json_bounds(value: &Value) -> mlua::Result<()> {
     let mut budget = MAX_JSON_NODES;
-    depth_walk(value, MAX_JSON_DEPTH, &mut budget)
+    depth_walk(value, MAX_JSON_DEPTH, &mut budget, true)
 }
 
-fn depth_walk(value: &Value, remaining: usize, budget: &mut usize) -> mlua::Result<()> {
+/// [`check_json_bounds`] without the UTF-8 rule, for renderers that show
+/// bytes as bytes (`nitr.dbg`'s `{:#?}`, the log placeholder path): a
+/// binary field is a legitimate thing to debug-print.
+pub(crate) fn check_value_bounds(value: &Value) -> mlua::Result<()> {
+    let mut budget = MAX_JSON_NODES;
+    depth_walk(value, MAX_JSON_DEPTH, &mut budget, false)
+}
+
+fn depth_walk(
+    value: &Value,
+    remaining: usize,
+    budget: &mut usize,
+    strict_utf8: bool,
+) -> mlua::Result<()> {
     // Charged for every visit, scalars included, and a shared subtree
     // counted once per path that reaches it — because that is what the
     // serializer will do too.
@@ -93,12 +106,13 @@ fn depth_walk(value: &Value, remaining: usize, budget: &mut usize) -> mlua::Resu
     // to `nitr.crypto.random_bytes(16)` came back on the next request as a
     // table of sixteen integers, with no error at save time. Refuse it
     // here, where every serializer already passes through.
-    if let Value::String(s) = value
+    if strict_utf8
+        && let Value::String(s) = value
         && s.to_str().is_err()
     {
         return Err(mlua::Error::RuntimeError(
             "json value contains a string that is not valid UTF-8: encode binary data \
-             first (nitr.base64.encode or nitr.crypto.hex)"
+             first (nitr.base64.encode)"
                 .into(),
         ));
     }
@@ -113,8 +127,8 @@ fn depth_walk(value: &Value, remaining: usize, budget: &mut usize) -> mlua::Resu
     // Raw iteration, matching what serialization will walk; keys can be
     // tables too, and a deep key must not slip past the check.
     table.for_each(|key: Value, item: Value| {
-        depth_walk(&key, remaining - 1, budget)?;
-        depth_walk(&item, remaining - 1, budget)
+        depth_walk(&key, remaining - 1, budget, strict_utf8)?;
+        depth_walk(&item, remaining - 1, budget, strict_utf8)
     })
 }
 
@@ -166,7 +180,7 @@ pub(crate) fn dag_table(lua: &Lua, levels: usize) -> Value {
 /// diagnose is worse than one that says it could not render.
 pub(crate) fn create_debug_fn(lua: &Lua) -> mlua::Result<Function> {
     lua.create_function(|_, value: Value| {
-        if let Err(err) = check_json_bounds(&value) {
+        if let Err(err) = check_value_bounds(&value) {
             tracing::debug!("[lua] <value not rendered: {err}>");
             return Ok(());
         }
@@ -330,10 +344,12 @@ mod tests {
         let err = check_json_bounds(&Value::String(raw.clone())).expect_err("binary");
         assert!(err.to_string().contains("UTF-8"), "got: {err}");
         let nested = lua.create_table().expect("table");
-        nested.set("k", raw).expect("set");
+        nested.set("k", raw.clone()).expect("set");
         assert!(check_json_bounds(&Value::Table(nested)).is_err());
         let text = lua.create_string("caf\u{e9}").expect("string");
         check_json_bounds(&Value::String(text)).expect("UTF-8 passes");
+        // The debug renderer shows bytes as bytes and keeps accepting them.
+        check_value_bounds(&Value::String(raw)).expect("dbg accepts binary");
     }
 
     #[test]

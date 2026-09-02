@@ -55,9 +55,11 @@ pub struct Server {
     /// The shared `nitr.cache`, held here so a reload hands the new pool
     /// the same storage rather than starting cold.
     cache: Option<nitr_std::Cache>,
-    /// Set while a pool rebuild is running on its own task, so a second
-    /// `SIGHUP` in the meantime coalesces instead of building twice.
-    reloading: Arc<AtomicBool>,
+    /// The pool rebuild's state: [`RELOAD_IDLE`], [`RELOAD_RUNNING`], or
+    /// [`RELOAD_PENDING`] (running, and another was asked for meanwhile —
+    /// the task runs once more when it finishes, so a save or a `SIGHUP`
+    /// that lands mid-rebuild is never lost).
+    reloading: Arc<std::sync::atomic::AtomicU8>,
     /// The TLS acceptor built from `[tls] cert`/`key`, or `None` on a
     /// plaintext listener. Built in [`ServerBuilder::build`] — so a
     /// broken pair fails the build rather than every handshake on an
@@ -127,13 +129,25 @@ impl Server {
     /// configuration script — seconds, on a large pool with a script that
     /// opens a database — and it used to run inline in the accept loop's
     /// `select!`, during which no connection was accepted and a `SIGTERM`
-    /// went unanswered. A reload requested while one is running is
-    /// coalesced: the running one already reads the current files.
+    /// went unanswered. A reload requested while one is running marks it
+    /// pending, and the task rebuilds once more when it finishes: the
+    /// running rebuild read the scripts before the second request came,
+    /// so dropping that request would lose the edit it carried.
     fn reload(&self) {
         #[cfg(feature = "tls")]
         self.reload_tls();
-        if self.reloading.swap(true, Ordering::AcqRel) {
-            tracing::info!("reload requested while one is in progress; coalescing");
+        if self
+            .reloading
+            .compare_exchange(
+                RELOAD_IDLE,
+                RELOAD_RUNNING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            self.reloading.store(RELOAD_PENDING, Ordering::Release);
+            tracing::info!("reload requested while one is in progress; it will run again");
             return;
         }
         tracing::info!("reload requested: rebuilding the runtime pool");
@@ -143,26 +157,39 @@ impl Server {
         let modules = self.modules.clone();
         let cache = self.cache.clone();
         let pool = self.pool.clone();
-        let reloading = self.reloading.clone();
+        let state = self.reloading.clone();
         tokio::spawn(async move {
-            match build_runtimes(&cfg, builtins, &setup_fns, &modules, cache.as_ref()).await {
-                Ok(runtimes) => {
-                    let fresh = Arc::new(new_pool(
-                        runtimes, &cfg, builtins, &setup_fns, &modules, cache,
-                    ));
-                    match pool.write() {
-                        Ok(mut pool) => {
-                            *pool = fresh;
-                            tracing::info!("reload complete: new runtime pool is live");
-                        }
-                        Err(_) => tracing::error!("reload failed: pool lock is poisoned"),
-                    }
+            // Whatever happens below — a panic in an embedder's setup
+            // function included — the state must return to idle, or no
+            // reload would ever run again for the life of the process.
+            let _reset = ReloadReset(state.clone());
+            loop {
+                let rebuild = std::panic::AssertUnwindSafe(rebuild_pool(
+                    &cfg, builtins, &setup_fns, &modules, &cache, &pool,
+                ));
+                if let Err(payload) = futures_util::FutureExt::catch_unwind(rebuild).await {
+                    let message = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".into());
+                    tracing::error!("reload failed: the rebuild panicked: {message}");
                 }
-                Err(err) => {
-                    tracing::error!("reload failed, keeping the current pool: {err}");
+                // Finished. If another request arrived meanwhile, go again.
+                if state
+                    .compare_exchange(
+                        RELOAD_RUNNING,
+                        RELOAD_IDLE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    break;
                 }
+                state.store(RELOAD_RUNNING, Ordering::Release);
+                tracing::info!("running the reload requested during the last rebuild");
             }
-            reloading.store(false, Ordering::Release);
         });
     }
 
@@ -199,6 +226,57 @@ impl Server {
             Err(err) => {
                 tracing::warn!("TLS reload failed, keeping the current certificate: {err}");
             }
+        }
+    }
+}
+
+/// No rebuild in flight.
+const RELOAD_IDLE: u8 = 0;
+/// A rebuild is running.
+const RELOAD_RUNNING: u8 = 1;
+/// A rebuild is running and another was requested while it ran.
+const RELOAD_PENDING: u8 = 2;
+
+/// Returns the reload state to idle when dropped — the rebuild task's
+/// backstop against a panic that would otherwise leave it "running"
+/// forever.
+struct ReloadReset(Arc<std::sync::atomic::AtomicU8>);
+
+impl Drop for ReloadReset {
+    fn drop(&mut self) {
+        self.0.store(RELOAD_IDLE, Ordering::Release);
+    }
+}
+
+/// One rebuild: a complete replacement pool, swapped in on success.
+async fn rebuild_pool(
+    cfg: &Config,
+    builtins: Builtins,
+    setup_fns: &Arc<Vec<SetupFn>>,
+    modules: &Arc<Vec<Module>>,
+    cache: &Option<nitr_std::Cache>,
+    pool: &Arc<RwLock<Arc<RuntimePool>>>,
+) {
+    match build_runtimes(cfg, builtins, setup_fns, modules, cache.as_ref()).await {
+        Ok(runtimes) => {
+            let fresh = Arc::new(new_pool(
+                runtimes,
+                cfg,
+                builtins,
+                setup_fns,
+                modules,
+                cache.clone(),
+            ));
+            match pool.write() {
+                Ok(mut pool) => {
+                    *pool = fresh;
+                    tracing::info!("reload complete: new runtime pool is live");
+                }
+                Err(_) => tracing::error!("reload failed: pool lock is poisoned"),
+            }
+        }
+        Err(err) => {
+            tracing::error!("reload failed, keeping the current pool: {err}");
         }
     }
 }

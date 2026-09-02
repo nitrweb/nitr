@@ -152,10 +152,13 @@ pub(crate) async fn run_tests(mut cfg: Config, filter: Option<&str>) -> anyhow::
         let source = std::fs::read(file)
             .with_context(|| format!("cannot read test file {}", file.display()))?;
         // Named after the real file, so assertion failures point at it.
+        // Text only, like every chunk the runtime compiles: a test file
+        // is no place for unverified bytecode either.
         let chunk = match rt
             .lua()
             .load(source)
             .set_name(format!("@{}", file.display()))
+            .set_mode(mlua::chunk::ChunkMode::Text)
             .into_function()
         {
             Ok(chunk) => chunk,

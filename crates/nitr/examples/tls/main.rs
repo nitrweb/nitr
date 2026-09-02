@@ -66,17 +66,23 @@ fn mint(dir: &std::path::Path) -> std::io::Result<(PathBuf, PathBuf)> {
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
     std::fs::write(&cert_path, generated.cert.pem())?;
-    std::fs::write(&key_path, generated.signing_key.serialize_pem())?;
 
     // A private key readable by every account on the box is a private key
     // in name only. The server does not enforce this — file permissions
     // are the operator's job — but an example that skipped it would be
-    // teaching the wrong habit.
+    // teaching the wrong habit. The mode is set at creation, not after a
+    // write: a write-then-chmod leaves a window where the key sits at the
+    // umask's mercy, and `create_new` refuses a path someone planted.
+    let mut key = std::fs::OpenOptions::new();
+    key.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        key.mode(0o600);
     }
+    use std::io::Write as _;
+    key.open(&key_path)?
+        .write_all(generated.signing_key.serialize_pem().as_bytes())?;
     Ok((cert_path, key_path))
 }
 
@@ -95,8 +101,19 @@ async fn main() -> nitr::Result {
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
 
-    let dir = std::env::temp_dir().join("nitr-example-tls");
-    std::fs::create_dir_all(&dir)
+    // A private per-run directory, never a fixed name in the shared temp
+    // directory: a fixed name is a path another local user can create
+    // first, and this one receives a private key.
+    let dir = std::env::temp_dir().join(format!("nitr-example-tls-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&dir)
         .map_err(|err| nitr::Error::Config(format!("cannot create {}: {err}", dir.display())))?;
     let (cert, key) = mint(&dir).map_err(|err| {
         nitr::Error::Config(format!("cannot write the example certificate: {err}"))

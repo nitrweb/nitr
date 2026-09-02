@@ -53,6 +53,31 @@ struct Config {
     /// The cookie's attributes, **extending** the defaults rather than
     /// replacing them. See [`cookie_opts`].
     cookie_opts: Option<Table>,
+    /// Whether an unsafe request a browser marks `Sec-Fetch-Site:
+    /// cross-site` is refused outright. On unless the token cookie is
+    /// `SameSite=None`, which is the one configuration that *means* to
+    /// accept cross-site form posts. See [`refuses_cross_site`].
+    refuse_cross_site: bool,
+}
+
+/// Whether the middleware refuses browser-flagged cross-site requests
+/// before looking at the token.
+///
+/// A double-submit token proves the sender could read a cookie, not that
+/// the cookie was ours: a sibling subdomain (or plain HTTP, when the
+/// cookie is not `Secure`) can plant one it obtained itself. Browsers
+/// state the answer to that directly — a request a third-party site
+/// initiated says `Sec-Fetch-Site: cross-site` — so it is refused, unless
+/// the caller set `same_site = "None"` on the token cookie, which is the
+/// documented way to accept a legitimate cross-site form and would be
+/// contradicted by the refusal. Older clients send no such header and
+/// fall back to the token alone.
+fn refuses_cross_site(cookie_opts: Option<&Table>) -> mlua::Result<bool> {
+    let Some(opts) = cookie_opts else {
+        return Ok(true);
+    };
+    let same_site: Option<String> = opts.get("same_site")?;
+    Ok(!same_site.is_some_and(|value| value.eq_ignore_ascii_case("none")))
 }
 
 fn new_token() -> mlua::Result<String> {
@@ -142,16 +167,9 @@ async fn handle(lua: Lua, config: Arc<Config>, next: Function, req: Value) -> ml
     let resp = if safe {
         next.call_async::<Value>(&req).await?
     } else {
-        // A double-submit token proves the sender could read a cookie,
-        // not that the cookie was ours: a sibling subdomain (or plain HTTP,
-        // when the cookie is not `Secure`) can plant one it obtained
-        // itself. Browsers state the answer to that directly — a request a
-        // third-party site initiated says `Sec-Fetch-Site: cross-site` —
-        // so an unsafe cross-site request is refused before the token is
-        // even compared. Older clients send no such header and fall back
-        // to the token alone.
+        // See `refuses_cross_site`.
         let cross_site = match &req {
-            Value::UserData(ud) => ud
+            Value::UserData(ud) if config.refuse_cross_site => ud
                 .get::<Table>("headers")?
                 .get::<Option<String>>("sec-fetch-site")?
                 .is_some_and(|site| site.eq_ignore_ascii_case("cross-site")),
@@ -268,6 +286,9 @@ fn create_call_metatable(lua: &Lua) -> mlua::Result<Table> {
                 field: opts
                     .get::<Option<String>>("field")?
                     .unwrap_or_else(|| "_csrf".into()),
+                refuse_cross_site: refuses_cross_site(
+                    opts.get::<Option<Table>>("cookie_opts")?.as_ref(),
+                )?,
                 cookie_opts: opts.get("cookie_opts")?,
             });
 
@@ -320,6 +341,28 @@ mod tests {
         let factory: Function = csrf.call(opts).expect("factory");
         let next = lua.create_function(|_, v: Value| Ok(v)).expect("next");
         let _handler: Function = factory.call(next).expect("handler");
+    }
+
+    /// Cross-site requests are refused by default and accepted only when
+    /// the token cookie is deliberately `SameSite=None`.
+    #[test]
+    fn cross_site_refusal_follows_the_cookie_policy() {
+        let lua = Lua::new();
+        assert!(refuses_cross_site(None).expect("default"));
+        for (opts, expected) in [
+            ("{ path = '/admin' }", true),
+            ("{ same_site = 'Lax' }", true),
+            ("{ same_site = 'Strict' }", true),
+            ("{ same_site = 'None' }", false),
+            ("{ same_site = 'none' }", false),
+        ] {
+            let table: Table = lua.load(opts).eval().expect("opts");
+            assert_eq!(
+                refuses_cross_site(Some(&table)).expect("policy"),
+                expected,
+                "{opts}"
+            );
+        }
     }
 
     #[test]

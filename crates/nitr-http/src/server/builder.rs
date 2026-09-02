@@ -255,7 +255,7 @@ impl ServerBuilder {
             health_listener: self.health_listener,
             ready: Arc::new(AtomicBool::new(true)),
             cache,
-            reloading: Arc::new(AtomicBool::new(false)),
+            reloading: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             #[cfg(feature = "tls")]
             tls,
         })

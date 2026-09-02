@@ -9,7 +9,15 @@ use rusqlite::{Connection, ToSql};
 
 use std::sync::{Arc, Mutex};
 
-pub(crate) type Conn = Arc<Mutex<Connection>>;
+/// One state's connection plus the per-connection limits that travel
+/// with it onto the blocking thread.
+pub(crate) struct Db {
+    pub(crate) conn: Connection,
+    /// Most rows one `query` may return (see `SqlitePragmas::max_rows`).
+    pub(crate) max_rows: usize,
+}
+
+pub(crate) type Conn = Arc<Mutex<Db>>;
 
 /// A plain, `Send` SQL value: the boundary type between the Lua state (async
 /// thread) and rusqlite (blocking thread), so no Lua handle ever crosses

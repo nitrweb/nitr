@@ -536,6 +536,10 @@ fn pidfile_reload_and_cleanup() {
     )
     .expect("write config");
 
+    // A stale pidfile (a crash left it behind, its pid long gone) must
+    // not stop the server: it is replaced. Linux pids top out at 2^22.
+    std::fs::write(dir.join("nitr.pid"), "4194304\n").expect("plant stale pidfile");
+
     // tracing's fmt subscriber writes to stdout: that is where the
     // "listening" line will appear.
     let log = std::fs::File::create(dir.join("server.log")).expect("log file");
@@ -576,7 +580,48 @@ fn pidfile_reload_and_cleanup() {
         .trim()
         .parse()
         .expect("pid");
-    assert_eq!(pid, child.id());
+    assert_eq!(pid, child.id(), "the stale pidfile must have been replaced");
+
+    // A second instance sees a *live* pid in the pidfile and refuses,
+    // leaving the file to its owner.
+    let second = nitr()
+        .current_dir(&dir)
+        .arg("run")
+        .output()
+        .expect("run second instance");
+    assert!(
+        !second.status.success(),
+        "a second instance must refuse to start"
+    );
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains("names a running process"),
+        "the refusal must name the live pid: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&pidfile)
+            .expect("read pidfile")
+            .trim(),
+        pid.to_string(),
+        "the live instance's pidfile must survive the refused start"
+    );
+
+    // A pidfile naming pid 0 would signal the caller's process group;
+    // `reload` refuses it rather than obey.
+    let backup = std::fs::read_to_string(&pidfile).expect("read pidfile");
+    std::fs::write(&pidfile, "0\n").expect("plant pid 0");
+    let out = nitr()
+        .current_dir(&dir)
+        .arg("reload")
+        .output()
+        .expect("run reload");
+    assert!(!out.status.success(), "reload must refuse pid 0");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cannot be a running server"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(&pidfile, backup).expect("restore pidfile");
 
     // `nitr reload` finds the server through the pidfile.
     let out = nitr()

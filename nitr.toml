@@ -125,6 +125,7 @@ path = "scripts/file.db"
 #synchronous = "normal"    # the right pairing with WAL
 #foreign_keys = true       # SQLite leaves this off, which surprises everyone
 #cache_size = -2000        # KiB per connection
+#max_rows = 10000          # most rows one nitr.db:query may return (error past it)
 #migrations_dir = "migrations"
 
 # The shared `nitr.cache` (enable with `cache` in [std] features). Bounded
@@ -222,6 +223,10 @@ path = "scripts/file.db"
                                      # opt-in per call and only ever applied
                                      # to idempotent methods
 #proxy = "http://proxy.internal:3128" # unset reads HTTPS_PROXY/HTTP_PROXY
+                            # A proxy resolves targets itself, so the SSRF
+                            # resolver guard cannot apply: with `fetch` enabled
+                            # a proxy needs allowed_hosts (or
+                            # allow_private_networks = true) to start.
 #no_proxy = false                    # ignore the proxy env vars entirely
 #propagate_trace_context = false     # forward a W3C traceparent derived
                                      # from the inbound request id

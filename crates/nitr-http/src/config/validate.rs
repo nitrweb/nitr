@@ -12,6 +12,20 @@ use nitr_core::{Error, Result};
 
 use super::Config;
 
+/// Whether the environment names an outbound proxy reqwest would honor.
+fn proxy_env_present() -> bool {
+    [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
 /// Most Lua states one process will build; each is a full VM with its
 /// own memory budget.
 const MAX_WORKERS: usize = 4096;
@@ -92,6 +106,34 @@ impl Config {
                 "[limits] pool_wait_ms = {} exceeds [lua] exec_timeout_ms = {}: a \
                  request would wait for a state longer than any handler may run",
                 self.limits.pool_wait_ms, self.lua.exec_timeout_ms
+            )));
+        }
+        // Behind an outbound proxy the *proxy* resolves the target, so the
+        // guarded resolver — the thing that makes the SSRF policy hold
+        // against DNS rebinding — never runs; only the pre-flight name
+        // check does, and a name can answer that check with one address
+        // and the proxy's lookup with another. Without private networks
+        // allowed (the operator saying "I trust what this proxy reaches")
+        // the policy then needs an allow-list that does not depend on
+        // DNS at all. Only enforced when `fetch` is enabled: a proxy in
+        // the file with no fetch builtin proxies nothing.
+        if self
+            .builtins()
+            .is_ok_and(|b| b.contains(nitr_std::Builtins::FETCH))
+            && (self.fetch.proxy.is_some() || (!self.fetch.no_proxy && proxy_env_present()))
+            && !self.fetch.allow_private_networks
+            && self.fetch.allowed_hosts.is_none()
+        {
+            let source = if self.fetch.proxy.is_some() {
+                "[fetch] proxy is set"
+            } else {
+                "a proxy environment variable (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY) is set"
+            };
+            return Err(Error::Config(format!(
+                "{source}, so outbound targets are resolved by the proxy and the SSRF resolver \
+                 guard cannot apply. Set [fetch] allowed_hosts to the hosts scripts may reach, \
+                 or allow_private_networks = true if the proxy is trusted to reach anything, \
+                 or no_proxy = true to ignore the environment"
             )));
         }
         // Drained before the remaining hard checks, where the old inline

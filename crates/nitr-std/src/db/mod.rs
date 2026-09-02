@@ -15,7 +15,7 @@ use mlua::{AnyUserData, Function, Lua, Table, UserData, UserDataMethods, Value};
 use rusqlite::Connection;
 use tracing::Instrument as _;
 
-use crate::db::types::{Conn, SqlValue, params_from_table, row_to_lua};
+use crate::db::types::{Conn, Db, SqlValue, params_from_table, row_to_lua};
 use nitr_core::Result;
 
 pub(crate) mod execute;
@@ -42,6 +42,58 @@ pub(crate) struct LuaTransaction {
     conn: Conn,
     /// Names nested savepoints uniquely within this scope.
     savepoints: AtomicUsize,
+    /// Cleared when the scope's transaction ends — normally or because
+    /// the handler's timeout dropped it mid-flight. A `tx` a script
+    /// stashed and reused later must fail loudly rather than write into
+    /// an abandoned transaction the next outer statement will roll back.
+    alive: Arc<AtomicBool>,
+}
+
+/// The connection of a live scope; an ended one is refused.
+fn tx_conn(tx: &LuaTransaction) -> mlua::Result<Conn> {
+    if !tx.alive.load(Ordering::Acquire) {
+        return Err(mlua::Error::RuntimeError(
+            "this transaction has ended: a `tx` handle is only valid inside the \
+             db:transaction(function(tx) ... end) body that received it"
+                .into(),
+        ));
+    }
+    Ok(tx.conn.clone())
+}
+
+/// Where a pending query came from, which decides the check it runs
+/// before touching the connection: an outer handle must not run while a
+/// transaction is open (it would rollback-or-join it), an inner one must
+/// not outlive its scope.
+#[derive(Clone)]
+enum QueryOrigin {
+    Outer(TxFlag),
+    Inner(Arc<AtomicBool>),
+}
+
+impl QueryOrigin {
+    fn check(&self) -> mlua::Result<()> {
+        match self {
+            QueryOrigin::Outer(flag) if flag.load(Ordering::Acquire) => {
+                Err(mlua::Error::RuntimeError(
+                    "a transaction is open on this connection: a `nitr.db:query_async` handle \
+                     cannot run inside db:transaction(...); use `tx:query_async` instead"
+                        .into(),
+                ))
+            }
+            QueryOrigin::Inner(alive) if !alive.load(Ordering::Acquire) => {
+                Err(mlua::Error::RuntimeError(
+                    "this transaction has ended: the `tx:query_async` handle can no longer run"
+                        .into(),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn is_outer(&self) -> bool {
+        matches!(self, QueryOrigin::Outer(_))
+    }
 }
 
 /// Runs a blocking database operation on the blocking thread pool so it
@@ -65,7 +117,7 @@ async fn run_blocking<T, F>(
 ) -> mlua::Result<T>
 where
     T: Send + 'static,
-    F: FnOnce(&Connection, &str, &[SqlValue]) -> Result<T, rusqlite::Error> + Send + 'static,
+    F: FnOnce(&Connection, &str, &[SqlValue], usize) -> Result<T, rusqlite::Error> + Send + 'static,
 {
     // The `db_query` span: which statement kind ran, for how long, and a
     // correlator for *which* statement. Deliberately no SQL text and no
@@ -81,9 +133,10 @@ where
     );
     let started = std::time::Instant::now();
     let result = tokio::task::spawn_blocking(move || {
-        let conn = conn.lock().map_err(|_| {
+        let db = conn.lock().map_err(|_| {
             mlua::Error::RuntimeError("failed to lock the database connection".into())
         })?;
+        let conn = &db.conn;
         if outer && !conn.is_autocommit() {
             tracing::warn!(
                 "rolling back a transaction a previous request left open on this connection \
@@ -103,7 +156,7 @@ where
         // anywhere. Interpolating the statement here put a token or an
         // email address in a literal into both. The tag keeps repeated
         // failures groupable without carrying what the statement said.
-        f(&conn, &sql, &params).map_err(|err| {
+        f(conn, &sql, &params, db.max_rows).map_err(|err| {
             mlua::Error::RuntimeError(format!("{kind} failed (stmt {stmt_tag}): {}", redact(&err)))
         })
     })
@@ -164,7 +217,7 @@ fn stmt_tag(sql: &str) -> String {
 
 /// Executes a control statement (`BEGIN`, `COMMIT`, `SAVEPOINT ...`).
 async fn exec_batch(conn: Conn, sql: String, outer: bool) -> mlua::Result<()> {
-    run_blocking(conn, "tx", sql, Vec::new(), outer, |conn, sql, _| {
+    run_blocking(conn, "tx", sql, Vec::new(), outer, |conn, sql, _, _| {
         conn.execute_batch(sql)
     })
     .await
@@ -271,8 +324,10 @@ pub struct PendingQuery {
     kind: QueryKind,
     sql: String,
     params: Vec<SqlValue>,
-    /// Built from the outer `nitr.db` handle (see [`run_blocking`]).
-    outer: bool,
+    /// Which handle built it; checked when it runs, not only when it was
+    /// built — a handle made before `db:transaction` and awaited inside
+    /// it would otherwise roll the live transaction back.
+    origin: QueryOrigin,
 }
 
 impl PendingQuery {
@@ -283,8 +338,10 @@ impl PendingQuery {
             kind,
             sql,
             params,
-            outer,
+            origin,
         } = self;
+        origin.check()?;
+        let outer = origin.is_outer();
         match kind {
             QueryKind::Execute => {
                 let affected =
@@ -350,8 +407,10 @@ impl UserData for LuaPendingQuery {
 }
 
 /// Registers `query_async` on a userdata type that exposes a connection.
-fn add_async_query_method<T, M>(methods: &mut M, conn_of: fn(&T) -> mlua::Result<Conn>, outer: bool)
-where
+fn add_async_query_method<T, M>(
+    methods: &mut M,
+    origin_of: fn(&T) -> mlua::Result<(Conn, QueryOrigin)>,
+) where
     T: UserData + 'static,
     M: UserDataMethods<T>,
 {
@@ -359,15 +418,43 @@ where
     methods.add_method(
         "query_async",
         move |_, this, (sql, params, kind): (String, Option<Table>, Option<String>)| {
+            let (conn, origin) = origin_of(this)?;
             Ok(LuaPendingQuery(Mutex::new(Some(PendingQuery {
-                conn: conn_of(this)?,
+                conn,
                 kind: QueryKind::parse(kind.as_deref())?,
                 sql,
                 params: params_from_table(params.as_ref())?,
-                outer,
+                origin,
             }))))
         },
     );
+}
+
+/// Rolls back only when a transaction is actually open: after
+/// `SQLITE_FULL`/`SQLITE_IOERR` SQLite may already have aborted it, and
+/// a `ROLLBACK` then fails with "no transaction is active" — noise, not
+/// news.
+async fn rollback_if_open(conn: Conn, sql: String) -> mlua::Result<()> {
+    run_blocking(conn, "tx", sql, Vec::new(), false, |conn, sql, _, _| {
+        if conn.is_autocommit() {
+            Ok(())
+        } else {
+            conn.execute_batch(sql)
+        }
+    })
+    .await
+}
+
+/// Ends a scope when dropped — after the body, or when the future is
+/// dropped mid-flight — so its `tx` handles and pending queries refuse
+/// to run from then on. Plain Rust, no Lua API: it may run while the
+/// coroutine is being collected.
+struct ScopeEnd(Arc<AtomicBool>);
+
+impl Drop for ScopeEnd {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Runs the transaction body between `begin` and `commit`/`rollback`,
@@ -392,16 +479,27 @@ async fn run_transaction(
     outer: bool,
 ) -> mlua::Result<Value> {
     exec_batch(conn.clone(), begin, outer).await?;
+    let alive = Arc::new(AtomicBool::new(true));
+    let _scope_end = ScopeEnd(alive.clone());
     let scope = lua.create_userdata(LuaTransaction {
         conn: conn.clone(),
         savepoints: AtomicUsize::new(0),
+        alive,
     })?;
     let result = f.call_async::<Value>(&scope).await;
-    let _ = scope.take::<LuaTransaction>();
+    // A savepoint's rollback must run even when the outer transaction is
+    // open (it always is), so only the top-level one is conditional.
+    let roll_back = |conn: Conn| async move {
+        if outer {
+            rollback_if_open(conn, rollback).await
+        } else {
+            exec_batch(conn, rollback, false).await
+        }
+    };
     match result {
         Ok(value) => {
             if let Err(commit_err) = exec_batch(conn.clone(), commit, false).await {
-                if let Err(rollback_err) = exec_batch(conn, rollback, false).await {
+                if let Err(rollback_err) = roll_back(conn).await {
                     tracing::error!("rollback after a failed commit failed: {rollback_err}");
                 }
                 return Err(commit_err);
@@ -409,7 +507,7 @@ async fn run_transaction(
             Ok(value)
         }
         Err(err) => {
-            if let Err(rollback_err) = exec_batch(conn, rollback, false).await {
+            if let Err(rollback_err) = roll_back(conn).await {
                 tracing::error!("transaction rollback failed: {rollback_err}");
             }
             Err(err)
@@ -457,18 +555,17 @@ impl UserData for LuaDatabase {
             },
             true,
         );
-        add_async_query_method(
-            methods,
-            |db: &LuaDatabase| {
-                if db.in_transaction.load(Ordering::Acquire) {
-                    return Err(mlua::Error::RuntimeError(
-                        "a transaction is open on this connection: use the `tx` handle".into(),
-                    ));
-                }
-                Ok(db.conn.clone())
-            },
-            true,
-        );
+        add_async_query_method(methods, |db: &LuaDatabase| {
+            if db.in_transaction.load(Ordering::Acquire) {
+                return Err(mlua::Error::RuntimeError(
+                    "a transaction is open on this connection: use the `tx` handle".into(),
+                ));
+            }
+            Ok((
+                db.conn.clone(),
+                QueryOrigin::Outer(db.in_transaction.clone()),
+            ))
+        });
 
         // db:transaction(function(tx) ... end): commits when the function
         // returns, rolls back (and re-raises) when it errors.
@@ -501,19 +598,21 @@ impl UserData for LuaDatabase {
 
 impl UserData for LuaTransaction {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        add_stmt_methods(methods, |tx: &LuaTransaction| Ok(tx.conn.clone()), false);
-        add_async_query_method(methods, |tx: &LuaTransaction| Ok(tx.conn.clone()), false);
+        add_stmt_methods(methods, tx_conn, false);
+        add_async_query_method(methods, |tx: &LuaTransaction| {
+            Ok((tx_conn(tx)?, QueryOrigin::Inner(tx.alive.clone())))
+        });
 
         // Nested transactions become savepoints: rolling back the inner
         // scope keeps the outer transaction alive.
         methods.add_async_method("transaction", |lua, tx, f: Function| {
-            let conn = tx.conn.clone();
+            let conn = tx_conn(&tx);
             let n = tx.savepoints.fetch_add(1, Ordering::Relaxed);
             async move {
                 let name = format!("nitr_sp_{n}");
                 run_transaction(
                     &lua,
-                    conn,
+                    conn?,
                     f,
                     format!("SAVEPOINT {name}"),
                     format!("RELEASE {name}"),
@@ -532,7 +631,10 @@ pub(crate) fn create_database_fn(
     path: &std::path::Path,
     pragmas: &SqlitePragmas,
 ) -> Result<AnyUserData> {
-    let conn = Arc::new(Mutex::new(pragmas::open(path, pragmas)?));
+    let conn = Arc::new(Mutex::new(Db {
+        conn: pragmas::open(path, pragmas)?,
+        max_rows: pragmas.max_rows,
+    }));
     let value = lua.create_userdata(LuaDatabase {
         conn,
         in_transaction: Arc::new(AtomicBool::new(false)),
@@ -543,6 +645,245 @@ pub(crate) fn create_database_fn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Lua state with `nitr.db` over a fresh temporary database and a
+    /// `stall()` builtin that never returns, standing in for the slow
+    /// upstream a handler awaits inside a transaction.
+    async fn db_state(label: &str) -> (Lua, std::path::PathBuf) {
+        db_state_with(label, SqlitePragmas::default()).await
+    }
+
+    async fn db_state_with(label: &str, pragmas: SqlitePragmas) -> (Lua, std::path::PathBuf) {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("nitr-db-test-{label}-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("app.db");
+        let lua = Lua::new();
+        let db = create_database_fn(&lua, &path, &pragmas).expect("db");
+        let nitr = lua.create_table().expect("table");
+        nitr.set("db", db).expect("set");
+        lua.globals().set("nitr", nitr).expect("set");
+        let stall = lua
+            .create_async_function(|_, ()| async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Ok(())
+            })
+            .expect("stall");
+        lua.globals().set("stall", stall).expect("set");
+        lua.load("nitr.db:execute('CREATE TABLE t (x INTEGER)')")
+            .exec_async()
+            .await
+            .expect("setup statement");
+        (lua, dir)
+    }
+
+    async fn count(lua: &Lua) -> i64 {
+        lua.load("return nitr.db:query_row('SELECT COUNT(*) AS n FROM t').n")
+            .eval_async()
+            .await
+            .expect("count")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn query_row_returns_nil_for_an_empty_result() {
+        let (lua, dir) = db_state("qrow").await;
+        let row: Value = lua
+            .load("return nitr.db:query_row('SELECT x FROM t WHERE x = 42')")
+            .eval_async()
+            .await
+            .expect("query_row");
+        assert!(row.is_nil(), "no rows must be nil, got {row:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A transaction whose future is dropped mid-await (the handler's
+    /// timeout) must not brick the connection: the flag clears, the next
+    /// outer statement rolls the abandoned work back, and a new
+    /// transaction can begin.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_abandoned_transaction_is_rolled_back_and_the_connection_recovers() {
+        let (lua, dir) = db_state("abandon").await;
+        let body = lua
+            .load(
+                "nitr.db:transaction(function(tx)
+                     tx:execute('INSERT INTO t VALUES (1)')
+                     stall()
+                 end)",
+            )
+            .exec_async();
+        let timed = tokio::time::timeout(std::time::Duration::from_millis(200), body).await;
+        assert!(timed.is_err(), "the stall must outlive the timeout");
+        // The future is gone; the state is what the pool would hand out.
+
+        lua.load("nitr.db:execute('INSERT INTO t VALUES (2)')")
+            .exec_async()
+            .await
+            .expect("an outer statement runs after the abandoned transaction");
+        assert_eq!(count(&lua).await, 1, "the abandoned insert was rolled back");
+
+        lua.load("nitr.db:transaction(function(tx) tx:execute('INSERT INTO t VALUES (3)') end)")
+            .exec_async()
+            .await
+            .expect("a new transaction opens");
+        assert_eq!(count(&lua).await, 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A `nitr.db:query_async` handle built before a transaction and
+    /// awaited inside it is refused, not silently run in autocommit
+    /// (which would roll the live transaction back underneath it).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_outer_pending_query_is_refused_inside_a_transaction() {
+        let (lua, dir) = db_state("pending").await;
+        let (ok, err): (bool, String) = lua
+            .load(
+                "local h = nitr.db:query_async('SELECT 1')
+                 local ok, err = pcall(function()
+                     nitr.db:transaction(function(tx)
+                         tx:execute('INSERT INTO t VALUES (1)')
+                         h:send()
+                     end)
+                 end)
+                 return ok, tostring(err)",
+            )
+            .eval_async()
+            .await
+            .expect("script");
+        assert!(!ok, "the handle must be refused");
+        assert!(err.contains("transaction is open"), "got: {err}");
+        assert_eq!(
+            count(&lua).await,
+            0,
+            "the body's insert rolled back with the error"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A `tx` stashed past its transaction is dead, and says so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stashed_tx_handle_is_dead_after_its_transaction_ends() {
+        let (lua, dir) = db_state("stash").await;
+        let (ok, err): (bool, String) = lua
+            .load(
+                "local saved
+                 nitr.db:transaction(function(tx) saved = tx end)
+                 local ok, err = pcall(function() saved:execute('INSERT INTO t VALUES (1)') end)
+                 return ok, tostring(err)",
+            )
+            .eval_async()
+            .await
+            .expect("script");
+        assert!(!ok);
+        assert!(err.contains("has ended"), "got: {err}");
+        assert_eq!(count(&lua).await, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A result past `max_rows` is an error naming the setting, never a
+    /// silent truncation; results at the cap still come back whole.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queries_past_max_rows_are_refused_not_truncated() {
+        let pragmas = SqlitePragmas {
+            max_rows: 2,
+            ..SqlitePragmas::default()
+        };
+        let (lua, dir) = db_state_with("maxrows", pragmas).await;
+        lua.load("nitr.db:execute('INSERT INTO t VALUES (1), (2), (3)')")
+            .exec_async()
+            .await
+            .expect("seed");
+        let (ok, err): (bool, String) = lua
+            .load(
+                "local ok, err = pcall(function() return nitr.db:query('SELECT x FROM t') end)
+                 return ok, tostring(err)",
+            )
+            .eval_async()
+            .await
+            .expect("script");
+        assert!(!ok, "three rows over a cap of two must fail");
+        assert!(err.contains("max_rows"), "got: {err}");
+        let n: i64 = lua
+            .load("return #nitr.db:query('SELECT x FROM t LIMIT 2')")
+            .eval_async()
+            .await
+            .expect("at the cap");
+        assert_eq!(n, 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A `COMMIT` that fails leaves SQLite's transaction open; it must be
+    /// rolled back so the connection is in autocommit mode again for the
+    /// next statement. Induced the way it happens in production: in
+    /// rollback-journal mode a reader holding a shared lock (an open
+    /// cursor on another connection) blocks the exclusive lock `COMMIT`
+    /// needs, and `busy_timeout` turns that into `SQLITE_BUSY`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_commit_rolls_back_and_the_connection_recovers() {
+        let pragmas = SqlitePragmas {
+            journal_mode: "delete".into(),
+            busy_timeout: 50,
+            ..SqlitePragmas::default()
+        };
+        let (lua, dir) = db_state_with("commitfail", pragmas).await;
+        lua.load("nitr.db:execute('INSERT INTO t VALUES (1)')")
+            .exec_async()
+            .await
+            .expect("seed");
+
+        // The reader: a stepped, unfinished cursor keeps the shared lock.
+        let reader = Connection::open(dir.join("app.db")).expect("reader");
+        let mut stmt = reader.prepare("SELECT x FROM t").expect("prepare");
+        let mut rows = stmt.query([]).expect("query");
+        assert!(
+            rows.next().expect("step").is_some(),
+            "the cursor must be live"
+        );
+
+        let (ok, err): (bool, String) = lua
+            .load(
+                "local ok, err = pcall(function()
+                     nitr.db:transaction(function(tx) tx:execute('INSERT INTO t VALUES (2)') end)
+                 end)
+                 return ok, tostring(err)",
+            )
+            .eval_async()
+            .await
+            .expect("script");
+        assert!(!ok, "COMMIT must fail while the reader holds its lock");
+        assert!(
+            err.contains("locked") || err.contains("busy"),
+            "the failure must be the lock, got: {err}"
+        );
+        drop(rows);
+        drop(stmt);
+        drop(reader);
+
+        // Autocommit again: an outer statement runs without an abandoned
+        // transaction in the way, and the failed insert is gone.
+        lua.load("nitr.db:execute('INSERT INTO t VALUES (3)')")
+            .exec_async()
+            .await
+            .expect("the connection is usable after the failed commit");
+        let xs: Vec<i64> = lua
+            .load(
+                "local out = {}
+                 for _, r in ipairs(nitr.db:query('SELECT x FROM t ORDER BY x')) do
+                     out[#out + 1] = r.x
+                 end
+                 return out",
+            )
+            .eval_async()
+            .await
+            .expect("rows");
+        assert_eq!(
+            xs,
+            vec![1, 3],
+            "row 2 was rolled back with the failed commit"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn query_kinds_parse_strictly_with_a_query_default() {

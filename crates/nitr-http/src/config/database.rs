@@ -42,6 +42,11 @@ pub struct DatabaseConfig {
     /// `cache_size` pragma, per connection. Negative values are KiB.
     #[serde(default = "default_cache_size")]
     pub cache_size: i64,
+    /// Most rows a single `nitr.db:query` may return; a larger result is
+    /// an error naming this setting. Rows are materialized in memory, so
+    /// this is the ceiling on what one query can allocate.
+    #[serde(default = "default_max_rows")]
+    pub max_rows: usize,
     /// Directory holding `NNN_name.sql` migrations. Unset looks for
     /// `migrations/` in the working directory and ignores it when absent.
     #[serde(default)]
@@ -63,6 +68,9 @@ fn default_foreign_keys() -> bool {
 fn default_cache_size() -> i64 {
     -2_000 // 2 MiB
 }
+fn default_max_rows() -> usize {
+    10_000
+}
 
 impl DatabaseConfig {
     /// The defaults for a given path.
@@ -74,6 +82,7 @@ impl DatabaseConfig {
             synchronous: default_synchronous(),
             foreign_keys: default_foreign_keys(),
             cache_size: default_cache_size(),
+            max_rows: default_max_rows(),
             migrations_dir: None,
         }
     }
@@ -97,6 +106,7 @@ impl DatabaseConfig {
             synchronous: self.synchronous.clone(),
             foreign_keys: self.foreign_keys,
             cache_size: self.cache_size,
+            max_rows: self.max_rows,
         }
     }
 }

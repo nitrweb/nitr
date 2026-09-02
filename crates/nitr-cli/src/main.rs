@@ -232,15 +232,65 @@ fn read_pid(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// Whether a process with this pid exists (`kill -0`).
+/// Whether a process with this pid exists.
+///
+/// `/proc/<pid>` where there is a procfs (Linux: no external binary, and
+/// another user's live process still counts as alive), else `kill -0`.
+/// A `kill` that cannot be spawned reports "alive" — a false "dead" here
+/// deletes a live instance's pidfile, which is the failure this check
+/// exists to prevent, so the doubt goes the safe way.
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
+    if Path::new("/proc/self").exists() {
+        return Path::new(&format!("/proc/{pid}")).exists();
+    }
+    match std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_ok_and(|status| status.success())
+    {
+        Ok(status) => status.success(),
+        Err(_) => true,
+    }
+}
+
+/// Whether `pid` runs nitr, judged from procfs when there is one; without
+/// procfs there is nothing to judge from and the answer is yes.
+///
+/// "Runs nitr" means: the same executable as this one, a `nitr build`
+/// artifact (this executable with an archive appended, under whatever
+/// name the operator chose — recognised by its trailer), or, when the
+/// executable link cannot be read, a process named like ours.
+#[cfg(unix)]
+fn is_nitr_process(pid: u32) -> bool {
+    if !Path::new("/proc/self").exists() {
+        return true;
+    }
+    if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+        // The kernel appends " (deleted)" to a replaced binary; the path
+        // before it is still what to compare.
+        let exe = PathBuf::from(
+            exe.to_string_lossy()
+                .trim_end_matches(" (deleted)")
+                .to_string(),
+        );
+        if std::env::current_exe().is_ok_and(|own| own == exe) {
+            return true;
+        }
+        if let Ok(Some(_)) = bundle::read_appended(&exe) {
+            return true;
+        }
+    }
+    let own_comm = std::fs::read_to_string("/proc/self/comm")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        Ok(comm) => comm.trim().contains("nitr") || comm.trim() == own_comm,
+        // No comm to read (another user's process): nothing says it is
+        // not ours.
+        Err(_) => true,
+    }
 }
 
 #[cfg(not(unix))]
@@ -283,21 +333,13 @@ fn reload(cfg: &Config) -> anyhow::Result<()> {
     {
         // The pid may have been reused since the file was written (a
         // crash leaves the file behind). Where the kernel says what runs
-        // under it, insist that it is this program before signalling: a
-        // process named like ours (`nitr`, or whatever a `nitr build`
-        // artifact was called — the bundle is this same executable).
-        let own_comm = std::fs::read_to_string("/proc/self/comm")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
-        if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-            && !comm.trim().contains("nitr")
-            && comm.trim() != own_comm
-        {
+        // under it, insist that it is a nitr server before signalling.
+        if !is_nitr_process(pid) {
             bail!(
-                "pid {pid} from the pidfile {} is `{}`, not a nitr server; the file is \
-                 stale — remove it",
-                path.display(),
-                comm.trim()
+                "pid {pid} from the pidfile {} does not look like a nitr server. If the \
+                 server is a `nitr build` artifact, run `reload` from that artifact; if \
+                 it is not running any more, remove the stale pidfile",
+                path.display()
             );
         }
         let status = std::process::Command::new("kill")

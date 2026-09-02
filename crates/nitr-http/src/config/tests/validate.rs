@@ -484,3 +484,28 @@ proptest::proptest! {
         }
     }
 }
+
+/// A proxy resolves the target itself, which sidesteps the resolver guard:
+/// with `fetch` enabled, a proxy needs an allow-list or an explicit
+/// private-networks decision before the server starts.
+#[test]
+fn a_proxy_without_an_allow_list_is_refused_when_fetch_is_enabled() {
+    let mut cfg = valid_base();
+    cfg.std.features = Some(vec!["fetch".into()]);
+    cfg.fetch.proxy = Some("http://proxy.internal:3128".into());
+    let err = cfg.validate().expect_err("proxy without an allow-list");
+    assert!(err.to_string().contains("allowed_hosts"), "got: {err}");
+
+    // Either remedy is accepted.
+    cfg.fetch.allowed_hosts = Some(vec!["api.example".into()]);
+    cfg.validate().expect("an allow-list satisfies the rule");
+    cfg.fetch.allowed_hosts = None;
+    cfg.fetch.allow_private_networks = true;
+    cfg.validate()
+        .expect("an explicit trust decision satisfies the rule");
+
+    // And without the fetch builtin a proxy setting proxies nothing.
+    cfg.fetch.allow_private_networks = false;
+    cfg.std.features = None;
+    cfg.validate().expect("no fetch, no rule");
+}

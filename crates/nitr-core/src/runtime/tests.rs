@@ -334,6 +334,15 @@ fn package_states_cannot_load_native_modules() {
             cpath, "",
             "`package.cpath` must be empty (confined: {confined})"
         );
+
+        // `searchpath` is a filesystem existence oracle with its own
+        // template argument; confinement of `package.path` never reached
+        // it.
+        let searchpath: Value = package.get("searchpath").expect("read searchpath");
+        assert!(
+            searchpath.is_nil(),
+            "`package.searchpath` must be nil (confined: {confined})"
+        );
     }
 }
 

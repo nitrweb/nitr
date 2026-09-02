@@ -297,18 +297,23 @@ impl RateLimiter {
 
     /// The address the budget is keyed by, reduced to a bucket key.
     ///
-    /// Behind a trusted proxy the *last* `X-Forwarded-For` entry is used —
-    /// the one that proxy appended, i.e. the address it accepted the
-    /// connection from. The first entry is whatever the client wrote:
-    /// every mainstream proxy appends rather than overwrites, so keying by
-    /// it let a client mint a fresh budget per request with one header.
-    /// A header that does not parse falls back to the peer address.
+    /// Behind a trusted proxy the *last* `X-Forwarded-For` entry of the
+    /// *last* header line is used — the one that proxy appended, i.e. the
+    /// address it accepted the connection from. The first entry is
+    /// whatever the client wrote: every mainstream proxy appends rather
+    /// than overwrites, so keying by it let a client mint a fresh budget
+    /// per request with one header. Some proxies (HAProxy's `option
+    /// forwardfor`) append a whole new header *line* rather than extend
+    /// the first one, so it is the last line that carries the proxy's
+    /// word. A header that does not parse falls back to the peer address.
     fn client_key(&self, req: &LuaRequest) -> IpAddr {
         let ip = if self.trust_forwarded_for
             && let Some(ip) = req
                 .req
                 .headers()
-                .get("x-forwarded-for")
+                .get_all("x-forwarded-for")
+                .iter()
+                .next_back()
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.rsplit(',').next())
                 .and_then(|v| v.trim().parse().ok())
@@ -559,5 +564,21 @@ mod tests {
         );
         // A garbage header falls back to the peer address.
         assert!(rl.check(&request("10.0.0.9", Some("not-an-ip"))).is_ok());
+
+        // A proxy that adds a second header *line* (HAProxy) leaves the
+        // client's line first: the last line is the proxy's word.
+        let rl = limiter(1, 60_000, true);
+        let two_lines = |first: &str| {
+            let mut req = request("10.0.0.9", Some(first));
+            req.req
+                .headers_mut()
+                .append("x-forwarded-for", HeaderValue::from_static("9.9.9.9"));
+            req
+        };
+        assert!(rl.check(&two_lines("1.1.1.1")).is_ok());
+        assert!(
+            rl.check(&two_lines("2.2.2.2")).is_err(),
+            "a fresh first line must not buy a fresh budget"
+        );
     }
 }

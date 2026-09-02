@@ -17,7 +17,10 @@ fn fields_json(fields: Option<Table>) -> Option<String> {
     // Logging is infallible by contract: a value the serializer cannot
     // take — too deep included, which would otherwise overflow the stack
     // — degrades to a placeholder instead of failing the request.
-    if crate::utils::check_json_bounds(&fields).is_err() {
+    // The plain bound: a binary field serializes as a byte array here,
+    // which is more useful in a log line than a placeholder for the
+    // whole table.
+    if crate::utils::check_value_bounds(&fields).is_err() {
         return Some("\"<unserializable fields>\"".to_string());
     }
     Some(

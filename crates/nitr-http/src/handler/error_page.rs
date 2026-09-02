@@ -110,8 +110,12 @@ fn resolve_source_path(
         .unwrap_or(std::path::Path::new("."))
         .canonicalize()
         .ok()?;
+    // Only Lua: `require` can load nothing else, and the script directory
+    // also holds `nitr.toml`, `.env` and, in the scaffold's layout, the
+    // TLS key.
     let candidate = std::path::Path::new(source).canonicalize().ok()?;
-    (candidate.is_file() && candidate.starts_with(&root)).then_some(candidate)
+    let is_lua = candidate.extension().is_some_and(|ext| ext == "lua");
+    (is_lua && candidate.is_file() && candidate.starts_with(&root)).then_some(candidate)
 }
 
 pub(super) fn escape_html(text: &str) -> String {
@@ -141,6 +145,9 @@ mod tests {
         let outside =
             std::env::temp_dir().join(format!("nitr-errpage-outside-{}", std::process::id()));
         std::fs::write(&outside, "secret\n").expect("write");
+        // Beside the script but not a module: the env file and a key.
+        std::fs::write(dir.join(".env"), "SECRET=1\n").expect("write");
+        std::fs::write(dir.join("key.pem"), "-----BEGIN\n").expect("write");
 
         let script_str = script.to_string_lossy().to_string();
         assert_eq!(
@@ -157,7 +164,12 @@ mod tests {
             resolve_source_path(&module.to_string_lossy(), Some(&script)),
             Some(module.canonicalize().expect("canonical"))
         );
-        for hostile in [outside.to_string_lossy().to_string(), "/etc/passwd".into()] {
+        for hostile in [
+            outside.to_string_lossy().to_string(),
+            "/etc/passwd".into(),
+            dir.join(".env").to_string_lossy().to_string(),
+            dir.join("key.pem").to_string_lossy().to_string(),
+        ] {
             assert_eq!(
                 resolve_source_path(&hostile, Some(&script)),
                 None,

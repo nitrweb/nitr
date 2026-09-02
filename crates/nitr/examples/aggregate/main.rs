@@ -17,7 +17,7 @@
 //! curl -X POST 'http://127.0.0.1:3000/transfer?from=alice&to=bob&amount=9999'
 //! ```
 
-use nitr::{Config, Server};
+use nitr::{Builtins, Config, Server};
 
 #[tokio::main]
 async fn main() -> nitr::Result {
@@ -45,6 +45,8 @@ async fn main() -> nitr::Result {
 
     Server::builder()
         .config(cfg)
+        // The minimal default set has neither `fetch` nor `db`.
+        .builtins(Builtins::minimal() | Builtins::FETCH | Builtins::DATABASE)
         // `nitr.ext.example.upstream`: the base URL the dashboard fetches
         // from, decided here rather than read from the request.
         .module("example", move |lua| {

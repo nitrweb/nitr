@@ -158,9 +158,11 @@ pub(crate) async fn try_serve(
 /// mount serves dotfiles or the path is under `.well-known/`.
 async fn resolve_in(mount: &StaticMount, rel: &str) -> Option<PathBuf> {
     let rel_path = rel.trim_start_matches('/');
+    // A lone `.` is the current directory, not a dotfile; `safe_join`
+    // skips it the way a browser would have.
     let hidden = rel_path
         .split(['/', '\\'])
-        .any(|segment| segment.starts_with('.'));
+        .any(|segment| segment != "." && segment.starts_with('.'));
     if hidden && !mount.dotfiles && !is_well_known(rel_path) {
         return None;
     }
@@ -589,6 +591,10 @@ mod tests {
                 .is_some()
         );
         assert!(resolve_in(&mount, "index.html").await.is_some());
+        assert!(
+            resolve_in(&mount, "./index.html").await.is_some(),
+            "a `.` segment is not a dotfile"
+        );
 
         let open = StaticMount::new("/", &dir, false, None).dotfiles(true);
         assert!(resolve_in(&open, ".env").await.is_some());

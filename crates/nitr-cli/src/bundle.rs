@@ -37,7 +37,7 @@ const TRAILER: u64 = 16;
 const CONFIG_NAME: &str = "nitr.toml";
 
 /// Reads the archive appended to `exe`, if any.
-fn read_appended(exe: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+pub(crate) fn read_appended(exe: &Path) -> anyhow::Result<Option<Vec<u8>>> {
     let mut file = std::fs::File::open(exe)
         .with_context(|| format!("cannot open the executable {}", exe.display()))?;
     let len = file.metadata()?.len();
@@ -101,7 +101,7 @@ pub fn load() -> anyhow::Result<Option<Config>> {
                 extract(&tar, &staging)?;
                 std::fs::File::create(staging.join(MARKER))?;
                 match std::fs::rename(&staging, &root) {
-                    Ok(()) => {}
+                    Ok(()) => sweep_stale_staging(&cache, &format!("app-{key:016x}.")),
                     // A concurrent start won the race; its extraction is
                     // complete.
                     Err(_) if root.join(MARKER).is_file() => {
@@ -116,6 +116,12 @@ pub fn load() -> anyhow::Result<Option<Config>> {
         }
         None => {
             let root = fresh_private_dir(&std::env::temp_dir(), "nitr-app")?;
+            // stderr, not tracing: the subscriber does not exist yet.
+            eprintln!(
+                "warning: no writable cache directory ($XDG_CACHE_HOME or $HOME/.cache); \
+                 extracting the bundle to {} for this run only",
+                root.display()
+            );
             extract(&tar, &root)?;
             root
         }
@@ -177,6 +183,20 @@ fn cache_root() -> Option<PathBuf> {
         }
     }
     Some(root)
+}
+
+/// Removes staging directories an earlier run left behind (a crash
+/// between extraction and rename), recognised by the finished
+/// directory's name plus a dot. Best effort.
+fn sweep_stale_staging(cache: &Path, prefix: &str) {
+    let Ok(entries) = std::fs::read_dir(cache) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(prefix) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Creates a new directory under `parent` with a unique name, mode 0700,
@@ -398,26 +418,30 @@ pub fn build(cfg_path: &Path, cfg: &Config, output: &Path) -> anyhow::Result<()>
 /// All `*.lua` files under `dir`, recursively, in stable order.
 ///
 /// Symlinked directories are followed (a shared module tree is a
-/// legitimate layout) but each real directory is entered once: `ln -s .
-/// loop` in the application directory used to spin the walk forever
-/// while the archive grew.
+/// legitimate layout, and two names for one tree are archived under
+/// both, since `require` will ask by name), but a link back into its own
+/// ancestry is skipped: `ln -s . loop` in the application directory used
+/// to spin the walk forever while the archive grew.
 fn lua_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
-    let mut visited = std::collections::HashSet::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(dir) = stack.pop() {
+    // Each entry carries the canonical path of every directory on the
+    // way down to it, so a cycle is recognised by the chain it closes.
+    let mut stack = vec![(dir.to_path_buf(), Vec::<PathBuf>::new())];
+    while let Some((dir, ancestors)) = stack.pop() {
         let real = dir
             .canonicalize()
             .with_context(|| format!("cannot resolve the directory {}", dir.display()))?;
-        if !visited.insert(real) {
+        if ancestors.contains(&real) {
             continue;
         }
         let entries = std::fs::read_dir(&dir)
             .with_context(|| format!("cannot read the directory {}", dir.display()))?;
+        let mut chain = ancestors;
+        chain.push(real);
         for entry in entries {
             let path = entry?.path();
             if path.is_dir() {
-                stack.push(path);
+                stack.push((path, chain.clone()));
             } else if path.extension().is_some_and(|ext| ext == "lua") {
                 out.push(path);
             }

@@ -68,7 +68,11 @@ templates, static files, migrations) to the running binary. The result is
 one executable with no dependency on the directory it was built from:
 
 - `dev_mode` is forced off — there are no source files to watch.
-- The extraction is a content-addressed temp directory, reused across
-  starts of the same artifact.
+- The extraction lives in the user's private cache
+  (`$XDG_CACHE_HOME/nitr/apps`, else `~/.cache/nitr/apps`, mode 0700),
+  content-addressed and reused across starts of the same artifact. With
+  no writable cache directory (a `ProtectHome=true` unit, a HOME-less
+  container user) the bundle is extracted into a fresh private temporary
+  directory on every start and a warning says where.
 - The **database path is untouched**: it resolves against the working
   directory as always. State stays outside the artifact, on purpose.

@@ -93,7 +93,8 @@ async fn main() -> nitr::Result {
     // root under the handler's directory is refused at startup (`require`
     // is pinned there, so an uploaded `.lua` would be a loadable module).
     // A private per-run directory keeps it out of the way.
-    let uploads = std::env::temp_dir().join(format!("nitr-standards-uploads-{}", std::process::id()));
+    let uploads =
+        std::env::temp_dir().join(format!("nitr-standards-uploads-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&uploads);
     {
         let mut builder = std::fs::DirBuilder::new();

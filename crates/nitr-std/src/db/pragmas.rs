@@ -113,11 +113,23 @@ pub fn open(path: &std::path::Path, pragmas: &SqlitePragmas) -> Result<Connectio
 /// filename; that is permitted so operators keep the maintenance
 /// statement, and it is the reason this is an authorizer rather than
 /// `SQLITE_LIMIT_ATTACHED = 0`, which would refuse `VACUUM` too.
+///
+/// SQLite hands the authorizer a filename only when the `ATTACH` argument
+/// is a string *literal*; a bound parameter, a concatenation or a
+/// subquery arrives with no argument at all, which rusqlite surfaces as
+/// `AuthAction::Unknown` carrying the raw action code. Those are denied
+/// too: the empty-filename attach `VACUUM` performs is always a literal,
+/// so a filename SQLite cannot show is never the one to allow.
 fn authorize(ctx: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization {
     use rusqlite::hooks::{AuthAction, Authorization};
     match ctx.action {
         AuthAction::Attach { filename: "" } => Authorization::Allow,
         AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
+        AuthAction::Unknown { code, .. }
+            if code == rusqlite::ffi::SQLITE_ATTACH || code == rusqlite::ffi::SQLITE_DETACH =>
+        {
+            Authorization::Deny
+        }
         _ => Authorization::Allow,
     }
 }
@@ -150,6 +162,10 @@ mod tests {
             format!("ATTACH DATABASE '{}' AS x", other.display()),
             "ATTACH DATABASE ':memory:' AS m".to_string(),
             format!("VACUUM INTO '{}'", other.display()),
+            // Non-literal filenames reach the authorizer with no argument
+            // at all; they must be refused just the same.
+            format!("ATTACH DATABASE ('{}' || '') AS y", other.display()),
+            format!("ATTACH DATABASE (SELECT '{}') AS z", other.display()),
         ] {
             let err = conn.execute_batch(&sql).expect_err(&sql);
             assert!(
@@ -157,6 +173,14 @@ mod tests {
                 "`{sql}` must be refused by the authorizer, got: {err}"
             );
         }
+        // And through a bound parameter.
+        let err = conn
+            .execute(
+                "ATTACH DATABASE ?1 AS p",
+                [other.to_string_lossy().as_ref()],
+            )
+            .expect_err("bound attach");
+        assert!(err.to_string().contains("authoriz"), "bound: {err}");
         assert!(!other.exists(), "no file may be created through SQL");
 
         conn.execute_batch("VACUUM")

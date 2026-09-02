@@ -7,32 +7,46 @@ use std::path::Path;
 use std::sync::Arc;
 
 use minijinja::{Environment, path_loader};
-use mlua::{
-    AnyUserData, ExternalResult, Lua, LuaSerdeExt, Table, UserData, UserDataMethods, Value,
-};
+use mlua::{AnyUserData, ExternalResult, Lua, Table, UserData, UserDataMethods, Value};
 
-pub(crate) struct LuaTemplate<'a>(Arc<Environment<'a>>);
+pub(crate) struct LuaTemplate(Arc<Environment<'static>>);
 
-impl UserData for LuaTemplate<'_> {
+impl UserData for LuaTemplate {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method_mut("render", |lua, templ, args: (String, Option<Table>)| {
-            let file_path = args.0;
-            let data = args.1;
+        // Async, and the work runs on the blocking pool: `get_template`
+        // reads the file on first use (every request, when the name is
+        // request-derived and misses), and rendering is CPU time — neither
+        // belongs on an async worker. Lua values cannot cross threads, so
+        // the context is converted to minijinja's own `Value` here, on
+        // the Lua thread, and only that crosses.
+        methods.add_async_method("render", |_, templ, args: (String, Option<Table>)| {
+            let (name, data) = args;
+            let env = templ.0.clone();
             // The context crosses into minijinja's `Serialize` bridge,
             // which recurses per nesting level exactly as serde_json does
             // and has no bound of its own — so this is the same guard
             // every other serializing builtin runs, for the same reason:
             // a deep enough table overflows the Rust stack, and an abort
             // is not something the per-request `catch_unwind` can catch.
-            if let Some(data) = &data {
-                crate::utils::check_json_bounds(&Value::Table(data.clone()))?;
+            let bounded = match &data {
+                Some(data) => crate::utils::check_json_bounds(&Value::Table(data.clone())),
+                None => Ok(()),
+            };
+            let context = bounded
+                .as_ref()
+                .ok()
+                .map(|()| minijinja::Value::from_serialize(&data));
+            async move {
+                bounded?;
+                let context = context.unwrap_or_default();
+                tokio::task::spawn_blocking(move || {
+                    env.get_template(&name)
+                        .and_then(|template| template.render(context))
+                })
+                .await
+                .map_err(mlua::Error::external)?
+                .into_lua_err()
             }
-            let templ_store = templ.0.clone();
-            let templ = templ_store
-                .get_template(file_path.as_str())
-                .into_lua_err()?;
-            let content = templ.render(data).into_lua_err()?;
-            lua.to_value(&content)
         });
     }
 }
@@ -90,8 +104,8 @@ mod tests {
     /// `render` must enforce the same boundary as every other serializing
     /// builtin: 128 levels through, 129 refused with a catchable error
     /// rather than an abort inside minijinja's serializer.
-    #[test]
-    fn render_bounds_its_context_at_the_shared_depth() {
+    #[tokio::test]
+    async fn render_bounds_its_context_at_the_shared_depth() {
         use mlua::ObjectLike as _;
 
         let lua = Lua::new();
@@ -101,14 +115,16 @@ mod tests {
             panic!("deep_table returns a table");
         };
         templ
-            .call_method::<String>("render", ("t.html", ok))
+            .call_async_method::<String>("render", ("t.html", ok))
+            .await
             .expect("a context at the bound still renders");
 
         let Value::Table(too_deep) = deep_table(&lua, MAX_JSON_DEPTH + 1) else {
             panic!("deep_table returns a table");
         };
         let err = templ
-            .call_method::<String>("render", ("t.html", too_deep))
+            .call_async_method::<String>("render", ("t.html", too_deep))
+            .await
             .expect_err("a context past the bound must be refused");
         assert!(
             err.to_string().contains("nested deeper than 128 levels"),
@@ -118,8 +134,8 @@ mod tests {
 
     /// HTML escaping is the default for any name that is not plain text,
     /// `.j2`-suffixed or not.
-    #[test]
-    fn templates_escape_html_unless_named_as_plain_text() {
+    #[tokio::test]
+    async fn templates_escape_html_unless_named_as_plain_text() {
         use mlua::ObjectLike as _;
 
         let lua = Lua::new();
@@ -137,19 +153,25 @@ mod tests {
         ctx.set("x", "<b>&</b>").expect("set");
 
         for name in ["page.j2", "page.html", "page", "mail.html.j2"] {
-            let out: String = templ.call_method("render", (name, &ctx)).expect("render");
+            let out: String = templ
+                .call_async_method("render", (name, &ctx))
+                .await
+                .expect("render");
             assert_eq!(out, "&lt;b&gt;&amp;&lt;&#x2f;b&gt;", "{name} must escape");
         }
         for name in ["mail.txt.j2", "data.json"] {
-            let out: String = templ.call_method("render", (name, &ctx)).expect("render");
+            let out: String = templ
+                .call_async_method("render", (name, &ctx))
+                .await
+                .expect("render");
             assert_eq!(out, "<b>&</b>", "{name} is plain text");
         }
     }
 
     /// The node budget reaches `render` too: a shared-subtree context is
     /// shallow, so only the work bound can refuse it.
-    #[test]
-    fn render_bounds_its_context_by_node_count() {
+    #[tokio::test]
+    async fn render_bounds_its_context_by_node_count() {
         use mlua::ObjectLike as _;
 
         let lua = Lua::new();
@@ -158,7 +180,8 @@ mod tests {
             panic!("dag_table returns a table");
         };
         let err = templ
-            .call_method::<String>("render", ("t.html", dag))
+            .call_async_method::<String>("render", ("t.html", dag))
+            .await
             .expect_err("a DAG context must be refused");
         assert!(
             err.to_string().contains("expands to more than"),

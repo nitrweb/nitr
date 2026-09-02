@@ -14,6 +14,7 @@ pub(crate) fn call(
     conn: &Connection,
     sql: &str,
     params: &[SqlValue],
+    _max_rows: usize,
 ) -> Result<Option<SqlRow>, rusqlite::Error> {
     let mut stmt = conn.prepare_cached(sql)?;
     let columns = stmt

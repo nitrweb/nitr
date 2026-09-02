@@ -48,7 +48,7 @@ A well-formed entity tag for whatever identifies the resource (a row version, an
 
 ### `nitr.csrf(opts) -> fun` (std feature: `http`)
 
-As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field). Options: `secret` (required), `cookie` (the cookie NAME, default `_csrf`), `header`, `field`, and `cookie_opts` (the cookie ATTRIBUTES, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set). Note `nitr.session` spells its attribute table `cookie` — here that key is the name.
+As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field). Options: `secret` (required), `cookie` (the cookie NAME, default `_csrf`), `header`, `field`, and `cookie_opts` (the cookie ATTRIBUTES, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set). Note `nitr.session` spells its attribute table `cookie` — here that key is the name. Unsafe requests a browser marks `Sec-Fetch-Site: cross-site` are refused before the token is checked, unless `cookie_opts.same_site = "None"` (the setting that means to accept cross-site posts).
 
 - `nitr.csrf.token(req) -> string` — The request's token, for a form or meta tag. Requires the middleware.
 
@@ -80,14 +80,14 @@ Runs fetch handles (and `db:query_async` handles) concurrently, passed as separa
 
 The minijinja template engine, loading from `[templating] dir`.
 
-- `nitr.template:render(name, data) -> string` — Renders a template.
+- `nitr.template:render(name, data) -> string` — Renders a template. HTML auto-escaping is on unless the name (before any `.j2`) ends in a plain-text extension (`.txt`, `.md`, `.csv`, `.json`, `.yaml`, `.toml`). Loading and rendering happen off the async worker.
 
 ### `nitr.db` (std feature: `db`)
 
 The SQLite database (`database` in nitr.toml): WAL, busy timeout, foreign keys on.
 
 - `nitr.db:execute(sql, params) -> integer` — Runs a statement.
-- `nitr.db:query(sql, params) -> table[]` — All rows, each a column→value table.
+- `nitr.db:query(sql, params) -> table[]` — All rows, each a column→value table. A result larger than `[database] max_rows` (default 10000) raises rather than truncating.
 - `nitr.db:query_row(sql, params) -> table|nil` — The first row as a column→value table, or nil when the query returns no rows.
 - `nitr.db:query_one(sql, params) -> table` — The row of a query that must return exactly one row (a column→value table); raises when it returns none or more than one.
 - `nitr.db:transaction(fn) -> any` — Runs `fn` atomically; rolls back on error. Nestable (savepoints). Use `tx`, not the outer `nitr.db`.
@@ -258,7 +258,7 @@ A response: `{ status, headers, body }` plus a cookie builder. Helpers build the
 
 Builder for `Set-Cookie` headers on a response.
 
-- `:set(name, value, opts)` — Adds a cookie. Options: `http_only`, `secure`, `path`, `domain`, `max_age` (seconds), `same_site` ("Strict"/"Lax"/"None").
+- `:set(name, value, opts)` — Adds a cookie. The name must be an RFC 6265 token and the value a cookie-octet string (no whitespace, quotes, commas, semicolons or backslashes — encode with `nitr.base64` or a signed cookie first); anything else raises. Options: `http_only`, `secure`, `path`, `domain`, `max_age` (seconds), `same_site` ("Strict"/"Lax"/"None").
 - `:set_signed(name, value, secret, opts)` — Adds an HMAC-signed cookie, verifiable later with `req.cookies:verify`.
 
 ### `nitr.App`
@@ -274,7 +274,7 @@ The application: routes, middleware, error handling, static mounts. Return it fr
 - `:options(path, ...)` — Registers an OPTIONS route (see `get`). Without one, OPTIONS answers 204 with `Allow`.
 - `:use(mw)` — Adds app-wide middleware: a factory `fn(next) -> fn(req)`. Must be called before any route.
 - `:on_error(handler)` — Sets the app-wide error handler: `fn(err, req)` where `err` is the structured error (`kind`, `message`, `source`, `line`, `traceback`, ...).
-- `:static(mount, dir, opts)` — Mounts a static directory, served in Rust. Options: `{ spa = boolean, cache_control = string }`.
+- `:static(mount, dir, opts)` — Mounts a static directory, served in Rust. Options: `{ spa = boolean, cache_control = string, dotfiles = boolean }` — dotfiles are hidden unless `dotfiles = true` (`.well-known/` is always served).
 
 ### `nitr.Part`
 

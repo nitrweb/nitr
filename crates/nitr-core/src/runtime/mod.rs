@@ -230,6 +230,12 @@ impl Runtime {
             let package: Table = lua.globals().get("package")?;
             package.set("loadlib", Value::Nil)?;
             package.set("cpath", "")?;
+            // `searchpath(name, template)` takes its template as an
+            // argument, never from `package.path`, so no pinning reaches
+            // it: `package.searchpath("passwd", "/etc/?")` answers whether
+            // any file on the box exists and is readable. Nothing in Nitr
+            // uses it (the confined searcher below does its own lookup).
+            package.set("searchpath", Value::Nil)?;
 
             // Confine `require` to the configured directory. Only the
             // pinning is conditional: without a directory there is nothing
