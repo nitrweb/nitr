@@ -59,7 +59,9 @@
 //! * **The shapes, exactly** ([`SHAPES`]). Every JSON-encoder edge a Lua
 //!   value has, with the output it actually produces today: `null` for
 //!   NaN and both infinities, `-0.0` preserved, `math.mininteger`
-//!   exact, a non-UTF8 string becoming an **array of bytes**, an empty
+//!   exact, a non-UTF8 string (value or key) **refused** with the
+//!   UTF-8 message — it used to come out as an array of bytes, a silent
+//!   change of type that a session field once fell into — an empty
 //!   table `{}` against an array-marked one `[]`, and the three lossy
 //!   cases — a mixed table dropping its map half, a sparse array dropping
 //!   everything past the first hole, and an integer key colliding with
@@ -96,6 +98,7 @@ const ENCODE_ERRORS: &[&str] = &[
     "key must be a string",
     "float key must be finite",
     "cannot serialize",
+    "not valid UTF-8",
 ];
 
 /// The guard in `nitr-std/src/utils.rs`.
@@ -131,12 +134,13 @@ const SHAPES: &[(&str, &str, Want)] = &[
         Want::Exact("-9223372036854775808"),
     ),
     // A Lua string is a byte string. Non-UTF8 bytes cannot be a JSON
-    // string, and come out as an array of numbers instead — a silent
-    // change of *type*, which is why it is pinned here.
+    // string; they used to come out as an array of numbers — a silent
+    // change of *type* — and are now refused before any serializer runs,
+    // with a message that names the remedy.
     (
         "a non-UTF8 string",
         "return '\\255\\254'",
-        Want::Exact("[255,254]"),
+        Want::Refused("not valid UTF-8"),
     ),
     ("an empty table", "return {}", Want::Exact("{}")),
     (
@@ -181,10 +185,12 @@ const SHAPES: &[(&str, &str, Want)] = &[
         "return {[{}] = 1}",
         Want::Refused("key must be a string"),
     ),
+    // Keys walk through the same guard as values, so the UTF-8 refusal
+    // fires before serde's own "key must be a string" would.
     (
         "a non-UTF8 key",
         "return {['\\255'] = 1}",
-        Want::Refused("key must be a string"),
+        Want::Refused("not valid UTF-8"),
     ),
     (
         "a function value",

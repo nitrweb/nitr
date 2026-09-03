@@ -120,6 +120,34 @@ mod tests {
     /// deep-enough table chain overflowed the Rust stack — a process
     /// kill no panic boundary can contain (verified as SIGABRT at
     /// ~30,000 levels before the guard existed).
+    /// A non-UTF-8 Lua string is refused by `encode`, as a value and as a
+    /// key, with the message that names the remedy. It used to serialize
+    /// as an array of byte values — a silent change of type the fuzz
+    /// target pinned as "expected" until a session field fell into it.
+    #[test]
+    fn encode_refuses_non_utf8_strings_instead_of_emitting_byte_arrays() {
+        let lua = Lua::new();
+        let json = create_json_fn(&lua).expect("json");
+        for (label, src) in [
+            ("value", "return '\\255\\254'"),
+            ("nested value", "return { raw = '\\255' }"),
+            ("key", "return { ['\\255'] = 1 }"),
+        ] {
+            let value: Value = lua.load(src).eval().expect(label);
+            let err = json
+                .call_method::<String>("encode", value)
+                .expect_err(label);
+            assert!(
+                err.to_string().contains("not valid UTF-8"),
+                "{label}: {err}"
+            );
+        }
+        // UTF-8 with non-ASCII content is still a plain JSON string.
+        let value: Value = lua.load("return 'caf\u{e9}'").eval().expect("utf8");
+        let text: String = json.call_method("encode", value).expect("encode");
+        assert_eq!(text, "\"caf\u{e9}\"");
+    }
+
     #[test]
     fn encode_rejects_values_nested_beyond_the_depth_bound() {
         let lua = Lua::new();
