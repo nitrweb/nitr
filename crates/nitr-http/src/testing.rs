@@ -87,7 +87,7 @@ impl TestClient {
             peer_addr: peer,
             req,
             params: Vec::new(),
-            id,
+            id: id.into(),
             // Replaced with the configured bounds by the handler.
             limits: Default::default(),
             cached_form: None,

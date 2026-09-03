@@ -124,14 +124,20 @@ where
     // bind values — statements can embed secrets, and logs outlive them.
     // DEBUG so the per-request decomposition is opt-in via the level
     // filter.
-    let stmt_tag = stmt_tag(&sql);
+    // The tag is hashed and formatted only when something consumes it: the
+    // span at DEBUG, or the error path. At INFO neither happens, and a
+    // statement used to pay a hash of its whole text plus a `format!`
+    // regardless.
     let span = tracing::debug_span!(
         "db_query",
         kind,
-        stmt = %stmt_tag,
+        stmt = tracing::field::Empty,
         elapsed_ms = tracing::field::Empty
     );
-    let started = std::time::Instant::now();
+    let started = (!span.is_disabled()).then(|| {
+        span.record("stmt", stmt_tag(&sql).as_str());
+        std::time::Instant::now()
+    });
     let result = tokio::task::spawn_blocking(move || {
         let db = conn.lock().map_err(|_| {
             mlua::Error::RuntimeError("failed to lock the database connection".into())
@@ -157,13 +163,19 @@ where
         // email address in a literal into both. The tag keeps repeated
         // failures groupable without carrying what the statement said.
         f(conn, &sql, &params, db.max_rows).map_err(|err| {
-            mlua::Error::RuntimeError(format!("{kind} failed (stmt {stmt_tag}): {}", redact(&err)))
+            mlua::Error::RuntimeError(format!(
+                "{kind} failed (stmt {}): {}",
+                stmt_tag(&sql),
+                redact(&err)
+            ))
         })
     })
     .instrument(span.clone())
     .await
     .map_err(mlua::Error::external)?;
-    span.record("elapsed_ms", started.elapsed().as_millis() as u64);
+    if let Some(started) = started {
+        span.record("elapsed_ms", started.elapsed().as_millis() as u64);
+    }
     result
 }
 

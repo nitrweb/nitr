@@ -113,7 +113,11 @@ impl RuntimePool {
             wait_ms = tracing::field::Empty,
             outcome = tracing::field::Empty,
         );
-        let started = std::time::Instant::now();
+        // The clock is read only when the span is enabled: a disabled span
+        // records nothing, and two `clock_gettime` calls per request are
+        // measurable at the level this path runs at (`get_timeout_hit` vs
+        // `pool_checkout` in crates/nitr/benches/runtime.rs).
+        let started = (!span.is_disabled()).then(std::time::Instant::now);
         let got = async {
             if wait.is_zero() {
                 Some(self.get().await)
@@ -131,8 +135,10 @@ impl RuntimePool {
         }
         .instrument(span.clone())
         .await;
-        span.record("wait_ms", started.elapsed().as_millis() as u64);
-        span.record("outcome", if got.is_some() { "hit" } else { "shed" });
+        if let Some(started) = started {
+            span.record("wait_ms", started.elapsed().as_millis() as u64);
+            span.record("outcome", if got.is_some() { "hit" } else { "shed" });
+        }
         got
     }
 

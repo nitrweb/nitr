@@ -85,6 +85,39 @@ fn both_script_forms_still_evaluate() {
     std::fs::remove_file(&path).ok();
 }
 
+#[test]
+fn a_bare_call_script_evaluates_as_an_expression() {
+    // `f()` is valid as an expression *and* as a call statement. The
+    // expression parse must stay first for this shape: as a block the
+    // chunk would compile fine and evaluate to nothing.
+    let rt = Runtime::new().expect("runtime");
+    let path = write_temp_script("call-expr.lua", "-- comment\nstring.rep('ab', 2)");
+    let value = rt.eval_script(&path).expect("call expression");
+    std::fs::remove_file(&path).ok();
+    match value {
+        Value::String(s) => assert_eq!(s.to_str().expect("utf-8").as_ref(), "abab"),
+        other => panic!("expected the call's result, got {}", other.type_name()),
+    }
+}
+
+#[test]
+fn block_form_typos_report_the_real_line() {
+    // A handler-shaped script (leading comment, then `local`): the
+    // expression parse is skipped for it, and the diagnostic must still be
+    // the block parse's own — line 3, the typo — exactly as when both
+    // parses ran and the furthest error won.
+    let rt = Runtime::new().expect("runtime");
+    let path = write_temp_script(
+        "block-typo.lua",
+        "-- comment\nlocal ok = 1\nlodcal users = 2\nreturn {}",
+    );
+    let err = rt.eval_script(&path).expect_err("typo must fail the load");
+    std::fs::remove_file(&path).ok();
+    let message = err.to_string();
+    assert!(message.contains("block-typo.lua:3"), "{message}");
+    assert!(message.contains("near 'users'"), "{message}");
+}
+
 #[tokio::test]
 async fn function_calls_round_trip() {
     let mut rt = test_runtime(Some(Duration::from_secs(5)));

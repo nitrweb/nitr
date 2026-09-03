@@ -73,6 +73,18 @@ impl Encoding {
             _ => None,
         }
     }
+
+    /// [`from_token`](Self::from_token) for a token as a client spelled
+    /// it (`GZIP`, `Br`), without lowercasing a copy first.
+    fn from_token_ignore_ascii_case(token: &str) -> Option<Self> {
+        if token.eq_ignore_ascii_case("br") {
+            Some(Encoding::Brotli)
+        } else if token.eq_ignore_ascii_case("gzip") {
+            Some(Encoding::Gzip)
+        } else {
+            None
+        }
+    }
 }
 
 /// The compiled `[compression]` policy plus the negotiation machinery,
@@ -142,16 +154,32 @@ impl Compression {
         }
     }
 
+    /// Whether on-the-fly compression can act on a response at all, so the
+    /// dynamic path can skip negotiating a value it would discard.
+    /// Sidecar selection on the static path negotiates regardless.
+    pub(crate) fn negotiates(&self) -> bool {
+        #[cfg(feature = "compression")]
+        {
+            self.enabled
+        }
+        #[cfg(not(feature = "compression"))]
+        {
+            false
+        }
+    }
+
     /// The best encoding for this request, considering only what the server
     /// offers. Used for sidecar lookup, so it ignores `enabled`.
+    ///
+    /// Allocation-free: the header is scanned in place, once per offered
+    /// encoding in server preference order, so the `algorithms` list is a
+    /// real knob rather than advisory.
     pub fn negotiate(&self, accept_encoding: Option<&HeaderValue>) -> Option<Encoding> {
-        let accepted = parse_accept_encoding(accept_encoding?.to_str().ok()?);
-        // Server preference order wins among everything the client accepts,
-        // so the `algorithms` list is a real knob rather than advisory.
+        let value = accept_encoding?.to_str().ok()?;
         self.algorithms
             .iter()
             .copied()
-            .find(|enc| accepted.iter().any(|(token, q)| *q > 0.0 && token == enc))
+            .find(|enc| accept_encoding_entries(value).any(|(token, q)| q > 0.0 && token == *enc))
     }
 
     /// Compresses a response in place when the policy allows it.
@@ -242,6 +270,8 @@ impl Compression {
         {
             return false;
         }
+        // Compared case-insensitively in place: the patterns are lowercased
+        // once at construction, so the response's type is never copied.
         let content_type = headers
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
@@ -249,19 +279,35 @@ impl Compression {
             .split(';')
             .next()
             .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        if content_type.is_empty() || INCOMPRESSIBLE.iter().any(|p| content_type.starts_with(p)) {
+            .trim();
+        if content_type.is_empty()
+            || INCOMPRESSIBLE
+                .iter()
+                .any(|p| starts_with_ignore_ascii_case(content_type, p))
+        {
             return false;
         }
         self.types
             .iter()
             .any(|pattern| match pattern.strip_suffix('*') {
-                Some(prefix) => content_type.starts_with(prefix),
-                None => *pattern == content_type,
+                Some(prefix) => starts_with_ignore_ascii_case(content_type, prefix),
+                None => pattern.eq_ignore_ascii_case(content_type),
             })
     }
 }
+
+/// `haystack.to_ascii_lowercase().starts_with(prefix)` for an already
+/// lowercase `prefix`, without the copy.
+#[cfg(feature = "compression")]
+fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
+    haystack
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+#[cfg(feature = "compression")]
+impl Compression {}
 
 /// The weak validator for an encoded representation: `"abc"` under gzip
 /// becomes `W/"abc-gzip"` — a well-formed entity-tag (the suffix stays
@@ -279,18 +325,20 @@ pub(crate) fn weaken_etag(etag: &str, token: &str) -> String {
 /// Parses `Accept-Encoding` into (encoding, q-value) pairs, keeping only
 /// codings we can produce.
 pub fn parse_accept_encoding(value: &str) -> Vec<(Encoding, f32)> {
-    value
-        .split(',')
-        .filter_map(|entry| {
-            let mut parts = entry.split(';');
-            let token = parts.next()?.trim().to_ascii_lowercase();
-            let encoding = Encoding::from_token(&token)?;
-            let q = parts
-                .find_map(|p| p.trim().strip_prefix("q=")?.parse::<f32>().ok())
-                .unwrap_or(1.0);
-            Some((encoding, q))
-        })
-        .collect()
+    accept_encoding_entries(value).collect()
+}
+
+/// The entries of an `Accept-Encoding` value, borrowed: no token is copied
+/// or lowercased, so [`Compression::negotiate`] runs without allocating.
+fn accept_encoding_entries(value: &str) -> impl Iterator<Item = (Encoding, f32)> + '_ {
+    value.split(',').filter_map(|entry| {
+        let mut parts = entry.split(';');
+        let encoding = Encoding::from_token_ignore_ascii_case(parts.next()?.trim())?;
+        let q = parts
+            .find_map(|p| p.trim().strip_prefix("q=")?.parse::<f32>().ok())
+            .unwrap_or(1.0);
+        Some((encoding, q))
+    })
 }
 
 #[cfg(feature = "compression")]

@@ -40,17 +40,15 @@ fn sanitize(msg: &str) -> std::borrow::Cow<'_, str> {
     if !msg.chars().any(|c| c.is_control() && c != '\t') {
         return std::borrow::Cow::Borrowed(msg);
     }
-    std::borrow::Cow::Owned(
-        msg.chars()
-            .flat_map(|c| {
-                if c.is_control() && c != '\t' {
-                    c.escape_default().collect::<Vec<_>>()
-                } else {
-                    vec![c]
-                }
-            })
-            .collect(),
-    )
+    let mut out = String::with_capacity(msg.len() + 8);
+    for c in msg.chars() {
+        if c.is_control() && c != '\t' {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// The four Lua-facing log levels, as a closed enum so the dispatch below
@@ -77,6 +75,21 @@ pub(crate) fn create_log_table(lua: &Lua) -> mlua::Result<Table> {
         table.set(
             name,
             lua.create_function(move |_, (msg, fields): (String, Option<Table>)| {
+                // The level filter is consulted first: a filtered-out call
+                // used to walk and serialize its fields table and sanitize
+                // the message before the macro could say no, which made a
+                // `debug` line with fields cost ~3 µs in production
+                // (`stdlib::log` benches). The `enabled!` check is the
+                // same callsite test the macros run.
+                let enabled = match level {
+                    LuaLevel::Debug => tracing::enabled!(target: "lua", tracing::Level::DEBUG),
+                    LuaLevel::Info => tracing::enabled!(target: "lua", tracing::Level::INFO),
+                    LuaLevel::Warn => tracing::enabled!(target: "lua", tracing::Level::WARN),
+                    LuaLevel::Error => tracing::enabled!(target: "lua", tracing::Level::ERROR),
+                };
+                if !enabled {
+                    return Ok(());
+                }
                 let msg = sanitize(&msg);
                 match (level, fields_json(fields)) {
                     (LuaLevel::Debug, Some(f)) => {

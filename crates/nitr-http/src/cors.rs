@@ -171,8 +171,12 @@ impl Cors {
 
     /// Appends the `Access-Control-*` headers to an ordinary (non-preflight)
     /// cross-origin response.
-    pub(crate) fn apply(&self, req_headers: &HeaderMap, resp_headers: &mut HeaderMap) {
-        let Some(origin) = req_headers.get(header::ORIGIN) else {
+    ///
+    /// Takes the request's `Origin` value rather than its header map: the
+    /// caller keeps only that value across the handler, not a copy of
+    /// every request header.
+    pub(crate) fn apply(&self, origin: Option<&HeaderValue>, resp_headers: &mut HeaderMap) {
+        let Some(origin) = origin else {
             return;
         };
         // The response body varies by origin even when the request is
@@ -258,7 +262,9 @@ mod tests {
         });
         let mut out = HeaderMap::new();
         policy.apply(
-            request(Method::GET, &[("origin", "https://a.example")]).headers(),
+            request(Method::GET, &[("origin", "https://a.example")])
+                .headers()
+                .get(header::ORIGIN),
             &mut out,
         );
         assert_eq!(out[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
@@ -273,7 +279,9 @@ mod tests {
         });
         let mut out = HeaderMap::new();
         policy.apply(
-            request(Method::GET, &[("origin", "https://evil.example")]).headers(),
+            request(Method::GET, &[("origin", "https://evil.example")])
+                .headers()
+                .get(header::ORIGIN),
             &mut out,
         );
         assert!(!out.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));

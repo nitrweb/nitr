@@ -23,7 +23,7 @@ pub(super) struct LimitedBody {
     pub(super) inner: IncomingBody,
     pub(super) limit: u64,
     pub(super) read: u64,
-    pub(super) exceeded: Arc<AtomicBool>,
+    pub(super) flags: Arc<BodyFlags>,
 }
 
 impl Body for LimitedBody {
@@ -44,7 +44,7 @@ impl Body for LimitedBody {
         if let Some(data) = frame.data_ref() {
             this.read += data.len() as u64;
             if this.read > this.limit {
-                this.exceeded.store(true, Ordering::Relaxed);
+                this.flags.oversized.store(true, Ordering::Relaxed);
                 return Poll::Ready(Some(Err(Box::new(BodyTooLarge(this.limit)))));
             }
         }
@@ -80,7 +80,7 @@ pub(super) struct StalledBody {
     /// Armed while the inner body is pending; `None` whenever it last
     /// made progress.
     pub(super) deadline: Option<Pin<Box<tokio::time::Sleep>>>,
-    pub(super) stalled: Arc<AtomicBool>,
+    pub(super) flags: Arc<BodyFlags>,
 }
 
 impl Body for StalledBody {
@@ -104,7 +104,7 @@ impl Body for StalledBody {
                     .get_or_insert_with(|| Box::pin(tokio::time::sleep(budget)));
                 match deadline.as_mut().poll(cx) {
                     Poll::Ready(()) => {
-                        this.stalled.store(true, Ordering::Relaxed);
+                        this.flags.stalled.store(true, Ordering::Relaxed);
                         Poll::Ready(Some(Err(Box::new(BodyStalled(budget)))))
                     }
                     Poll::Pending => Poll::Pending,
@@ -138,9 +138,28 @@ impl std::error::Error for BodyStalled {}
 /// either violation surfaces it has crossed into Lua and become an opaque
 /// error value, so the handler reads these to answer `413`/`408` instead
 /// of a generic `500`.
-pub(crate) struct BodyGuards {
+///
+/// Both flags share one allocation: the wrappers and the handler hold the
+/// same `Arc`, so installing the guards costs one refcount, not two.
+pub(crate) struct BodyGuards(pub(super) Arc<BodyFlags>);
+
+/// The two violations a guarded body can record.
+#[derive(Default)]
+pub(super) struct BodyFlags {
     /// The body exceeded the byte ceiling.
-    pub(crate) oversized: Arc<AtomicBool>,
+    pub(super) oversized: AtomicBool,
     /// A body read made no progress within the stall budget.
-    pub(crate) stalled: Arc<AtomicBool>,
+    pub(super) stalled: AtomicBool,
+}
+
+impl BodyGuards {
+    /// The body exceeded the byte ceiling.
+    pub(crate) fn oversized(&self) -> bool {
+        self.0.oversized.load(Ordering::Relaxed)
+    }
+
+    /// A body read made no progress within the stall budget.
+    pub(crate) fn stalled(&self) -> bool {
+        self.0.stalled.load(Ordering::Relaxed)
+    }
 }

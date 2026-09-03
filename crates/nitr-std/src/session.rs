@@ -102,8 +102,8 @@ fn serialize(session: &Table, max_age: Option<i64>, now: i64) -> mlua::Result<St
         )));
     }
     let session = Value::Table(session.clone());
-    crate::utils::check_json_bounds(&session)?;
-    let mut json = serde_json::to_value(&session).map_err(|err| {
+    let bounds = crate::bounded::Bounds::new(true);
+    let mut json = serde_json::to_value(crate::bounded::Guarded::new(&session, &bounds)).map_err(|err| {
         mlua::Error::RuntimeError(format!(
             "session values must be JSON-serializable (strings, numbers, booleans, tables): {err}"
         ))

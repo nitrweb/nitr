@@ -5,7 +5,7 @@
 
 use rusqlite::{Connection, params_from_iter};
 
-use crate::db::types::{SqlRow, SqlValue, read_row};
+use crate::db::types::{SqlRow, SqlValue, column_names, read_row};
 
 /// Runs a query expected to return exactly one row and returns it.
 pub(crate) fn call(
@@ -15,11 +15,7 @@ pub(crate) fn call(
     _max_rows: usize,
 ) -> Result<SqlRow, rusqlite::Error> {
     let mut stmt = conn.prepare_cached(sql)?;
-    let columns = stmt
-        .column_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
+    let columns = column_names(&stmt);
 
     stmt.query_one(params_from_iter(params), |row| read_row(&columns, row))
 }

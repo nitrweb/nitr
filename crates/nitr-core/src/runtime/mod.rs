@@ -28,6 +28,18 @@ const MEMORY_LIMIT: usize = 8 * 1024 * 1024; // 8 MiB
 const EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How often (in Lua VM instructions) the execution-deadline hook runs.
+///
+/// Not a throughput knob. While a count hook is set, Lua 5.4 keeps the
+/// interpreter on its trap path for *every* instruction (`luaG_traceexec`
+/// returns 1 whenever the counter has not reached zero — `ldebug.c`), so
+/// the cost is per instruction whatever the interval; the interval only
+/// decides how often the Rust closure runs. Measured with the `hook`
+/// group in `crates/nitr/benches/runtime.rs` (2026-09-03, i7-6500U): a
+/// 100 000-iteration arithmetic loop takes 0.99 ms without the hook and
+/// 2.08 ms with it, and 2.06 ms at 4 000, 40 000 and 400 000 alike. That
+/// factor of two on pure interpreter time is the price of stopping
+/// `while true do end`, and raising this value would not recover any of
+/// it — it would only coarsen the deadline's resolution.
 const HOOK_INSTRUCTION_INTERVAL: u32 = 4000;
 
 /// Extra wall-clock grace given to the outer async timeout so the
@@ -74,6 +86,12 @@ load = function(chunk, name, _, ...)
 end
 if string then string.dump = nil end
 
+-- Cost, measured with the `pcall` group in crates/nitr/benches/runtime.rs
+-- (2026-09-03): the two extra frames and vararg round trips make a
+-- successful pcall about 100 ns slower (10 000 calls: 1.12 ms stock,
+-- 2.14 ms wrapped). Kept as is: the success path never crosses into
+-- Rust, and the uncatchable budget error is what stops
+-- `while true do pcall(...) end` from pinning a worker.
 local function guard(ok, ...)
     if not ok and tripped() then error(budget_msg, 0) end
     return ok, ...
@@ -506,6 +524,14 @@ impl Runtime {
                         // could serve its next request with the previous
                         // one's work still in flight. Close the stack now
                         // and collect, so the future is dropped here.
+                        //
+                        // Measured (`gc_collect_loaded_state` in
+                        // crates/nitr/benches/runtime.rs): a full
+                        // collection over ~3 MiB of live tables is ~1 ms,
+                        // paid once per timed-out request on this worker
+                        // — nothing next to the budget that request
+                        // already spent, so it stays inline rather than
+                        // hopping to the blocking pool.
                         let _ = thread.reset(f);
                         let _ = self.lua.gc_collect();
                         self.thread = Some(thread);

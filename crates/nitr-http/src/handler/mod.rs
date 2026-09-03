@@ -91,10 +91,17 @@ pub(crate) async fn handle(
         resp.headers_mut().insert("x-request-id", value);
     }
     if let Some(cors) = protection.cors() {
-        cors.apply(&head.headers, resp.headers_mut());
+        cors.apply(head.origin.as_ref(), resp.headers_mut());
     }
-    let encoding = protection.compression().negotiate(head.accept_encoding());
-    resp = protection.compression().apply(resp, encoding);
+    // Negotiated only when on-the-fly compression can act on the answer:
+    // with `[compression] enabled = false` (the default) the parse was
+    // pure waste on every request that carried the header. The static
+    // path negotiates for itself — sidecars are served regardless.
+    let compression = protection.compression();
+    if compression.negotiates() {
+        let encoding = compression.negotiate(head.accept_encoding.as_ref());
+        resp = compression.apply(resp, encoding);
+    }
     // Last: HEAD is defined as GET with the body removed, so it must see
     // every header the GET would have had, compression included.
     if head.method == Method::HEAD {
@@ -105,21 +112,24 @@ pub(crate) async fn handle(
 
 /// The parts of a request the response phase still needs after the request
 /// itself has been handed to Lua.
+///
+/// Only the two header values that phase reads are kept — each a
+/// refcounted `Bytes` clone — rather than a copy of the whole map, which
+/// cost two allocations and a walk of every header on every request.
 struct RequestHead {
     method: Method,
-    headers: header::HeaderMap,
+    accept_encoding: Option<header::HeaderValue>,
+    origin: Option<header::HeaderValue>,
 }
 
 impl RequestHead {
     fn of(req: &LuaRequest) -> Self {
+        let headers = req.req.headers();
         Self {
             method: req.req.method().clone(),
-            headers: req.req.headers().clone(),
+            accept_encoding: headers.get(header::ACCEPT_ENCODING).cloned(),
+            origin: headers.get(header::ORIGIN).cloned(),
         }
-    }
-
-    fn accept_encoding(&self) -> Option<&header::HeaderValue> {
-        self.headers.get(header::ACCEPT_ENCODING)
     }
 }
 
@@ -240,12 +250,16 @@ async fn handle_inner(
             // any `nitr.log` lines it emits nested inside. DEBUG so the
             // decomposition is opt-in via the level filter.
             let span = tracing::debug_span!("lua_handler", elapsed_ms = tracing::field::Empty);
-            let started = std::time::Instant::now();
+            // The clock is read only when the span is enabled; a disabled
+            // span records nothing.
+            let started = (!span.is_disabled()).then(std::time::Instant::now);
             let called = rt
                 .call_function::<LuaTable>(chain, &req_ud)
                 .instrument(span.clone())
                 .await;
-            span.record("elapsed_ms", started.elapsed().as_millis() as u64);
+            if let Some(started) = started {
+                span.record("elapsed_ms", started.elapsed().as_millis() as u64);
+            }
             let err = match called {
                 // `finish` releases the body itself: a streaming body may
                 // still be reading from the request.
@@ -256,7 +270,7 @@ async fn handle_inner(
             // An oversized body is a rejection, not an application failure:
             // answer it in Rust and skip the app's error handler, which
             // would only see an opaque read error.
-            if guards.oversized.load(std::sync::atomic::Ordering::Relaxed) {
+            if guards.oversized() {
                 tracing::debug!("request rejected: body exceeded max_body_bytes");
                 discard_body(&req_ud);
                 return plain_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large");
@@ -264,7 +278,7 @@ async fn handle_inner(
             // A stalled body likewise: the client is the culprit, and the
             // connection is closed with the response — keep-alive would
             // hand a misbehaving client a fresh slot.
-            if guards.stalled.load(std::sync::atomic::Ordering::Relaxed) {
+            if guards.stalled() {
                 tracing::warn!("request rejected: body read stalled beyond [limits] body_read_ms");
                 discard_body(&req_ud);
                 let mut resp = plain_response(StatusCode::REQUEST_TIMEOUT, "Request Timeout")?;

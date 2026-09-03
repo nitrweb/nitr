@@ -25,16 +25,24 @@ pub fn is_fresh(
         };
         let etag = strip_weak(etag);
         return candidates.split(',').any(|candidate| {
-            let candidate = strip_weak(candidate.trim());
-            // `*` matches any existing representation, and the weak/strong
-            // prefix is not part of the comparison this header calls for.
-            // A tag the compression layer derived for an encoded variant
-            // (`"abc-gzip"`) names the same bytes as `"abc"`: a client
-            // that cached the gzip form must revalidate as fresh, or every
-            // conditional request of a compressed response is a full 200
-            // plus a recompress.
-            candidate == "*"
-                || candidate == etag
+            let candidate = candidate.trim();
+            // `*` matches any existing representation — as the bare member
+            // only. It is checked *before* the weak prefix comes off: `W/*`
+            // is not the wildcard (RFC 9110 has no weak wildcard), it is a
+            // malformed tag compared like any other. The fuzzer found the
+            // difference through the upper-cased near miss of a handler
+            // tag `w/*`, which used to certify every resource as unchanged.
+            if candidate == "*" {
+                return true;
+            }
+            // The weak/strong prefix is not part of the comparison this
+            // header calls for. A tag the compression layer derived for an
+            // encoded variant (`"abc-gzip"`) names the same bytes as
+            // `"abc"`: a client that cached the gzip form must revalidate
+            // as fresh, or every conditional request of a compressed
+            // response is a full 200 plus a recompress.
+            let candidate = strip_weak(candidate);
+            candidate == etag
                 || strip_encoding_suffix(candidate).is_some_and(|base| base == etag)
         });
     }
@@ -74,6 +82,30 @@ fn strip_encoding_suffix(tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Found by the `conditional_headers` fuzz target: `W/*` weak-stripped
+    /// to `*` and matched everything. Only the bare `*` member is the
+    /// wildcard; `W/*` is a tag like any other and matches only itself.
+    #[test]
+    fn a_weak_prefixed_star_is_not_the_wildcard() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("if-none-match", "W/*".parse().expect("value"));
+        assert!(!is_fresh(&headers, Some("\"abc\""), None));
+        assert!(!is_fresh(&headers, Some("w/*"), None));
+        // The exact input the fuzzer reported.
+        headers.insert(
+            "if-none-match",
+            "w/*x, W/w/*x, w/, W/*".parse().expect("value"),
+        );
+        assert!(!is_fresh(&headers, Some("w/*"), None));
+        // The bare wildcard still matches, alone and inside a list, and
+        // still needs a tag to match against.
+        for list in ["*", " * ", "\"aaa\", *, W/\"bbb\""] {
+            headers.insert("if-none-match", list.parse().expect("value"));
+            assert!(is_fresh(&headers, Some("\"abc\""), None), "{list:?}");
+            assert!(!is_fresh(&headers, None, None), "{list:?}");
+        }
+    }
 
     #[test]
     fn encoded_variant_tags_revalidate_against_the_identity_tag() {

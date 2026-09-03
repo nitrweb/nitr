@@ -14,13 +14,15 @@ pub(crate) struct LuaJson;
 
 impl UserData for LuaJson {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method_mut("encode", |lua, _, input: Value| {
-            crate::utils::check_json_bounds(&input)?;
-            let s = serde_json::to_string(&input).into_lua_err()?;
-            lua.to_value(&s)
+        methods.add_method("encode", |lua, _, input: Value| {
+            // The bounds are enforced inside the one serialization pass.
+            let s = crate::bounded::to_json_string(&input).into_lua_err()?;
+            // A plain string: no need to run the serializer a second time
+            // to turn it into a Lua value.
+            lua.create_string(&s)
         });
 
-        methods.add_method_mut("decode", |lua, _, input: LuaString| {
+        methods.add_method("decode", |lua, _, input: LuaString| {
             // serde_json's default recursion limit (128) is load-bearing
             // here: it is what stops hostile deeply nested input from
             // overflowing the stack, with an ordinary error, before
@@ -38,8 +40,7 @@ impl UserData for LuaJson {
         methods.add_meta_method(
             MetaMethod::Call,
             |lua, _, (value, status): (Value, Option<u16>)| {
-                crate::utils::check_json_bounds(&value)?;
-                let body = serde_json::to_string(&value).into_lua_err()?;
+                let body = crate::bounded::to_json_string(&value).into_lua_err()?;
                 let table = crate::http::response_table(lua, status.unwrap_or(200))?;
                 table
                     .get::<Table>("headers")?

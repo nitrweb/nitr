@@ -73,25 +73,39 @@ impl SqlValue {
 
 /// A single result row as plain data: `(column name, value)` pairs in
 /// column order.
-pub(crate) type SqlRow = Vec<(String, SqlValue)>;
+/// A result row: column names are shared across every row of one query
+/// (an `Arc<str>` each, cloned per cell) instead of being copied per cell.
+pub(crate) type SqlRow = Vec<(Arc<str>, SqlValue)>;
+
+/// The column names of a prepared statement, shared by all its rows.
+pub(crate) fn column_names(stmt: &rusqlite::Statement<'_>) -> Vec<Arc<str>> {
+    stmt.column_names().iter().map(|s| Arc::from(*s)).collect()
+}
 
 /// Converts a result row into a Lua table keyed by column name.
+///
+/// `raw_set`: a fresh table has no metatable, so the metamethod-aware
+/// `set` had nothing to consult and only cost the check.
 pub(crate) fn row_to_lua(lua: &Lua, row: SqlRow) -> mlua::Result<Table> {
-    let table = lua.create_table()?;
+    let table = lua.create_table_with_capacity(0, row.len())?;
     for (column, value) in row {
-        table.set(column, value.into_lua(lua)?)?;
+        table.raw_set(&*column, value.into_lua(lua)?)?;
     }
     Ok(table)
 }
 
 /// Extracts SQL parameters from an optional Lua table (array part order).
+///
+/// The sequence is walked as a sequence: `pairs` materialized every key
+/// only to discard it, and its order is not the positional order the
+/// `?1, ?2` binding depends on.
 pub(crate) fn params_from_table(params: Option<&Table>) -> mlua::Result<Vec<SqlValue>> {
     let mut out = vec![];
     let Some(table) = params else {
         return Ok(out);
     };
-    for pair in table.pairs::<Value, Value>() {
-        let (_, v) = pair.into_lua_err()?;
+    for v in table.sequence_values::<Value>() {
+        let v = v.into_lua_err()?;
         match v {
             Value::Nil => out.push(SqlValue::Null),
             Value::Boolean(b) => out.push(SqlValue::Bool(b)),
@@ -111,7 +125,7 @@ pub(crate) fn params_from_table(params: Option<&Table>) -> mlua::Result<Vec<SqlV
 
 /// Reads all columns of the current row as plain data.
 pub(crate) fn read_row(
-    columns: &[String],
+    columns: &[Arc<str>],
     row: &rusqlite::Row<'_>,
 ) -> Result<SqlRow, rusqlite::Error> {
     let mut out = Vec::with_capacity(columns.len());

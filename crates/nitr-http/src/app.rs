@@ -244,6 +244,10 @@ pub(crate) fn load(
     let value = rt.eval_script(script)?;
     let (dispatch, mut statics) = compile(value, script)?;
     statics.extend_from_slice(base_statics);
+    // Longest mount prefix first, once: the static path used to collect
+    // and sort the candidates on every request. Stable, so mounts of equal
+    // length keep their registration order, script mounts before `[static]`.
+    statics.sort_by_key(|m| std::cmp::Reverse(m.mount.len()));
     let state = rt.lua().create_userdata(AppState {
         dispatch,
         statics: Arc::new(statics),

@@ -66,13 +66,12 @@ pub(super) fn new_pool(
 pub(super) async fn build_runtimes(
     cfg: &Config,
     builtins: Builtins,
-    setup_fns: &[SetupFn],
-    modules: &[Module],
+    setup_fns: &Arc<Vec<SetupFn>>,
+    modules: &Arc<Vec<Module>>,
     cache: Option<&nitr_std::Cache>,
 ) -> Result<Vec<Runtime>> {
     let workers = cfg.workers.max(1);
     let base_statics = crate::static_files::base_mounts(cfg);
-    let base_statics = base_statics.as_slice();
 
     // Bootstrap state: runs the configuration script exactly once.
     let mut bootstrap = new_runtime(cfg, builtins, setup_fns, modules, cache)?;
@@ -92,21 +91,43 @@ pub(super) async fn build_runtimes(
         None => None,
     };
     set_nitr_cfg(&bootstrap)?;
-    app::load(&bootstrap, &cfg.handler_script, base_statics)?;
+    app::load(&bootstrap, &cfg.handler_script, &base_statics)?;
+    if workers == 1 {
+        return Ok(vec![bootstrap]);
+    }
 
     // Remaining states: inject the snapshot instead of re-running the
-    // configuration script, so its side effects happen exactly once.
+    // configuration script, so its side effects happen exactly once. This
+    // is synchronous CPU work — a Lua state, the builtins, the compiled
+    // script, `workers - 1` times over — so it runs on the blocking pool:
+    // a reload used to occupy one of the async workers for the whole
+    // rebuild, the way a poisoned-state recycle never did.
+    let rest = {
+        let cfg = cfg.clone();
+        let setup_fns = setup_fns.clone();
+        let modules = modules.clone();
+        let cache = cache.cloned();
+        tokio::task::spawn_blocking(move || -> Result<Vec<Runtime>> {
+            let mut runtimes = Vec::with_capacity(workers - 1);
+            for _ in 1..workers {
+                let mut rt = new_runtime(&cfg, builtins, &setup_fns, &modules, cache.as_ref())?;
+                if let Some(snapshot) = &snapshot {
+                    rt.set_cfg_snapshot(snapshot)?;
+                }
+                set_nitr_cfg(&rt)?;
+                app::load(&rt, &cfg.handler_script, &base_statics)?;
+                runtimes.push(rt);
+            }
+            Ok(runtimes)
+        })
+        .await
+        .map_err(|err| {
+            nitr_core::Error::Panic(format!("building the runtime pool failed: {err}"))
+        })??
+    };
     let mut runtimes = Vec::with_capacity(workers);
     runtimes.push(bootstrap);
-    for _ in 1..workers {
-        let mut rt = new_runtime(cfg, builtins, setup_fns, modules, cache)?;
-        if let Some(snapshot) = &snapshot {
-            rt.set_cfg_snapshot(snapshot)?;
-        }
-        set_nitr_cfg(&rt)?;
-        app::load(&rt, &cfg.handler_script, base_statics)?;
-        runtimes.push(rt);
-    }
+    runtimes.extend(rest);
     Ok(runtimes)
 }
 

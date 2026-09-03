@@ -23,7 +23,7 @@
 //!   script changes is a cache that never warms, which is worse than not
 //!   having one in development.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -58,6 +58,10 @@ struct Entry {
     expires_at: Option<Instant>,
     /// Monotonic tick of the last read or write, for LRU eviction.
     touched: u64,
+    /// Tick of the write that created the entry: the tiebreaker that
+    /// keeps two entries expiring at the same instant apart in the
+    /// expiry index.
+    inserted: u64,
 }
 
 /// Longest key accepted, so a request-derived key cannot dominate an
@@ -82,13 +86,43 @@ impl Entry {
     }
 }
 
+/// The storage behind the lock.
+///
+/// Two ordered indexes ride beside the map so that eviction is a lookup,
+/// not a scan: every `set` used to `retain` over the whole map to drop
+/// expired entries and then scan it again per victim, all under the lock
+/// every state shares — O(n) per write at 10 000 entries. Now a write
+/// costs a few `BTreeMap` operations and a victim is the first key of an
+/// index. Keys are shared (`Arc<str>`) between the map and the indexes.
 #[derive(Default)]
 struct Inner {
-    entries: HashMap<String, Entry>,
+    entries: HashMap<Arc<str>, Entry>,
+    /// Least recently used first; `touched` ticks are unique, so this is
+    /// a total order over the live entries.
+    lru: BTreeMap<u64, Arc<str>>,
+    /// Soonest expiry first, over the entries that have a TTL.
+    expiry: BTreeMap<(Instant, u64), Arc<str>>,
     bytes: u64,
     hits: u64,
     misses: u64,
     evictions: u64,
+}
+
+impl Inner {
+    /// Removes an entry from the map and both indexes, debiting its cost.
+    fn remove(&mut self, key: &str) -> Option<Entry> {
+        let (key, entry) = self.entries.remove_entry(key)?;
+        self.lru.remove(&entry.touched);
+        if let Some(at) = entry.expires_at {
+            self.expiry.remove(&(at, entry.inserted));
+        }
+        // Saturating (here and at every debit): if the hand-kept counter
+        // ever drifts, a wrap near `u64::MAX` would make eviction expel
+        // everything forever; flooring at zero merely over-admits until
+        // entries cycle out.
+        self.bytes = self.bytes.saturating_sub(Entry::cost(&key, &entry.value));
+        Some(entry)
+    }
 }
 
 /// The shared cache. Cloning shares the same storage; the server builds one
@@ -135,24 +169,23 @@ impl Cache {
         let now = Instant::now();
         let touched = self.tick();
         let mut inner = self.lock()?;
+        let inner = &mut *inner;
 
         match inner.entries.get_mut(key) {
             Some(entry) if entry.is_live(now) => {
-                entry.touched = touched;
+                // Re-ranked in the LRU index under its new tick.
+                let previous = std::mem::replace(&mut entry.touched, touched);
                 let value = entry.value.clone();
+                if let Some(shared) = inner.lru.remove(&previous) {
+                    inner.lru.insert(touched, shared);
+                }
                 inner.hits += 1;
                 Ok(Some(value))
             }
             // An expired entry is dropped on the way past rather than left
             // to be evicted later: it is dead weight against both bounds.
             Some(_) => {
-                if let Some(entry) = inner.entries.remove(key) {
-                    // Saturating (here and at every debit): if the hand-kept
-                    // counter ever drifts, a wrap near `u64::MAX` would make
-                    // eviction expel everything forever; flooring at zero
-                    // merely over-admits until entries cycle out.
-                    inner.bytes = inner.bytes.saturating_sub(Entry::cost(key, &entry.value));
-                }
+                inner.remove(key);
                 inner.misses += 1;
                 Ok(None)
             }
@@ -191,51 +224,55 @@ impl Cache {
             .flatten();
         let touched = self.tick();
         let mut inner = self.lock()?;
+        let inner = &mut *inner;
 
-        if let Some(previous) = inner.entries.remove(&key) {
-            inner.bytes = inner
-                .bytes
-                .saturating_sub(Entry::cost(&key, &previous.value));
-        }
+        inner.remove(&key);
+        let key: Arc<str> = key.into();
         inner.bytes += size;
+        inner.lru.insert(touched, key.clone());
+        if let Some(at) = expires_at {
+            inner.expiry.insert((at, touched), key.clone());
+        }
         inner.entries.insert(
             key,
             Entry {
                 value,
                 expires_at,
                 touched,
+                inserted: touched,
             },
         );
-        self.evict(&mut inner);
+        self.evict(inner);
         Ok(())
     }
 
     /// Brings the cache back inside both bounds, dropping expired entries
-    /// first and then the least recently used.
+    /// first (soonest expired first) and then the least recently used.
+    ///
+    /// Only runs while a bound is exceeded: an expired entry that still
+    /// fits is reaped when it is next read, or when room is needed, rather
+    /// than by a sweep on every write. Dropping expired entries does not
+    /// count as an eviction — they were dead already.
     fn evict(&self, inner: &mut Inner) {
         let now = Instant::now();
-        inner.entries.retain(|key, entry| {
-            let live = entry.is_live(now);
-            if !live {
-                inner.bytes = inner.bytes.saturating_sub(Entry::cost(key, &entry.value));
-            }
-            live
-        });
-
         while inner.entries.len() > self.opts.max_entries || inner.bytes > self.opts.max_bytes {
-            let Some(victim) = inner
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.touched)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            if let Some(entry) = inner.entries.remove(&victim) {
-                inner.bytes = inner
-                    .bytes
-                    .saturating_sub(Entry::cost(&victim, &entry.value));
-                inner.evictions += 1;
+            let expired = inner
+                .expiry
+                .first_key_value()
+                .filter(|((at, _), _)| *at <= now)
+                .map(|(_, key)| key.clone());
+            match expired {
+                Some(key) => {
+                    inner.remove(&key);
+                }
+                None => {
+                    let Some(victim) = inner.lru.first_key_value().map(|(_, key)| key.clone())
+                    else {
+                        break;
+                    };
+                    inner.remove(&victim);
+                    inner.evictions += 1;
+                }
             }
         }
     }
@@ -264,8 +301,7 @@ impl UserData for Cache {
                     Some(opts) => opts.get::<Option<u64>>("ttl")?,
                     None => None,
                 };
-                crate::utils::check_json_bounds(&value)?;
-                let bytes = serde_json::to_vec(&value).map_err(|err| {
+                let bytes = crate::bounded::to_json_vec(&value).map_err(|err| {
                     mlua::Error::RuntimeError(format!(
                         "cache values must be plain data (a table, string, number or \
                          boolean); `{key}` is not serializable: {err}"
@@ -279,18 +315,14 @@ impl UserData for Cache {
         // cache:delete(key) -> whether it was there
         methods.add_method("delete", |_, cache, key: String| {
             let mut inner = cache.lock()?;
-            match inner.entries.remove(&key) {
-                Some(entry) => {
-                    inner.bytes = inner.bytes.saturating_sub(Entry::cost(&key, &entry.value));
-                    Ok(true)
-                }
-                None => Ok(false),
-            }
+            Ok(inner.remove(&key).is_some())
         });
 
         methods.add_method("clear", |_, cache, ()| {
             let mut inner = cache.lock()?;
             inner.entries.clear();
+            inner.lru.clear();
+            inner.expiry.clear();
             inner.bytes = 0;
             Ok(())
         });
@@ -328,8 +360,7 @@ impl UserData for Cache {
                 if value.is_nil() {
                     return Ok(Value::Nil);
                 }
-                crate::utils::check_json_bounds(&value)?;
-                let bytes = serde_json::to_vec(&value).map_err(|err| {
+                let bytes = crate::bounded::to_json_vec(&value).map_err(|err| {
                     mlua::Error::RuntimeError(format!(
                         "cache:remember value for `{key}` is not serializable: {err}"
                     ))

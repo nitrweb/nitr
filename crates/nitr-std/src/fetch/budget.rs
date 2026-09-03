@@ -86,6 +86,14 @@ pub struct TraceContext(pub String);
 /// Records the inbound request id so outbound calls can carry a
 /// `traceparent` derived from it.
 pub fn set_trace_context(lua: &Lua, request_id: &str) {
+    // The slot is reused across requests: after the first one this is a
+    // copy into an existing buffer, not an allocation plus a typemap
+    // insert on every dispatch.
+    if let Some(mut context) = lua.app_data_mut::<TraceContext>() {
+        context.0.clear();
+        context.0.push_str(request_id);
+        return;
+    }
     lua.set_app_data(TraceContext(request_id.to_string()));
 }
 

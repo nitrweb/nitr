@@ -5,7 +5,6 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use http_body_util::BodyExt as _;
 use http_body_util::combinators::BoxBody;
@@ -34,8 +33,9 @@ pub(crate) struct LuaRequest {
     /// Path parameters captured by the router (empty for the catch-all).
     pub(crate) params: Vec<(String, String)>,
     /// The request id: generated per request (UUIDv7), or taken from a
-    /// trusted inbound `X-Request-ID` header.
-    pub(crate) id: String,
+    /// trusted inbound `X-Request-ID` header. Shared, so the response
+    /// phase and the trace context clone a pointer, not the string.
+    pub(crate) id: Arc<str>,
     /// Body-parsing bounds, copied from `[limits]` when the request is
     /// dispatched. Carried on the request because the Lua-facing parsers
     /// need them and Lua must not be able to raise them.
@@ -103,10 +103,7 @@ impl LuaRequest {
         limit: u64,
         stall: Option<std::time::Duration>,
     ) -> BodyGuards {
-        let guards = BodyGuards {
-            oversized: Arc::new(AtomicBool::new(false)),
-            stalled: Arc::new(AtomicBool::new(false)),
-        };
+        let guards = BodyGuards(Arc::new(body::BodyFlags::default()));
         // Recorded for `req:read(n)`'s clamp, so the bound is readable at
         // the point that allocates.
         self.body_limit = limit;
@@ -115,7 +112,7 @@ impl LuaRequest {
             inner,
             limit,
             read: 0,
-            exceeded: guards.oversized.clone(),
+            flags: guards.0.clone(),
         };
         // The stall timer wraps the byte counter so its budget covers the
         // whole read; when disabled the counter is installed alone.
@@ -124,7 +121,7 @@ impl LuaRequest {
                 inner: limited.boxed(),
                 budget,
                 deadline: None,
-                stalled: guards.stalled.clone(),
+                flags: guards.0.clone(),
             }
             .boxed(),
             None => limited.boxed(),
@@ -181,7 +178,7 @@ impl UserData for LuaRequest {
             }
             Ok(table)
         });
-        fields.add_field_method_get("id", |_, req| Ok(req.id.clone()));
+        fields.add_field_method_get("id", |lua, req| lua.create_string(&*req.id));
         fields.add_field_method_get("params", |lua, req| {
             // Path parameters captured by the router, e.g. `id` for a route
             // registered as `/users/:id`.

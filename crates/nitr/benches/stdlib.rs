@@ -560,6 +560,585 @@ return app
 
         bencher.bench_local(|| divan::black_box(get(&rt, &client, "/write")));
     }
+
+    /// Wide rows: twenty columns, so the per-cell conversion (column name,
+    /// value, table insert) dominates over SQLite itself.
+    const WIDE_APP: &str = r#"
+local app = nitr.app()
+
+app:get("/wide", function(req)
+    local out
+    for _ = 1, 5 do
+        out = nitr.db:query("SELECT * FROM wide ORDER BY id LIMIT 50")
+    end
+    return nitr.text(tostring(#out))
+end)
+
+-- Thirty distinct statements in rotation: more than the prepared
+-- statement cache holds by default.
+local STATEMENTS = {}
+for i = 1, 30 do
+    STATEMENTS[i] = "SELECT id, name, score FROM items WHERE id = " .. i .. " AND score >= 0"
+end
+
+app:get("/rotation", function(req)
+    local out
+    for i = 1, 30 do
+        out = nitr.db:query_row(STATEMENTS[i])
+    end
+    return nitr.text(out.name)
+end)
+
+return app
+"#;
+
+    fn wide_database() -> std::path::PathBuf {
+        let path = temp_dir("db-wide").join("bench.db");
+        let conn = rusqlite::Connection::open(&path).expect("open the benchmark database");
+        let columns: Vec<String> = (1..=19).map(|i| format!("c{i} TEXT NOT NULL")).collect();
+        conn.execute_batch(&format!(
+            "CREATE TABLE wide (id INTEGER PRIMARY KEY, {});
+             CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL NOT NULL);",
+            columns.join(", ")
+        ))
+        .expect("create the benchmark schema");
+        let placeholders: Vec<&str> = (1..=19).map(|_| "?").collect();
+        let mut stmt = conn
+            .prepare(&format!(
+                "INSERT INTO wide VALUES (?, {})",
+                placeholders.join(", ")
+            ))
+            .expect("prepare the seed statement");
+        for i in 1..=100 {
+            let mut values: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Integer(i)];
+            values.extend((1..=19).map(|c| rusqlite::types::Value::Text(format!("v{i}-{c}"))));
+            stmt.execute(rusqlite::params_from_iter(values))
+                .expect("seed a wide row");
+        }
+        drop(stmt);
+        let mut stmt = conn
+            .prepare("INSERT INTO items (id, name, score) VALUES (?, ?, ?)")
+            .expect("prepare the seed statement");
+        for i in 1..=50 {
+            stmt.execute(rusqlite::params![i, format!("item-{i}"), i as f64 * 1.5])
+                .expect("seed a row");
+        }
+        drop(stmt);
+        path
+    }
+
+    fn wide_client(
+        rt: &tokio::runtime::Runtime,
+        script: &std::path::Path,
+    ) -> nitr::testing::TestClient {
+        let database = wide_database();
+        client_with(
+            rt,
+            script,
+            Builtins::HTTP | Builtins::DATABASE,
+            Config::default(),
+            move |builder| builder.database(database),
+        )
+    }
+
+    #[divan::bench]
+    fn query_fifty_wide_rows(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-db-wide.lua", WIDE_APP);
+        let client = wide_client(&rt, &script);
+
+        bencher.bench_local(|| divan::black_box(get(&rt, &client, "/wide")));
+    }
+
+    #[divan::bench]
+    fn thirty_statement_rotation(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-db-wide.lua", WIDE_APP);
+        let client = wide_client(&rt, &script);
+
+        bencher.bench_local(|| divan::black_box(get(&rt, &client, "/rotation")));
+    }
+}
+
+/// The JSON bounds guard (`check_json_bounds`) against the serialization it
+/// runs in front of, on a bare Lua state: how much of every encode, cache
+/// write, session save and template render is the guard's own walk.
+mod bounds_guard {
+    use mlua::Value;
+
+    /// 500 records of three scalars: the shape of an API list.
+    const FLAT: &str = "local t = {} \
+        for i = 1, 500 do t[i] = { id = i, name = 'item-' .. i, ok = i % 2 == 0 } end \
+        return t";
+    /// A 100-deep chain: few nodes, maximal recursion.
+    const DEEP: &str = "local t = {} local cur = t \
+        for i = 1, 100 do cur.next = { v = i } cur = cur.next end \
+        return t";
+
+    fn value(lua: &mlua::Lua, src: &str) -> Value {
+        lua.load(src).eval().expect("build the value")
+    }
+
+    fn guard_only(bencher: divan::Bencher<'_, '_>, src: &str) {
+        let lua = mlua::Lua::new();
+        let value = value(&lua, src);
+        bencher.bench_local(|| {
+            nitr::stdlib::fuzzing::check_json_bounds(&value).expect("within bounds");
+        });
+    }
+
+    fn serialize_only(bencher: divan::Bencher<'_, '_>, src: &str) {
+        let lua = mlua::Lua::new();
+        let value = value(&lua, src);
+        bencher.bench_local(|| divan::black_box(serde_json::to_string(&value).expect("serialize")));
+    }
+
+    fn both(bencher: divan::Bencher<'_, '_>, src: &str) {
+        let lua = mlua::Lua::new();
+        let value = value(&lua, src);
+        bencher.bench_local(|| {
+            nitr::stdlib::fuzzing::check_json_bounds(&value).expect("within bounds");
+            divan::black_box(serde_json::to_string(&value).expect("serialize"))
+        });
+    }
+
+    #[divan::bench]
+    fn flat_guard_only(bencher: divan::Bencher<'_, '_>) {
+        guard_only(bencher, FLAT);
+    }
+
+    #[divan::bench]
+    fn flat_serialize_only(bencher: divan::Bencher<'_, '_>) {
+        serialize_only(bencher, FLAT);
+    }
+
+    #[divan::bench]
+    fn flat_guard_then_serialize(bencher: divan::Bencher<'_, '_>) {
+        both(bencher, FLAT);
+    }
+
+    #[divan::bench]
+    fn deep_guard_only(bencher: divan::Bencher<'_, '_>) {
+        guard_only(bencher, DEEP);
+    }
+
+    #[divan::bench]
+    fn deep_serialize_only(bencher: divan::Bencher<'_, '_>) {
+        serialize_only(bencher, DEEP);
+    }
+
+    #[divan::bench]
+    fn deep_guard_then_serialize(bencher: divan::Bencher<'_, '_>) {
+        both(bencher, DEEP);
+    }
+}
+
+/// The un-benched halves of `nitr.path` and `nitr.url`.
+mod utilities_more {
+    use super::*;
+
+    const APP: &str = r#"
+local app = nitr.app()
+
+app:get("/path-parts", function(req)
+    local out
+    for _ = 1, 50 do
+        local p = "/srv/app/public/assets/logo.png"
+        out = nitr.path.dirname(p) .. nitr.path.basename(p) .. (nitr.path.extension(p) or "")
+    end
+    return nitr.text(out)
+end)
+
+app:get("/url-codec", function(req)
+    local out
+    for _ = 1, 50 do
+        out = nitr.url.decode(nitr.url.encode("lua web server & friends/ü"))
+    end
+    return nitr.text(out)
+end)
+
+return app
+"#;
+
+    #[divan::bench]
+    fn path_parts(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-utils-more.lua", APP);
+        let client = client(
+            &rt,
+            &script,
+            Builtins::HTTP | Builtins::PATH | Builtins::URL,
+        );
+
+        bencher.bench_local(|| divan::black_box(get(&rt, &client, "/path-parts")));
+    }
+
+    #[divan::bench]
+    fn url_encode_decode(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-utils-more.lua", APP);
+        let client = client(
+            &rt,
+            &script,
+            Builtins::HTTP | Builtins::PATH | Builtins::URL,
+        );
+
+        bencher.bench_local(|| divan::black_box(get(&rt, &client, "/url-codec")));
+    }
+}
+
+/// `nitr.log`: what a log call costs when its level is filtered out (the
+/// production case for `debug`) and when it is written, to a sink.
+mod log {
+    use super::*;
+
+    const APP: &str = r#"
+local app = nitr.app()
+
+local FIELDS = { user = 42, path = "/orders/17", tags = { "a", "b", "c" }, ok = true }
+
+app:get("/debug", function(req)
+    for i = 1, 50 do
+        nitr.log.debug("order processed", FIELDS)
+    end
+    return nitr.text("ok")
+end)
+
+app:get("/debug/plain", function(req)
+    for i = 1, 50 do
+        nitr.log.debug("order processed")
+    end
+    return nitr.text("ok")
+end)
+
+return app
+"#;
+
+    /// No subscriber at all: the level filter says no before anything else
+    /// happens — or should.
+    #[divan::bench]
+    fn debug_with_fields_disabled(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-log.lua", APP);
+        let client = client(&rt, &script, Builtins::HTTP | Builtins::LOG);
+
+        bencher.bench_local(|| divan::black_box(get(&rt, &client, "/debug")));
+    }
+
+    #[divan::bench]
+    fn debug_plain_disabled(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-log.lua", APP);
+        let client = client(&rt, &script, Builtins::HTTP | Builtins::LOG);
+
+        bencher.bench_local(|| divan::black_box(get(&rt, &client, "/debug/plain")));
+    }
+
+    /// A DEBUG subscriber writing to a sink: the full cost of a line that
+    /// is actually emitted, fields serialized and all.
+    #[divan::bench]
+    fn debug_with_fields_enabled(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-log.lua", APP);
+        let client = client(&rt, &script, Builtins::HTTP | Builtins::LOG);
+        let subscriber = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(std::io::sink)
+                .finish(),
+        );
+
+        bencher.bench_local(|| {
+            tracing::dispatcher::with_default(&subscriber, || {
+                divan::black_box(get(&rt, &client, "/debug"))
+            })
+        });
+    }
+}
+
+/// The cache past its bounds, where every `set` has to evict.
+mod cache_pressure {
+    use super::*;
+    use crate::common::client_with;
+    use nitr::Config;
+
+    const APP: &str = r#"
+local app = nitr.app()
+
+local VALUE = { usd = 1.0, eur = 0.92, gbp = 0.79, jpy = 151.3, updated = "2024-01-01" }
+local n = 0
+
+-- 100 entries fit; every set past that evicts the least recently used.
+app:get("/churn", function(req)
+    for _ = 1, 50 do
+        n = n + 1
+        nitr.cache:set("k-" .. n, VALUE, { ttl = 60 })
+    end
+    return nitr.text("ok")
+end)
+
+app:get("/remember", function(req)
+    local out
+    for _ = 1, 50 do
+        out = nitr.cache:remember("rates", { ttl = 60 }, function() return VALUE end)
+    end
+    return nitr.text(tostring(out.eur))
+end)
+
+app:get("/stats", function(req)
+    local out
+    for _ = 1, 50 do
+        out = nitr.cache:stats()
+    end
+    return nitr.text(tostring(out.hits))
+end)
+
+return app
+"#;
+
+    fn small_cache() -> Config {
+        let mut cfg = Config::default();
+        cfg.cache.max_entries = 100;
+        cfg
+    }
+
+    /// Fifty sets into a full 100-entry cache: fifty evictions.
+    #[divan::bench]
+    fn set_evicting(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-cache-pressure.lua", APP);
+        let client = client_with(
+            &rt,
+            &script,
+            Builtins::HTTP | Builtins::CACHE,
+            small_cache(),
+            |b| b,
+        );
+        // Fill it first so the measured sets all evict.
+        for _ in 0..3 {
+            get(&rt, &client, "/churn");
+        }
+
+        bencher.bench_local(|| divan::black_box(get(&rt, &client, "/churn")));
+    }
+
+    #[divan::bench]
+    fn remember_hit(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-cache-pressure.lua", APP);
+        let client = client(&rt, &script, Builtins::HTTP | Builtins::CACHE);
+
+        bencher.bench_local(|| divan::black_box(get(&rt, &client, "/remember")));
+    }
+
+    #[divan::bench]
+    fn stats(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-cache-pressure.lua", APP);
+        let client = client(&rt, &script, Builtins::HTTP | Builtins::CACHE);
+
+        bencher.bench_local(|| divan::black_box(get(&rt, &client, "/stats")));
+    }
+}
+
+/// The response-path serializers: the `nitr.json(...)` helper,
+/// `nitr.error` with a table body, `nitr.etag` over a table. Each walks
+/// its value through the JSON bounds guard and then the serializer.
+mod response_helpers {
+    use super::*;
+    use crate::common::dispatch;
+
+    const APP: &str = r#"
+local app = nitr.app()
+
+local ITEMS = {}
+for i = 1, 50 do
+    ITEMS[i] = { id = i, name = "item-" .. i, tags = { "alpha", "beta" }, active = i % 2 == 0 }
+end
+local DOC = { items = ITEMS, total = 50 }
+
+app:get("/json", function(req)
+    return nitr.json(DOC)
+end)
+
+app:get("/error", function(req)
+    return nitr.error(422, { code = "INVALID", fields = { email = "required", name = "too short" } })
+end)
+
+app:get("/etag", function(req)
+    local out
+    for _ = 1, 20 do
+        out = nitr.etag(DOC)
+    end
+    return nitr.text(out)
+end)
+
+return app
+"#;
+
+    #[divan::bench]
+    fn json_helper_50_items(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-response.lua", APP);
+        let client = client(&rt, &script, Builtins::HTTP | Builtins::JSON);
+
+        bencher.bench_local(|| divan::black_box(get(&rt, &client, "/json")));
+    }
+
+    #[divan::bench]
+    fn error_with_table_body(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-response.lua", APP);
+        let client = client(&rt, &script, Builtins::HTTP | Builtins::JSON);
+
+        bencher.bench_local(|| {
+            divan::black_box(dispatch(&rt, &client, "GET", "/error", &[], None, 422))
+        });
+    }
+
+    #[divan::bench]
+    fn etag_over_table(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-response.lua", APP);
+        let client = client(&rt, &script, Builtins::HTTP | Builtins::JSON);
+
+        bencher.bench_local(|| divan::black_box(get(&rt, &client, "/etag")));
+    }
+}
+
+/// `nitr.validate` on a nested schema: objects inside arrays, where the
+/// per-field path bookkeeping multiplies.
+mod validate_nested {
+    use super::*;
+
+    const APP: &str = r#"
+local app = nitr.app()
+
+local schema = nitr.validate.schema({
+    order = { type = "table", required = true, fields = {
+        id = { type = "integer", required = true },
+        customer = { type = "table", required = true, fields = {
+            email = { type = "string", format = "email", required = true },
+            name = { type = "string", min_len = 2, required = true },
+        } },
+    } },
+    lines = { type = "array", required = true, max_items = 50, items = { type = "table", fields = {
+        sku = { type = "string", required = true },
+        qty = { type = "integer", min = 1, required = true },
+    } } },
+})
+
+local LINES = {}
+for i = 1, 20 do LINES[i] = { sku = "sku-" .. i, qty = i } end
+local GOOD = { order = { id = 7, customer = { email = "ada@example.com", name = "Ada" } }, lines = LINES }
+
+app:get("/accept", function(req)
+    local out
+    for _ = 1, 20 do
+        out = schema:check(GOOD)
+    end
+    return nitr.text(out.order.customer.name)
+end)
+
+return app
+"#;
+
+    #[divan::bench]
+    fn accepted_nested_input(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-validate-nested.lua", APP);
+        let client = client(&rt, &script, Builtins::HTTP | Builtins::VALIDATE);
+
+        bencher.bench_local(|| divan::black_box(get(&rt, &client, "/accept")));
+    }
+}
+
+/// `nitr.time` through strftime, the other half of the time module.
+mod time_strftime {
+    use super::*;
+
+    const APP: &str = r#"
+local app = nitr.app()
+
+app:get("/strftime", function(req)
+    local out
+    for _ = 1, 50 do
+        local s = nitr.time.format(784887151, "%Y-%m-%d %H:%M:%S")
+        out = nitr.time.parse(s, "%Y-%m-%d %H:%M:%S")
+    end
+    return nitr.text(tostring(out))
+end)
+
+return app
+"#;
+
+    #[divan::bench]
+    fn format_and_parse(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-time.lua", APP);
+        let client = client(&rt, &script, Builtins::HTTP | Builtins::TIME);
+
+        bencher.bench_local(|| divan::black_box(get(&rt, &client, "/strftime")));
+    }
+}
+
+/// `nitr.csrf`: the middleware's issue path (a `GET` that mints and sets
+/// the token) and its verify path (a `POST` echoing it).
+mod csrf {
+    use super::*;
+    use crate::common::{dispatch, header};
+
+    const APP: &str = r#"
+local app = nitr.app()
+
+app:use(nitr.csrf({ secret = "csrf-signing-secret-0123456789" }))
+
+app:get("/form", function(req)
+    return nitr.text(nitr.csrf.token(req))
+end)
+
+app:post("/submit", function(req)
+    return nitr.text("ok")
+end)
+
+return app
+"#;
+
+    #[divan::bench]
+    fn issue_on_get(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-csrf.lua", APP);
+        let client = client(&rt, &script, Builtins::HTTP);
+
+        bencher.bench_local(|| divan::black_box(get(&rt, &client, "/form")));
+    }
+
+    #[divan::bench]
+    fn verify_on_post(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("stdlib-csrf.lua", APP);
+        let client = client(&rt, &script, Builtins::HTTP);
+        let issued = get(&rt, &client, "/form");
+        let token = String::from_utf8(issued.body.to_vec()).expect("the token");
+        let cookie = issued
+            .header("set-cookie")
+            .expect("the csrf cookie")
+            .split(';')
+            .next()
+            .expect("the cookie pair")
+            .to_string();
+        let headers = [
+            header("cookie", &cookie),
+            header("x-csrf-token", &token),
+            header("sec-fetch-site", "same-origin"),
+        ];
+
+        bencher.bench_local(|| {
+            divan::black_box(dispatch(
+                &rt, &client, "POST", "/submit", &headers, None, 200,
+            ))
+        });
+    }
 }
 
 /// Per-request HTTP ergonomics added by phases 3 and 14: cookie-header

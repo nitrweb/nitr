@@ -45,7 +45,7 @@ pub(super) fn error_page_with_source(
         return Ok(Response::builder()
             .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
             .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(Full::new(Bytes::from("Internal Server Error")).boxed())?);
+            .body(Full::new(Bytes::from_static(b"Internal Server Error")).boxed())?);
     }
 
     let mut text = format!("Internal Server Error\n\n{}", info.concise());

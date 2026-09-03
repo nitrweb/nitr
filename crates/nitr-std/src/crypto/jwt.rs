@@ -104,8 +104,7 @@ pub(super) fn create_jwt_table(lua: &Lua) -> mlua::Result<Table> {
                 }
                 let header = B64URL.encode(format!(r#"{{"alg":"{alg}","typ":"JWT"}}"#));
                 let claims = Value::Table(claims);
-                crate::utils::check_json_bounds(&claims)?;
-                let payload = serde_json::to_string(&claims)
+                let payload = crate::bounded::to_json_string(&claims)
                     .map_err(|err| {
                         mlua::Error::RuntimeError(format!(
                             "JWT claims must be JSON-serializable: {err}"

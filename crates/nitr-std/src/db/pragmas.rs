@@ -29,6 +29,9 @@ use nitr_core::{Error, Result};
 /// build the statement is from a known-good set.
 const JOURNAL_MODES: &[&str] = &["delete", "truncate", "persist", "memory", "wal", "off"];
 
+/// Prepared statements kept per connection (rusqlite's `prepare_cached`).
+const PREPARED_STATEMENT_CACHE: usize = 64;
+
 /// `synchronous` levels SQLite accepts.
 const SYNCHRONOUS_LEVELS: &[&str] = &["off", "normal", "full", "extra"];
 
@@ -98,6 +101,11 @@ pub fn open(path: &std::path::Path, pragmas: &SqlitePragmas) -> Result<Connectio
         ))
     })?;
     pragmas.apply(&conn, path)?;
+    // rusqlite's default holds 16 prepared statements; an application with
+    // more distinct statements in rotation re-parsed nearly every call
+    // (`stdlib::db::thirty_statement_rotation`). 64 costs a few tens of
+    // KiB per connection — a memory knob, not a safety bound.
+    conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE);
     conn.authorizer(Some(authorize))
         .map_err(|err| Error::Config(format!("failed to install the SQL authorizer: {err}")))?;
     Ok(conn)

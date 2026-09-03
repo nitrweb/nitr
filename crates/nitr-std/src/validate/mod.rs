@@ -95,6 +95,67 @@ struct Rule {
     fields: Option<Vec<(String, Rule)>>,
 }
 
+/// One step of a field's position in the input.
+enum Segment<'a> {
+    Field(&'a str),
+    Index(usize),
+}
+
+/// A field's position in the input (`order.customer.email`,
+/// `lines[3].qty`), as a chain of borrowed segments rendered only when a
+/// message needs it: a successful check used to allocate one `String` per
+/// field and per array element purely for an error it never recorded.
+struct FieldPath<'a> {
+    parent: Option<&'a FieldPath<'a>>,
+    segment: Option<Segment<'a>>,
+}
+
+impl<'a> FieldPath<'a> {
+    const ROOT: FieldPath<'static> = FieldPath {
+        parent: None,
+        segment: None,
+    };
+
+    fn field(&'a self, name: &'a str) -> FieldPath<'a> {
+        FieldPath {
+            parent: Some(self),
+            segment: Some(Segment::Field(name)),
+        }
+    }
+
+    fn index(&'a self, index: usize) -> FieldPath<'a> {
+        FieldPath {
+            parent: Some(self),
+            segment: Some(Segment::Index(index)),
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut out = String::new();
+        self.write_to(&mut out);
+        out
+    }
+
+    fn write_to(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        if let Some(parent) = self.parent {
+            parent.write_to(out);
+        }
+        match self.segment {
+            Some(Segment::Field(name)) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(name);
+            }
+            Some(Segment::Index(index)) => {
+                let _ = write!(out, "[{index}]");
+            }
+            None => {}
+        }
+    }
+}
+
 /// Validates one value against a rule. On success returns the value to
 /// place in the output (tables are rebuilt with only declared fields); on
 /// failure records a message under `path` and returns `None`.
@@ -102,11 +163,11 @@ fn check_value(
     lua: &Lua,
     rule: &Rule,
     value: Value,
-    path: &str,
+    path: &FieldPath<'_>,
     errors: &Table,
 ) -> mlua::Result<Option<Value>> {
     let fail = |msg: String| -> mlua::Result<Option<Value>> {
-        errors.set(path, msg)?;
+        errors.set(path.render(), msg)?;
         Ok(None)
     };
 
@@ -194,7 +255,7 @@ fn check_value(
             let mut ok = true;
             for i in 1..=len {
                 let item: Value = t.raw_get(i)?;
-                match check_value(lua, items, item, &format!("{path}[{i}]"), errors)? {
+                match check_value(lua, items, item, &path.index(i), errors)? {
                     Some(item) => out.raw_set(i, item)?,
                     None => ok = false,
                 }
@@ -221,21 +282,17 @@ fn check_fields(
     lua: &Lua,
     fields: &[(String, Rule)],
     input: &Table,
-    path: &str,
+    path: &FieldPath<'_>,
     errors: &Table,
 ) -> mlua::Result<Option<Table>> {
     let out = lua.create_table()?;
     let mut ok = true;
     for (name, rule) in fields {
-        let field_path = if path.is_empty() {
-            name.clone()
-        } else {
-            format!("{path}.{name}")
-        };
+        let field_path = path.field(name);
         let value: Value = input.get(name.as_str())?;
         if value.is_nil() {
             if rule.required {
-                errors.set(field_path, "is required")?;
+                errors.set(field_path.render(), "is required")?;
                 ok = false;
             }
             continue;
@@ -271,7 +328,9 @@ impl UserData for LuaSchema {
         methods.add_method("check", |lua, this, value: Value| {
             let errors = lua.create_table()?;
             let checked = match &value {
-                Value::Table(input) => check_fields(lua, &this.fields, input, "", &errors)?,
+                Value::Table(input) => {
+                    check_fields(lua, &this.fields, input, &FieldPath::ROOT, &errors)?
+                }
                 other => {
                     errors.set("$", format!("must be a table, got {}", other.type_name()))?;
                     None

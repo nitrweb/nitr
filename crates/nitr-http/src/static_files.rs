@@ -15,8 +15,10 @@
 
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
+use bytes::BufMut as _;
 use http_body_util::{BodyExt as _, Empty, Full, StreamBody};
 use hyper::body::{Bytes, Frame};
 use hyper::header::{self, HeaderValue};
@@ -116,10 +118,11 @@ pub(crate) fn base_mounts(cfg: &crate::config::Config) -> Vec<StaticMount> {
 }
 
 /// Tries to serve the request from the given mounts (first match on the
-/// longest mount prefix wins). `None` means "not a static asset" and the
-/// caller continues its normal dispatch.
+/// longest mount prefix wins — the mounts are sorted that way once, at
+/// load time). `None` means "not a static asset" and the caller continues
+/// its normal dispatch.
 pub(crate) async fn try_serve(
-    mounts: &[StaticMount],
+    mounts: &Arc<Vec<StaticMount>>,
     req: &LuaRequest,
     compression: &Compression,
 ) -> Option<Result<HttpResponse>> {
@@ -130,43 +133,101 @@ pub(crate) async fn try_serve(
     let decoded = percent_encoding::percent_decode_str(path)
         .decode_utf8()
         .ok()?;
+    // Negotiated before the filesystem is consulted, so the sidecar lookup
+    // rides in the same blocking-pool hop as the file's own resolution.
+    let encoding = compression.negotiate(req.req.headers().get(header::ACCEPT_ENCODING));
 
-    let mut candidates: Vec<&StaticMount> = mounts
-        .iter()
-        .filter(|m| m.relative(&decoded).is_some())
-        .collect();
-    candidates.sort_by_key(|m| std::cmp::Reverse(m.mount.len()));
-
-    for mount in candidates {
-        let rel = mount.relative(&decoded)?;
-        let Some(file) = resolve_in(mount, rel).await else {
-            // Unknown path inside an SPA mount falls back to its index.
-            if mount.spa
-                && let Some(index) = resolve(&mount.dir, "index.html").await
-            {
-                return Some(serve_file(req, mount, &index, compression).await);
-            }
+    for (index, mount) in mounts.iter().enumerate() {
+        let Some(rel) = mount.relative(&decoded) else {
             continue;
         };
-        return Some(serve_file(req, mount, &file, compression).await);
+        let Some(located) = locate_for(mounts.clone(), index, rel.to_string(), encoding).await
+        else {
+            continue;
+        };
+        return Some(serve_file(req, mount, located).await);
     }
     None
 }
 
-/// [`resolve`] under a mount's dotfile policy: a path with a `.`-prefixed
-/// component is refused before the filesystem is consulted, unless the
-/// mount serves dotfiles or the path is under `.well-known/`.
+/// Everything one static response needs from the filesystem, gathered in
+/// **one** blocking-pool hop: the resolved file (or the SPA index), its
+/// metadata, and the precompressed sidecar when the client accepts one.
+///
+/// These used to be four to seven separate `tokio::fs` calls per request
+/// — each a dispatch to the blocking pool and a wake-up back — and that,
+/// not the read, was the static path's dominant cost.
+struct Located {
+    /// The logical file (canonical path): decides the content type.
+    file: PathBuf,
+    /// The precompressed sidecar actually served, when one was chosen.
+    sidecar: Option<(PathBuf, Encoding)>,
+    /// Metadata of the bytes served (the sidecar's when one was chosen).
+    meta: std::fs::Metadata,
+}
+
+async fn locate_for(
+    mounts: Arc<Vec<StaticMount>>,
+    index: usize,
+    rel: String,
+    encoding: Option<Encoding>,
+) -> Option<Located> {
+    tokio::task::spawn_blocking(move || {
+        let mount = &mounts[index];
+        let (file, meta) = match locate_in(mount, &rel) {
+            Some(found) => found,
+            // Unknown path inside an SPA mount falls back to its index.
+            None if mount.spa => locate(&mount.dir, "index.html")?,
+            None => return None,
+        };
+        Some(
+            match encoding.and_then(|encoding| sidecar_for(&file, encoding)) {
+                Some((sidecar, meta, encoding)) => Located {
+                    file,
+                    sidecar: Some((sidecar, encoding)),
+                    meta,
+                },
+                None => Located {
+                    file,
+                    sidecar: None,
+                    meta,
+                },
+            },
+        )
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// [`resolve`] under a mount's dotfile policy — the asynchronous form,
+/// for the fuzz seam below.
 async fn resolve_in(mount: &StaticMount, rel: &str) -> Option<PathBuf> {
+    if refused_as_dotfile(mount, rel) {
+        return None;
+    }
+    resolve(&mount.dir, rel).await
+}
+
+/// [`locate`] under a mount's dotfile policy, on the serving path.
+fn locate_in(mount: &StaticMount, rel: &str) -> Option<(PathBuf, std::fs::Metadata)> {
+    if refused_as_dotfile(mount, rel) {
+        return None;
+    }
+    locate(&mount.dir, rel)
+}
+
+/// A path with a `.`-prefixed component is refused before the filesystem
+/// is consulted, unless the mount serves dotfiles or the path is under
+/// `.well-known/`.
+fn refused_as_dotfile(mount: &StaticMount, rel: &str) -> bool {
     let rel_path = rel.trim_start_matches('/');
     // A lone `.` is the current directory, not a dotfile; `safe_join`
     // skips it the way a browser would have.
     let hidden = rel_path
         .split(['/', '\\'])
         .any(|segment| segment != "." && segment.starts_with('.'));
-    if hidden && !mount.dotfiles && !is_well_known(rel_path) {
-        return None;
-    }
-    resolve(&mount.dir, rel).await
+    hidden && !mount.dotfiles && !is_well_known(rel_path)
 }
 
 /// Whether the path is `.well-known` or inside it, with nothing else in
@@ -196,10 +257,22 @@ pub async fn resolve_for_fuzzing(mount: &StaticMount, url_path: &str) -> Option<
     resolve_in(mount, rel).await
 }
 
+/// [`locate`] on the blocking pool, returning only the path: the shape the
+/// fuzz seam and the tests drive.
+async fn resolve(dir: &Path, rel: &str) -> Option<PathBuf> {
+    let (dir, rel) = (dir.to_path_buf(), rel.to_string());
+    tokio::task::spawn_blocking(move || locate(&dir, &rel).map(|(path, _)| path))
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Resolves a relative URL path to a regular file inside `dir`, or `None`
 /// (unsafe path, missing file, unreadable metadata). Directories resolve
-/// to their `index.html`.
-async fn resolve(dir: &Path, rel: &str) -> Option<PathBuf> {
+/// to their `index.html`. Synchronous: the caller runs it on the blocking
+/// pool, together with whatever else the request needs from the
+/// filesystem.
+fn locate(dir: &Path, rel: &str) -> Option<(PathBuf, std::fs::Metadata)> {
     // The lexical rule (`..`, absolute segments, drive prefixes, NUL) is
     // shared with `part:save`'s upload root — see `crate::safe_path`. The
     // canonicalized containment check below is this caller's half.
@@ -212,21 +285,20 @@ async fn resolve(dir: &Path, rel: &str) -> Option<PathBuf> {
     // `relative`'s own root-mount branch trims exactly this way.
     let mut path = crate::safe_path::safe_join(dir, rel.trim_start_matches('/')).ok()?;
 
-    let meta = fs_ok(tokio::fs::metadata(&path).await, &path)?;
+    let mut meta = fs_ok(std::fs::metadata(&path), &path)?;
     if meta.is_dir() {
         path.push("index.html");
-        fs_ok(tokio::fs::metadata(&path).await, &path)?
-            .is_file()
-            .then_some(())?;
+        meta = fs_ok(std::fs::metadata(&path), &path)?;
+        meta.is_file().then_some(())?;
     } else if !meta.is_file() {
         return None;
     }
 
     // Symlink policy: the canonical target must stay inside the canonical
     // root, so links cannot escape the mount.
-    let canonical = fs_ok(tokio::fs::canonicalize(&path).await, &path)?;
-    let root = fs_ok(tokio::fs::canonicalize(dir).await, dir)?;
-    canonical.starts_with(&root).then_some(canonical)
+    let canonical = fs_ok(std::fs::canonicalize(&path), &path)?;
+    let root = fs_ok(std::fs::canonicalize(dir), dir)?;
+    canonical.starts_with(&root).then_some((canonical, meta))
 }
 
 /// Filesystem access on the serving path. An absent file is normal
@@ -260,20 +332,19 @@ fn fs_ok<T>(result: std::io::Result<T>, path: &Path) -> Option<T> {
 async fn serve_file(
     req: &LuaRequest,
     mount: &StaticMount,
-    path: &Path,
-    compression: &Compression,
+    located: Located,
 ) -> Result<HttpResponse> {
+    let Located {
+        file,
+        sidecar,
+        meta,
+    } = located;
     // The bytes may come from a sidecar, but the content type always comes
     // from the *logical* file: `app.js.br` is still JavaScript.
-    let mime = mime_guess::from_path(path).first_or_octet_stream();
-    let (source, encoding) = pick_source(req, path, compression).await;
-
-    let meta = match tokio::fs::metadata(&source).await {
-        Ok(meta) => meta,
-        Err(err) => {
-            tracing::error!("failed to stat static file {}: {err}", source.display());
-            return not_found();
-        }
+    let mime = mime_guess::from_path(&file).first_or_octet_stream();
+    let (source, encoding) = match sidecar {
+        Some((sidecar, encoding)) => (sidecar, Some(encoding)),
+        None => (file, None),
     };
     let len = meta.len();
     let modified = meta.modified().ok();
@@ -354,28 +425,21 @@ async fn serve_file(
     }
 }
 
-/// Chooses the bytes to serve: a precompressed sidecar when the client
-/// accepts its coding and the file is actually there, else the file itself.
+/// The precompressed sidecar for `file` under `encoding`, when the client
+/// accepts that coding and the file is actually there.
 ///
 /// This runs regardless of the `[compression]` section: a sidecar was
 /// compressed once at build time, so serving it costs nothing and gives a
-/// better ratio than anything done per request.
-async fn pick_source(
-    req: &LuaRequest,
-    path: &Path,
-    compression: &Compression,
-) -> (PathBuf, Option<Encoding>) {
-    let Some(encoding) = compression.negotiate(req.req.headers().get(header::ACCEPT_ENCODING))
-    else {
-        return (path.to_path_buf(), None);
-    };
-    let mut sidecar = path.as_os_str().to_os_string();
+/// better ratio than anything done per request. Synchronous, for the same
+/// reason as [`locate`].
+fn sidecar_for(file: &Path, encoding: Encoding) -> Option<(PathBuf, std::fs::Metadata, Encoding)> {
+    let mut sidecar = file.as_os_str().to_os_string();
     sidecar.push(".");
     sidecar.push(encoding.extension());
     let sidecar = PathBuf::from(sidecar);
-    match tokio::fs::metadata(&sidecar).await {
-        Ok(meta) if meta.is_file() => (sidecar, Some(encoding)),
-        _ => (path.to_path_buf(), None),
+    match std::fs::metadata(&sidecar) {
+        Ok(meta) if meta.is_file() => Some((sidecar, meta, encoding)),
+        _ => None,
     }
 }
 
@@ -418,17 +482,21 @@ async fn stream_file(
     let (tx, rx) = async_channel::bounded::<std::result::Result<Frame<Bytes>, Infallible>>(2);
     tokio::spawn(async move {
         let mut remaining = count;
-        let mut buf = vec![0u8; FILE_CHUNK];
+        // Each chunk is split off the buffer and handed over as it is —
+        // no copy per chunk; the buffer regrows its capacity in place
+        // once the consumer has released the previous chunk.
+        let mut buf = bytes::BytesMut::with_capacity(FILE_CHUNK);
         while remaining > 0 {
             // Clamp in `u64` first: on a 32-bit target `remaining as usize`
             // truncates, and a > 4 GiB span could clamp to a zero-length
             // read that ends the stream short of its `Content-Length`.
             let want = remaining.min(FILE_CHUNK as u64) as usize;
-            match file.read(&mut buf[..want]).await {
+            buf.reserve(want);
+            match file.read_buf(&mut (&mut buf).limit(want)).await {
                 Ok(0) => break,
                 Ok(n) => {
                     remaining -= n as u64;
-                    let chunk = Bytes::copy_from_slice(&buf[..n]);
+                    let chunk = buf.split_to(n).freeze();
                     if tx.send(Ok(Frame::data(chunk))).await.is_err() {
                         break; // client disconnected
                     }

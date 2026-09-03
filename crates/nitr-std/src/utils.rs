@@ -72,9 +72,28 @@ pub(crate) const MAX_JSON_NODES: usize = 1_000_000;
 /// recurses, but its depth is capped by the very bound it enforces; a
 /// cyclic table is infinitely deep and reports the depth error instead of
 /// hanging.
-pub(crate) fn check_json_bounds(value: &Value) -> mlua::Result<()> {
+pub fn check_json_bounds(value: &Value) -> mlua::Result<()> {
     let mut budget = MAX_JSON_NODES;
     depth_walk(value, MAX_JSON_DEPTH, &mut budget, true)
+}
+
+/// The three refusals, shared with the single-pass form in
+/// [`crate::bounded`] so both spell the bound the same way.
+pub(crate) fn nodes_message() -> String {
+    format!(
+        "json value expands to more than {MAX_JSON_NODES} nodes (a shared subtree \
+         counts once per path to it)"
+    )
+}
+
+pub(crate) fn depth_message() -> String {
+    format!("json value nested deeper than {MAX_JSON_DEPTH} levels")
+}
+
+pub(crate) fn utf8_message() -> String {
+    "json value contains a string that is not valid UTF-8: encode binary data \
+     first (nitr.base64.encode)"
+        .into()
 }
 
 /// [`check_json_bounds`] without the UTF-8 rule, for renderers that show
@@ -95,10 +114,7 @@ fn depth_walk(
     // counted once per path that reaches it — because that is what the
     // serializer will do too.
     if *budget == 0 {
-        return Err(mlua::Error::RuntimeError(format!(
-            "json value expands to more than {MAX_JSON_NODES} nodes (a shared subtree \
-             counts once per path to it)"
-        )));
+        return Err(mlua::Error::RuntimeError(nodes_message()));
     }
     *budget -= 1;
     // mlua serializes a string that is not UTF-8 as *bytes*, which
@@ -110,19 +126,13 @@ fn depth_walk(
         && let Value::String(s) = value
         && s.to_str().is_err()
     {
-        return Err(mlua::Error::RuntimeError(
-            "json value contains a string that is not valid UTF-8: encode binary data \
-             first (nitr.base64.encode)"
-                .into(),
-        ));
+        return Err(mlua::Error::RuntimeError(utf8_message()));
     }
     let Value::Table(table) = value else {
         return Ok(());
     };
     if remaining == 0 {
-        return Err(mlua::Error::RuntimeError(format!(
-            "json value nested deeper than {MAX_JSON_DEPTH} levels"
-        )));
+        return Err(mlua::Error::RuntimeError(depth_message()));
     }
     // Raw iteration, matching what serialization will walk; keys can be
     // tables too, and a deep key must not slip past the check.
@@ -180,6 +190,10 @@ pub(crate) fn dag_table(lua: &Lua, levels: usize) -> Value {
 /// diagnose is worse than one that says it could not render.
 pub(crate) fn create_debug_fn(lua: &Lua) -> mlua::Result<Function> {
     lua.create_function(|_, value: Value| {
+        // Nothing is walked or rendered unless the level is on.
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return Ok(());
+        }
         if let Err(err) = check_value_bounds(&value) {
             tracing::debug!("[lua] <value not rendered: {err}>");
             return Ok(());
@@ -235,8 +249,14 @@ pub fn error_lua_value(lua: &Lua, info: &nitr_core::ErrorInfo) -> mlua::Result<m
 /// Whether `print`-style console output should carry color: stdout is a
 /// terminal and `NO_COLOR` is unset.
 fn console_wants_color() -> bool {
-    use std::io::IsTerminal as _;
-    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+    // Decided once: an `isatty` syscall and an environment lookup per
+    // error value is the wrong price on a path that runs under attack.
+    // Neither answer changes while the process lives.
+    static WANTS_COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WANTS_COLOR.get_or_init(|| {
+        use std::io::IsTerminal as _;
+        std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+    })
 }
 
 /// The shared metatable for error values, built once per state:

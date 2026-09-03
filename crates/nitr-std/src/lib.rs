@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use nitr_core::Result;
 
 pub(crate) mod base64;
+pub(crate) mod bounded;
 pub mod cache;
 pub(crate) mod config;
 #[cfg(feature = "crypto")]
@@ -63,6 +64,9 @@ pub mod fuzzing {
         basename, dirname, is_absolute, is_windows_style, join, normalize, split_root,
     };
     pub use crate::url::create_url_table;
+    // Also driven by the `bounds_guard` benchmark, which measures the
+    // guard's own walk against the serialization it precedes.
+    pub use crate::utils::check_json_bounds;
     pub use crate::validate::format::{check_format, format_names};
 }
 

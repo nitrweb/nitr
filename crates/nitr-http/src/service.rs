@@ -95,7 +95,7 @@ impl Service<Request<Incoming>> for Svc {
                 body.map_err(|err| Box::new(err) as _).boxed()
             }),
             params: Vec::new(),
-            id,
+            id: id.into(),
             // Replaced with the configured bounds by the handler.
             limits: Default::default(),
             cached_form: None,

@@ -5,7 +5,7 @@
 
 use rusqlite::{Connection, OptionalExtension as _, params_from_iter};
 
-use crate::db::types::{SqlRow, SqlValue, read_row};
+use crate::db::types::{SqlRow, SqlValue, column_names, read_row};
 
 /// Runs a query and returns its first row, or `None` when it produced no
 /// rows — the documented `query_row` contract (`nil`, not an error, for an
@@ -17,11 +17,7 @@ pub(crate) fn call(
     _max_rows: usize,
 ) -> Result<Option<SqlRow>, rusqlite::Error> {
     let mut stmt = conn.prepare_cached(sql)?;
-    let columns = stmt
-        .column_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
+    let columns = column_names(&stmt);
 
     stmt.query_row(params_from_iter(params), |row| read_row(&columns, row))
         .optional()

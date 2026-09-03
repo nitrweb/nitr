@@ -68,12 +68,12 @@ impl Body for TrickleBody {
 // scheduler's mood on a loaded runner.
 #[tokio::test(start_paused = true)]
 async fn a_stalled_body_read_fails_and_sets_the_flag() {
-    let stalled = Arc::new(AtomicBool::new(false));
+    let flags = Arc::new(super::body::BodyFlags::default());
     let mut body = StalledBody {
         inner: NeverBody.boxed(),
         budget: std::time::Duration::from_millis(40),
         deadline: None,
-        stalled: stalled.clone(),
+        flags: flags.clone(),
     };
     let err = body
         .frame()
@@ -81,7 +81,8 @@ async fn a_stalled_body_read_fails_and_sets_the_flag() {
         .expect("a frame result")
         .expect_err("the stall must fail the read");
     assert!(err.to_string().contains("stalled"), "got: {err}");
-    assert!(stalled.load(Ordering::Relaxed));
+    assert!(flags.stalled.load(Ordering::Relaxed));
+    assert!(!flags.oversized.load(Ordering::Relaxed));
 }
 
 /// The budget bounds *progress*, not total transfer: a transfer whose
@@ -89,7 +90,7 @@ async fn a_stalled_body_read_fails_and_sets_the_flag() {
 /// takes in total.
 #[tokio::test(start_paused = true)]
 async fn a_slow_but_moving_body_completes() {
-    let stalled = Arc::new(AtomicBool::new(false));
+    let flags = Arc::new(super::body::BodyFlags::default());
     let mut body = StalledBody {
         inner: TrickleBody {
             frames: 4,
@@ -100,7 +101,7 @@ async fn a_slow_but_moving_body_completes() {
         // Under 4 × 30 ms of total transfer, over any single gap.
         budget: std::time::Duration::from_millis(80),
         deadline: None,
-        stalled: stalled.clone(),
+        flags: flags.clone(),
     };
     let mut got = 0;
     while let Some(frame) = body.frame().await {
@@ -108,7 +109,7 @@ async fn a_slow_but_moving_body_completes() {
         got += 1;
     }
     assert_eq!(got, 4);
-    assert!(!stalled.load(Ordering::Relaxed));
+    assert!(!flags.stalled.load(Ordering::Relaxed));
 }
 
 fn headers(pairs: &[(&'static str, &str)]) -> hyper::HeaderMap {
