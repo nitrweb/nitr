@@ -107,6 +107,10 @@ async fn main() -> nitr::Result {
     let dir = std::env::temp_dir().join(format!("nitr-example-tls-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let mut builder = std::fs::DirBuilder::new();
+    // Non-recursive on purpose (an existing path must fail, not be
+    // adopted); stated explicitly so the builder is mutated on every
+    // platform, not only where the mode is set.
+    builder.recursive(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;

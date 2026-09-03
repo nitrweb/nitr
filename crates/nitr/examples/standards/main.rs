@@ -98,6 +98,10 @@ async fn main() -> nitr::Result {
     let _ = std::fs::remove_dir_all(&uploads);
     {
         let mut builder = std::fs::DirBuilder::new();
+        // Non-recursive on purpose (an existing path must fail, not be
+        // adopted); stated explicitly so the builder is mutated on every
+        // platform, not only where the mode is set.
+        builder.recursive(false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt as _;

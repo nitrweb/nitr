@@ -37,9 +37,7 @@ pub(crate) async fn hash_password() -> anyhow::Result<()> {
         let password = prompt("Password")?;
         // A typo here becomes a credential nobody can ever use, and the
         // only symptom is a login that always fails. Cheap to prevent.
-        if *prompt("Confirm password")? != *password {
-            bail!("the passwords do not match");
-        }
+        confirm(&password, |_| prompt("Confirm password"))?;
         password
     } else {
         read_stdin_password(stdin.lock())?
@@ -57,6 +55,32 @@ pub(crate) async fn hash_password() -> anyhow::Result<()> {
     // `$(nitr hash-password)` both give exactly the storable string.
     println!("{}", argon2id(&password).await?);
     Ok(())
+}
+
+/// How many times the confirmation prompt is offered before giving up.
+const CONFIRM_ATTEMPTS: u32 = 3;
+
+/// Asks for the password again until the answer matches, at most
+/// [`CONFIRM_ATTEMPTS`] times. A mismatch is reported and re-asked; the
+/// last mismatch is an error, so a hash is only ever printed for a
+/// password the operator typed identically twice. `ask` receives the
+/// attempt number, so the caller decides what the prompt says.
+fn confirm(
+    password: &str,
+    mut ask: impl FnMut(u32) -> anyhow::Result<Zeroizing<String>>,
+) -> anyhow::Result<()> {
+    for attempt in 1..=CONFIRM_ATTEMPTS {
+        let again = ask(attempt)?;
+        if again.as_str() == password {
+            return Ok(());
+        }
+        if attempt < CONFIRM_ATTEMPTS {
+            eprintln!(
+                "the passwords do not match (attempt {attempt} of {CONFIRM_ATTEMPTS}); try again"
+            );
+        }
+    }
+    bail!("the passwords did not match in {CONFIRM_ATTEMPTS} attempts; nothing was hashed")
 }
 
 /// Reads the piped password, bounded by the server's own cap.
@@ -225,6 +249,32 @@ async fn argon2id(password: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{MAX_PASSWORD_BYTES, read_stdin_password, strip_eol};
+
+    /// The confirmation is re-asked on a mismatch and gives up after the
+    /// last attempt; a hash is never produced for an unconfirmed password.
+    #[test]
+    fn confirmation_retries_then_refuses() {
+        let answers = |list: &'static [&'static str]| {
+            let mut it = list.iter();
+            move |_attempt: u32| {
+                Ok(zeroize::Zeroizing::new(
+                    it.next().expect("more answers than attempts").to_string(),
+                ))
+            }
+        };
+        super::confirm("secret", answers(&["secret"])).expect("first try");
+        super::confirm("secret", answers(&["typo", "secret"])).expect("second try");
+        super::confirm("secret", answers(&["typo", "typo", "secret"])).expect("third try");
+
+        let err = super::confirm("secret", answers(&["a", "b", "c", "secret"]))
+            .expect_err("three mismatches must refuse");
+        assert!(err.to_string().contains("3 attempts"), "got: {err}");
+
+        // A read error on any attempt is the error, not a retry.
+        let err =
+            super::confirm("secret", |_| anyhow::bail!("terminal closed")).expect_err("read error");
+        assert!(err.to_string().contains("terminal closed"));
+    }
 
     #[test]
     fn only_the_shells_line_ending_is_removed() {
