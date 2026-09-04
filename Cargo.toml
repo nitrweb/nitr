@@ -48,7 +48,7 @@ mem_forget = "deny"
 unreachable = "deny"
 
 [workspace.package]
-version = "0.0.0-beta.3"
+version = "0.0.0-beta.4"
 edition = "2024"
 rust-version = "1.88.0"
 authors = ["Jose Quintana <https://joseluisq.net>"]
@@ -58,10 +58,10 @@ homepage = "https://github.com/nitrweb/nitr"
 
 [workspace.dependencies]
 # Workspace crates
-nitr-core = { version = "0.0.0-beta.3", path = "crates/nitr-core" }
-nitr-std = { version = "0.0.0-beta.3", path = "crates/nitr-std" }
-nitr-http = { version = "0.0.0-beta.3", path = "crates/nitr-http" }
-nitr = { version = "0.0.0-beta.3", path = "crates/nitr" }
+nitr-core = { version = "0.0.0-beta.4", path = "crates/nitr-core" }
+nitr-std = { version = "0.0.0-beta.4", path = "crates/nitr-std" }
+nitr-http = { version = "0.0.0-beta.4", path = "crates/nitr-http" }
+nitr = { version = "0.0.0-beta.4", path = "crates/nitr" }
 
 # External
 anyhow = "1.0"
