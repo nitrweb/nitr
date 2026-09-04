@@ -587,10 +587,18 @@ mod tests {
         assert!(err.to_string().contains("not valid UTF-8"), "{err}");
     }
 
+    /// mlua's serializer detects a table that comes round on the current
+    /// path and refuses it before the depth bound is reached; the walking
+    /// guard (`check_json_bounds`) reports the same value as too deep.
+    /// Both are ordinary errors, and the message a script sees for a
+    /// cycle at a JSON site is mlua's — pinned here and by the `json-lua`
+    /// fuzz target.
     #[test]
     fn a_cyclic_table_is_refused_without_hanging() {
         let lua = Lua::new();
         let cyclic = value(&lua, "local t = {} t.me = t return t");
-        assert!(to_json_string(&cyclic).is_err());
+        let err = to_json_string(&cyclic).expect_err("a cycle");
+        assert!(err.to_string().contains("recursive table"), "{err}");
+        assert!(crate::utils::check_json_bounds(&cyclic).is_err());
     }
 }

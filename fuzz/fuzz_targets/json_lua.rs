@@ -197,12 +197,15 @@ const SHAPES: &[(&str, &str, Want)] = &[
         "return {f = function() end}",
         Want::Refused("cannot serialize"),
     ),
-    // A cycle is infinitely deep, so the depth guard is what stops it —
-    // before any serializer recurses into it.
+    // A cycle is infinitely deep. The bounds are enforced inside the one
+    // serialization pass (`nitr_std::bounded`), and mlua's own recursion
+    // detection sees the table come round before the depth bound is
+    // reached — so the refusal names the cycle. Either way it is an
+    // ordinary error, never a hang or an overflow.
     (
         "a cycle",
         "local t = {} t.me = t return t",
-        Want::Refused("nested deeper"),
+        Want::Refused("recursive table"),
     ),
     // A shared subtree is not a cycle and must be written out twice.
     (

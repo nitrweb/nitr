@@ -72,6 +72,14 @@ pub(crate) const MAX_JSON_NODES: usize = 1_000_000;
 /// recurses, but its depth is capped by the very bound it enforces; a
 /// cyclic table is infinitely deep and reports the depth error instead of
 /// hanging.
+///
+/// The JSON sites now enforce the same three rules inside the one
+/// serialization pass ([`crate::bounded`]) rather than through this
+/// pre-walk; there a cycle is refused by mlua's own recursion detection
+/// (`recursive table detected`) before the depth bound is reached. This
+/// walk remains the guard for renderers that are not serde serializers
+/// (`nitr.dbg`, the template context) and the reference the single-pass
+/// form is tested against.
 pub fn check_json_bounds(value: &Value) -> mlua::Result<()> {
     let mut budget = MAX_JSON_NODES;
     depth_walk(value, MAX_JSON_DEPTH, &mut budget, true)
