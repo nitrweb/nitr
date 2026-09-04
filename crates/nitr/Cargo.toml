@@ -171,7 +171,11 @@ mlua = { workspace = true }
 # The TLS example and the `tls` integration test mint their own
 # self-signed certificate at run time; no key material is committed.
 rcgen = { workspace = true }
-reqwest = { workspace = true }
+# `query` is split out in reqwest 0.13; the integration tests use it.
+reqwest = { workspace = true, features = ["query"] }
+# reqwest's `rustls-no-provider` build needs a process default crypto
+# provider; the test harness installs `ring`, as the fetch client does.
+rustls = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }

@@ -191,7 +191,9 @@ fn the_release_profile_unwinds_so_the_panic_boundary_is_real() {
     };
 
     let text = std::fs::read_to_string(&manifest).expect("read the workspace manifest");
-    let parsed: toml::Value = text.parse().expect("parse the workspace manifest");
+    // A document, not a value: since toml 1.0 `Value::from_str` parses a
+    // single TOML value, and the table type is what parses a file.
+    let parsed: toml::Table = text.parse().expect("parse the workspace manifest");
     let panic_setting = parsed
         .get("profile")
         .and_then(|profiles| profiles.get("release"))

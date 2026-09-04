@@ -10,7 +10,8 @@
 use std::sync::OnceLock;
 
 use argon2::Argon2;
-use argon2::password_hash::{PasswordHash, PasswordHasher as _, PasswordVerifier as _, SaltString};
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher as _, PasswordVerifier as _};
 use mlua::{Lua, Value};
 
 use super::rng_err;
@@ -70,9 +71,11 @@ const MAX_HASH_MEMORY_KIB: u32 = 256 * 1024;
 const MAX_HASH_TIME_COST: u32 = 8;
 const MAX_HASH_LANES: u32 = 8;
 
-/// The password-hash error type has no `std::error::Error` impl here, so
-/// its `Display` is carried over manually.
-fn pw_err(err: argon2::password_hash::Error) -> mlua::Error {
+/// The password-hash and PHC error types have no `std::error::Error` impl
+/// here, so their `Display` is carried over manually (they are two types
+/// since password-hash 0.6: parsing errors are `phc::Error`, hashing and
+/// verification errors are `password_hash::Error`).
+fn pw_err(err: impl std::fmt::Display) -> mlua::Error {
     mlua::Error::RuntimeError(format!("password hashing failed: {err}"))
 }
 
@@ -127,10 +130,9 @@ pub(super) fn check_password_len(password: &[u8]) -> mlua::Result<()> {
 pub(super) fn hash_password(password: &[u8]) -> mlua::Result<String> {
     check_password_len(password)?;
     let mut salt = [0u8; 16];
-    getrandom::getrandom(&mut salt).map_err(rng_err)?;
-    let salt = SaltString::encode_b64(&salt).map_err(pw_err)?;
+    getrandom::fill(&mut salt).map_err(rng_err)?;
     Ok(Argon2::default()
-        .hash_password(password, &salt)
+        .hash_password_with_salt(password, &salt)
         .map_err(pw_err)?
         .to_string())
 }
@@ -166,12 +168,12 @@ pub(super) fn verify_stored(password: &[u8], hash: &str) -> VerifyOutcome {
         Err(reason) => VerifyOutcome::Rejected(reason),
         Ok(parsed) => match Argon2::default().verify_password(password, &parsed) {
             Ok(()) => VerifyOutcome::Matched,
-            // `Error::Password` is the one benign outcome: a well-formed
-            // argon2 hash that this password does not match. Everything
-            // else is the hash's fault, and `parse_stored_hash` has
-            // already ruled out the cases the verifier reports as
-            // `Password`.
-            Err(argon2::password_hash::Error::Password) => VerifyOutcome::Mismatch,
+            // `Error::PasswordInvalid` is the one benign outcome: a
+            // well-formed argon2 hash that this password does not match.
+            // Everything else is the hash's fault, and `parse_stored_hash`
+            // has already ruled out the cases the verifier reports as
+            // `PasswordInvalid` (a missing salt or output).
+            Err(argon2::password_hash::Error::PasswordInvalid) => VerifyOutcome::Mismatch,
             Err(_) => VerifyOutcome::Rejected("unusable hash"),
         },
     }
@@ -191,12 +193,13 @@ pub(super) fn verify_stored(password: &[u8], hash: &str) -> VerifyOutcome {
 /// * The algorithm identifier: a PHC string naming scrypt or pbkdf2
 ///   parses fine and is not something this verifier can check.
 /// * The cost parameters, against the ceilings above.
-pub(super) fn parse_stored_hash(hash: &str) -> Result<PasswordHash<'_>, &'static str> {
+pub(super) fn parse_stored_hash(hash: &str) -> Result<PasswordHash, &'static str> {
     let parsed = PasswordHash::new(hash).map_err(|_| "unsupported hash format")?;
     if parsed.salt.is_none() || parsed.hash.is_none() {
         return Err("incomplete hash");
     }
-    argon2::Algorithm::try_from(parsed.algorithm).map_err(|_| "unsupported hash algorithm")?;
+    argon2::Algorithm::try_from(parsed.algorithm.as_str())
+        .map_err(|_| "unsupported hash algorithm")?;
     let params = argon2::Params::try_from(&parsed).map_err(|_| "unusable hash")?;
     if params.m_cost() > MAX_HASH_MEMORY_KIB
         || params.t_cost() > MAX_HASH_TIME_COST
@@ -295,7 +298,7 @@ pub(super) fn dummy_verify(password: &[u8]) -> mlua::Result<bool> {
         Some(decoy) => decoy.as_str(),
         None => {
             let mut secret = [0u8; 32];
-            getrandom::getrandom(&mut secret).map_err(rng_err)?;
+            getrandom::fill(&mut secret).map_err(rng_err)?;
             let hash = hash_password(&secret)?;
             DECOY_HASH.get_or_init(|| hash).as_str()
         }

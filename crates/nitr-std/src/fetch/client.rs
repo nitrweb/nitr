@@ -258,6 +258,14 @@ fn client_for(opts: &FetchOptions) -> mlua::Result<Arc<HttpClient>> {
         return Ok(client.clone());
     }
 
+    // reqwest's `rustls-no-provider` feature builds its TLS configuration
+    // from the process-wide default crypto provider, so `ring` is installed
+    // as that default before the first client exists. A second install
+    // answers `Err` (already installed), which is the expected case for
+    // every client after the first — and for an embedder that installed
+    // its own provider earlier, whose choice then stands.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let mut builder = HttpClient::builder()
         .connect_timeout(policy.connect_timeout)
         .timeout(policy.timeout)

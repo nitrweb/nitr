@@ -113,6 +113,24 @@ impl Drop for TestDir {
 /// Binds port 0 (the OS picks a free port) and keeps the listener alive.
 /// The server adopts it via `.listener(...)`, so the port can never be
 /// taken by another test between choosing it and serving on it.
+/// Installs `ring` as the process-wide rustls crypto provider, once.
+///
+/// reqwest 0.13 is built here with `rustls-no-provider` (the `rustls`
+/// feature would pin `aws-lc-rs`, which the workspace avoids), so a client
+/// built before any provider is installed panics. The fetch builtin
+/// installs `ring` for the server; a test that talks to a server with its
+/// own reqwest client goes through this. A second install answers `Err`
+/// (already installed), which is the expected case.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// A reqwest client builder with the crypto provider in place.
+pub fn http_client_builder() -> reqwest::ClientBuilder {
+    install_crypto_provider();
+    reqwest::Client::builder()
+}
+
 pub fn reserve_addr() -> (std::net::TcpListener, SocketAddr) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind port 0");
     let addr = listener.local_addr().expect("local addr");
@@ -384,7 +402,7 @@ impl Builder {
             // No automatic decompression and no redirect following:
             // integration tests assert on the bytes and headers actually
             // sent.
-            client: reqwest::Client::builder()
+            client: http_client_builder()
                 .no_gzip()
                 .no_brotli()
                 .redirect(reqwest::redirect::Policy::none())

@@ -143,9 +143,8 @@ impl TlsServer {
     fn client(&self) -> reqwest::Client {
         let root = reqwest::Certificate::from_pem(self.identity.cert_pem.as_bytes())
             .expect("parse the test certificate");
-        reqwest::Client::builder()
-            .tls_built_in_root_certs(false)
-            .add_root_certificate(root)
+        harness::http_client_builder()
+            .tls_certs_only([root])
             .build()
             .expect("client")
     }
@@ -264,8 +263,9 @@ async fn a_plaintext_request_to_a_tls_port_is_refused_not_served() {
 async fn a_client_that_does_not_trust_the_certificate_is_rejected() {
     let mut server = TlsServer::spawn("tls-untrusted", |_| {}).await;
 
-    let stranger = reqwest::Client::builder()
-        .tls_built_in_root_certs(false)
+    // No roots at all, not even the platform's: nothing can verify.
+    let stranger = harness::http_client_builder()
+        .tls_certs_only(std::iter::empty())
         .build()
         .expect("client");
     let err = stranger
@@ -544,9 +544,8 @@ async fn a_reload_swaps_the_certificate_without_dropping_connections() {
     // A client that trusts ONLY the renewed certificate: succeeds exactly
     // when the acceptor has been swapped.
     let root = reqwest::Certificate::from_pem(new_cert_pem.as_bytes()).expect("new root");
-    let new_client = reqwest::Client::builder()
-        .tls_built_in_root_certs(false)
-        .add_root_certificate(root)
+    let new_client = harness::http_client_builder()
+        .tls_certs_only([root])
         .build()
         .expect("client");
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -670,7 +669,7 @@ return app
         .spawn()
         .await;
 
-    let client = reqwest::Client::builder()
+    let client = harness::http_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("client");

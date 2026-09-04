@@ -82,7 +82,7 @@ fn refuses_cross_site(cookie_opts: Option<&Table>) -> mlua::Result<bool> {
 
 fn new_token() -> mlua::Result<String> {
     let mut buf = [0u8; 32];
-    getrandom::getrandom(&mut buf)
+    getrandom::fill(&mut buf)
         .map_err(|err| mlua::Error::RuntimeError(format!("failed to read OS entropy: {err}")))?;
     Ok(B64.encode(buf))
 }

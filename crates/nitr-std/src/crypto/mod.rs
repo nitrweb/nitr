@@ -89,7 +89,7 @@ pub fn create_crypto_table(lua: &Lua) -> mlua::Result<Table> {
                 )));
             }
             let mut buf = vec![0u8; n as usize];
-            getrandom::getrandom(&mut buf).map_err(rng_err)?;
+            getrandom::fill(&mut buf).map_err(rng_err)?;
             lua.create_string(&buf)
         })?,
     )?;
@@ -149,7 +149,7 @@ pub fn create_crypto_table(lua: &Lua) -> mlua::Result<Table> {
             |lua, (key, plaintext, aad): (LuaString, LuaString, Option<LuaString>)| {
                 let cipher = aead_cipher(&key)?;
                 let mut nonce = [0u8; 24];
-                getrandom::getrandom(&mut nonce).map_err(rng_err)?;
+                getrandom::fill(&mut nonce).map_err(rng_err)?;
                 let nonce = XNonce::from(nonce);
                 let aad = aad
                     .as_ref()
@@ -187,8 +187,13 @@ pub fn create_crypto_table(lua: &Lua) -> mlua::Result<Table> {
                     return Ok(Value::Nil);
                 }
                 let (nonce, ciphertext) = raw.split_at(24);
+                // Exactly 24 bytes by the split above; a conversion failure
+                // is unreachable, and answered like any tampering anyway.
+                let Ok(nonce) = XNonce::try_from(nonce) else {
+                    return Ok(Value::Nil);
+                };
                 match cipher.decrypt(
-                    XNonce::from_slice(nonce),
+                    &nonce,
                     Payload {
                         msg: ciphertext,
                         aad: &aad,
@@ -298,11 +303,13 @@ fn aead_cipher(key: &LuaString) -> mlua::Result<XChaCha20Poly1305> {
             key.len()
         )));
     }
+    // Exactly 32 bytes by the check above, so the conversion cannot fail;
+    // it is still an error, never a panic, on a request path.
+    let key = chacha20poly1305::Key::try_from(&*key)
+        .map_err(|_| mlua::Error::RuntimeError("seal/open key conversion failed".into()))?;
     // Fully qualified: importing `KeyInit` would make the `Hmac`
     // constructors ambiguous (`Mac` supplies its own `new_from_slice`).
-    Ok(<XChaCha20Poly1305 as chacha20poly1305::KeyInit>::new(
-        key.as_ref().into(),
-    ))
+    Ok(<XChaCha20Poly1305 as chacha20poly1305::KeyInit>::new(&key))
 }
 
 mod auth;
