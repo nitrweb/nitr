@@ -23,12 +23,12 @@ written for. Measured against the seeds as they were committed:
 
 | Seed | Written as | What the target received |
 | ---- | ---------- | ------------------------ |
-| `range_header/simple` | `bytes=0-499` | header `"by"`, len `4121969244163499380` |
-| `range_header/multi` | `bytes=0-0,5-9` | header `"bytes"`, len `12724837855080509` |
+| `range-header/simple` | `bytes=0-499` | header `"by"`, len `4121969244163499380` |
+| `range-header/multi` | `bytes=0-0,5-9` | header `"bytes"`, len `12724837855080509` |
 | `multipart/simple` | a full body with `boundary=XX--` | content type `"multipart/"` — no boundary parameter, so the parser was never entered |
-| `accept_negotiation/zero-q` | `application/json;q=0, text/*` | `("application/js", ["n;q=0, text"])` |
-| `cookie_verify/pair` | one signed cookie | `("ses", "sion=dXNlci00Mg…", "Fy", "c3R1dnd4")` |
-| `json_lua/object.json` | a JSON object | the first 29 bytes, so it never parsed |
+| `accept-negotiation/zero-q` | `application/json;q=0, text/*` | `("application/js", ["n;q=0, text"])` |
+| `cookie-verify/pair` | one signed cookie | `("ses", "sion=dXNlci00Mg…", "Fy", "c3R1dnd4")` |
+| `json-lua/object.json` | a JSON object | the first 29 bytes, so it never parsed |
 
 Fourteen of sixteen seeds were dead on arrival, and the two survivors were
 partial. The tail-length rule also made the corpus unstable: appending one
@@ -53,14 +53,14 @@ Each target's module doc states its own layout.
 `printf` is enough. With no numeric prefix, a seed is just its text:
 
 ```sh
-printf 'bytes=0-499' > fuzz/seeds/range_header/simple
+printf 'bytes=0-499' > fuzz/seeds/range-header/simple
 ```
 
 With a numeric prefix, write the bytes little-endian — here a `u64`
 length of 1000 (`0x3e8`) followed by the header:
 
 ```sh
-printf '\xe8\x03\x00\x00\x00\x00\x00\x00bytes=0-499' > fuzz/seeds/range_header/simple
+printf '\xe8\x03\x00\x00\x00\x00\x00\x00bytes=0-499' > fuzz/seeds/range-header/simple
 ```
 
 Multiple text fields are separated by NUL:
@@ -79,7 +79,7 @@ meant to reach:
 ```sh
 cd fuzz
 CARGO_BUILD_TARGET= cargo +nightly fuzz run --target x86_64-unknown-linux-gnu \
-  range_header seeds/range_header/simple -- -runs=1
+  range-header seeds/range-header/simple -- -runs=1
 ```
 
 A seed that decodes to nothing costs nothing at runtime, which is exactly
@@ -97,14 +97,14 @@ written *into it*, named by the SHA-1 of its contents:
 
 ```sh
 # SAFE: one file, executed once, nothing written.
-cargo +nightly fuzz run json_lua seeds/json_lua/object -- -runs=1
+cargo +nightly fuzz run json-lua seeds/json-lua/object -- -runs=1
 
 # SAFE: no directory argument, so the default fuzz/corpus/<target> is used.
-cargo +nightly fuzz run json_lua -- -max_total_time=60
+cargo +nightly fuzz run json-lua -- -max_total_time=60
 
 # WRONG: this makes the curated seed directory the corpus. One 60-second
 # run buried these seeds under 800 generated files.
-cargo +nightly fuzz run json_lua fuzz/seeds/json_lua
+cargo +nightly fuzz run json-lua fuzz/seeds/json-lua
 ```
 
 `make fuzz` does the right thing already: it `cp -n`s the seeds into
@@ -125,7 +125,7 @@ after the format above had already fixed the field cutting:
 
 | Seed | Decoded correctly into | Why it still did nothing |
 | ---- | ---------------------- | ------------------------ |
-| `json_lua/numbers` | a JSON document of interesting numbers | it ended in `1e309`, which `serde_json` refuses as `number out of range`, so the *whole array* failed to decode and none of `i64::MAX`, `i64::MIN`, `-0.0` or `1e-400` ever reached the round trip |
+| `json-lua/numbers` | a JSON document of interesting numbers | it ended in `1e309`, which `serde_json` refuses as `number out of range`, so the *whole array* failed to decode and none of `i64::MAX`, `i64::MIN`, `-0.0` or `1e-400` ever reached the round trip |
 | `multipart/simple`, `multipart/bytewise` | `boundary=XX--` and a body | the body's delimiters spelled `--XX`, but the dash-boundary for `XX--` is `--XX--`, so multer found no part at all and returned `incomplete multipart stream` |
 
 So confirm the *outcome*, not just the decode: that the document parses,

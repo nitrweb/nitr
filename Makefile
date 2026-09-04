@@ -14,10 +14,10 @@ RUSTFLAGS ?=
 export RUSTFLAGS
 
 # The libfuzzer targets, same list as .github/workflows/fuzz.yml.
-FUZZ_TARGETS := cookie_verify accept_negotiation path_lexical json_lua \
-                range_header multipart static_resolve upload_resolve \
-                url_lexical cookie_header accept_encoding jwt_verify \
-                validate_formats conditional_headers basic_auth tls_pem
+FUZZ_TARGETS := cookie-verify accept-negotiation path-lexical json-lua \
+                range-header multipart static-resolve upload-resolve \
+                url-lexical cookie-header accept-encoding jwt-verify \
+                validate-formats conditional-headers basic-auth tls-pem
 # Per-target fuzz time in seconds (CI uses 90).
 FUZZ_TIME ?= 60
 # A hang is a bug: bound one execution well under the run itself, since
@@ -56,10 +56,10 @@ lint: fuzz-check
 # fills it with thousands of SHA-1-named inputs, and the good seeds are
 # then indistinguishable from the noise by eye.
 fuzz-check:
-	@bins=$$(sed -n 's/^name = "\([a-z_][a-z_]*\)"$$/\1/p' fuzz/Cargo.toml \
-		| grep -vx 'nitr_fuzz' | sort | tr '\n' ' '); \
+	@bins=$$(sed -n 's/^name = "\([a-z][a-z_-]*\)"$$/\1/p' fuzz/Cargo.toml \
+		| grep -vx 'nitr_fuzz' | grep -vx 'nitr-fuzz' | sort | tr '\n' ' '); \
 	mk=$$(echo $(FUZZ_TARGETS) | tr ' ' '\n' | sort | tr '\n' ' '); \
-	ci=$$(sed -n 's/^ *- target: \([a-z_][a-z_]*\)$$/\1/p' \
+	ci=$$(sed -n 's/^ *- target: \([a-z][a-z_-]*\)$$/\1/p' \
 		.github/workflows/fuzz.yml | sort | tr '\n' ' '); \
 	fail=0; \
 	if [ "$$bins" != "$$mk" ]; then \
@@ -119,8 +119,8 @@ fuzz:
 	for target in $(FUZZ_TARGETS); do \
 		case $$target in \
 			multipart) max_len=65536 ;; \
-			json_lua|tls_pem) max_len=16384 ;; \
-			jwt_verify|url_lexical) max_len=8192 ;; \
+			json-lua|tls-pem) max_len=16384 ;; \
+			jwt-verify|url-lexical) max_len=8192 ;; \
 			*) max_len=4096 ;; \
 		esac; \
 		echo "== fuzz $$target ($(FUZZ_TIME)s, max_len=$$max_len)"; \

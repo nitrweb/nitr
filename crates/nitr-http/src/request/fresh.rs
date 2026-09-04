@@ -42,8 +42,7 @@ pub fn is_fresh(
             // as fresh, or every conditional request of a compressed
             // response is a full 200 plus a recompress.
             let candidate = strip_weak(candidate);
-            candidate == etag
-                || strip_encoding_suffix(candidate).is_some_and(|base| base == etag)
+            candidate == etag || strip_encoding_suffix(candidate).is_some_and(|base| base == etag)
         });
     }
 
@@ -83,7 +82,8 @@ fn strip_encoding_suffix(tag: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// Found by the `conditional_headers` fuzz target: `W/*` weak-stripped
+    /// Found by the `conditional-headers` fuzz target (its input is kept
+    /// as the seed `weak-prefixed-wildcard`): `W/*` weak-stripped
     /// to `*` and matched everything. Only the bare `*` member is the
     /// wildcard; `W/*` is a tag like any other and matches only itself.
     #[test]

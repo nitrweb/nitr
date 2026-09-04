@@ -2,7 +2,7 @@
 # member: built by cargo-fuzz on nightly.
 #
 #   cargo install cargo-fuzz
-#   cargo +nightly fuzz run cookie_verify -- -max_total_time=60
+#   cargo +nightly fuzz run cookie-verify -- -max_total_time=60
 #
 # The crate carries a library (`src/lib.rs`) as well as the targets: it
 # holds the shared input format every target decodes with. See its module
@@ -47,35 +47,35 @@ name = "nitr_fuzz"
 path = "src/lib.rs"
 
 [[bin]]
-name = "cookie_verify"
+name = "cookie-verify"
 path = "fuzz_targets/cookie_verify.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "accept_negotiation"
+name = "accept-negotiation"
 path = "fuzz_targets/accept_negotiation.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "path_lexical"
+name = "path-lexical"
 path = "fuzz_targets/path_lexical.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "json_lua"
+name = "json-lua"
 path = "fuzz_targets/json_lua.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "range_header"
+name = "range-header"
 path = "fuzz_targets/range_header.rs"
 test = false
 doc = false
@@ -89,70 +89,70 @@ doc = false
 bench = false
 
 [[bin]]
-name = "static_resolve"
+name = "static-resolve"
 path = "fuzz_targets/static_resolve.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "upload_resolve"
+name = "upload-resolve"
 path = "fuzz_targets/upload_resolve.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "url_lexical"
+name = "url-lexical"
 path = "fuzz_targets/url_lexical.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "cookie_header"
+name = "cookie-header"
 path = "fuzz_targets/cookie_header.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "accept_encoding"
+name = "accept-encoding"
 path = "fuzz_targets/accept_encoding.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "jwt_verify"
+name = "jwt-verify"
 path = "fuzz_targets/jwt_verify.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "validate_formats"
+name = "validate-formats"
 path = "fuzz_targets/validate_formats.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "conditional_headers"
+name = "conditional-headers"
 path = "fuzz_targets/conditional_headers.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "tls_pem"
+name = "tls-pem"
 path = "fuzz_targets/tls_pem.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "basic_auth"
+name = "basic-auth"
 path = "fuzz_targets/basic_auth.rs"
 test = false
 doc = false

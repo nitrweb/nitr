@@ -63,43 +63,43 @@ jobs:
           # truncates the inputs that are bodies rather than headers, so
           # multipart never reached multi-frame sizes and JSON never got
           # deep enough to approach the 128-level depth guard.
-          - target: cookie_verify
+          - target: cookie-verify
             max_len: 4096
-          - target: accept_negotiation
+          - target: accept-negotiation
             max_len: 4096
-          - target: path_lexical
+          - target: path-lexical
             max_len: 4096
-          - target: json_lua
+          - target: json-lua
             max_len: 16384
-          - target: range_header
+          - target: range-header
             max_len: 4096
           - target: multipart
             max_len: 65536
-          - target: static_resolve
+          - target: static-resolve
             max_len: 4096
           # Upload paths are Lua strings, not URLs, and a file name is
           # bounded by NAME_MAX — the default length is ample.
-          - target: upload_resolve
+          - target: upload-resolve
             max_len: 4096
-          - target: url_lexical
+          - target: url-lexical
             max_len: 8192
-          - target: cookie_header
+          - target: cookie-header
             max_len: 4096
-          - target: accept_encoding
+          - target: accept-encoding
             max_len: 4096
-          - target: jwt_verify
+          - target: jwt-verify
             max_len: 8192
-          - target: validate_formats
+          - target: validate-formats
             max_len: 4096
-          - target: conditional_headers
+          - target: conditional-headers
             max_len: 4096
           # Headers and PHC hash strings, both well under the default.
-          - target: basic_auth
+          - target: basic-auth
             max_len: 4096
           # PEM files, not headers: a certificate chain with a couple of
           # intermediates already runs past 4096, and truncating one would
           # keep the parser from ever seeing a multi-block chain.
-          - target: tls_pem
+          - target: tls-pem
             max_len: 16384
     steps:
     - name: Checkout repository
