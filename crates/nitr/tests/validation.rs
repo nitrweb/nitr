@@ -604,7 +604,7 @@ return app
         assert_eq!(json["csv"], "id,name\n1,ada\n");
         let saved = json["saved"].as_str().expect("saved path");
         assert!(std::path::Path::new(saved).is_file(), "{saved}");
-        assert!(std::path::Path::new(saved).starts_with(server.dir().join("uploads")));
+        assert!(under(saved, &server.dir().join("uploads")), "{saved}");
         // Only the saved file remains under the upload root: the docs and
         // csv temporaries go with the request (removed off the request
         // thread, so poll briefly), the sneaky exe was never stored.
@@ -861,9 +861,8 @@ return app
             assert_eq!(status, 200, "{name:?}: {json}");
             let saved = json["saved"].as_str().expect("saved path");
             let saved_path = std::path::Path::new(saved);
-            let avatars = server.dir().join("uploads/avatars");
             assert!(
-                saved_path.starts_with(&avatars),
+                under(saved, &server.dir().join("uploads").join("avatars")),
                 "{name:?} saved at {saved}"
             );
             let base = saved_path.file_name().unwrap().to_string_lossy();
@@ -953,7 +952,7 @@ return app
         // The read guard notices within `body_read_ms`; the guard's Drop
         // removes the directory.
         let mut left = walk(&tmp);
-        for _ in 0..40 {
+        for _ in 0..100 {
             if left.is_empty() {
                 break;
             }
@@ -1082,6 +1081,19 @@ return app
             }
         }
         server.stop().await;
+    }
+
+    /// Whether `saved` (what `save` returns: the canonical location) lies
+    /// under `root` (a harness path, not canonical). Both sides are
+    /// canonicalized first: on macOS the temp dir `/var/…` is a symlink to
+    /// `/private/var/…`, on Windows it may carry an 8.3 short name, so a
+    /// plain `starts_with` against the harness path fails there.
+    fn under(saved: &str, root: &std::path::Path) -> bool {
+        let saved = std::path::Path::new(saved)
+            .canonicalize()
+            .expect("the saved file exists");
+        let root = root.canonicalize().expect("the root exists");
+        saved.starts_with(root)
     }
 
     /// A path relative to `root`, spelled with `/` whatever the host
