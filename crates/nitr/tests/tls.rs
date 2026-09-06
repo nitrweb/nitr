@@ -538,9 +538,6 @@ async fn a_reload_swaps_the_certificate_without_dropping_connections() {
         .write("key.pem.new", renewed.signing_key.serialize_pem());
     std::fs::rename(&staged_cert, server.identity.cert_path.as_path()).expect("swap cert");
     std::fs::rename(&staged_key, server.identity.key_path.as_path()).expect("swap key");
-    // Trigger the reload: a save under the watched tree.
-    server.dir.write("app.lua", TOUCHED_APP);
-
     // A client that trusts ONLY the renewed certificate: succeeds exactly
     // when the acceptor has been swapped.
     let root = reqwest::Certificate::from_pem(new_cert_pem.as_bytes()).expect("new root");
@@ -548,8 +545,17 @@ async fn a_reload_swaps_the_certificate_without_dropping_connections() {
         .tls_certs_only([root])
         .build()
         .expect("client");
+    // Trigger the reload with a save under the watched tree — and keep
+    // saving until it took, the way `dev_reload.rs` does: a single write
+    // races the watcher thread registering its watches (a slow Windows
+    // runner loses it outright), and a non-atomic write can land
+    // mid-rebuild, failing that reload and leaving the old pool. Every
+    // retry re-reads the certificate files, so the swap follows the first
+    // save the watcher sees.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
+        server.dir.write("app.lua", TOUCHED_APP);
+        tokio::time::sleep(Duration::from_millis(250)).await;
         if let Ok(resp) = new_client.get(server.url("/hello")).send().await
             && resp.status() == 200
         {
@@ -559,7 +565,6 @@ async fn a_reload_swaps_the_certificate_without_dropping_connections() {
             std::time::Instant::now() < deadline,
             "the renewed certificate was never presented: the reload did not swap the acceptor"
         );
-        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
     // The pre-swap client's pooled connection survived the swap: an
@@ -572,22 +577,36 @@ async fn a_reload_swaps_the_certificate_without_dropping_connections() {
     assert_eq!(resp.status(), 200);
 
     // The failure path: a half-written key must keep the CURRENT
-    // material, not stop terminating TLS.
+    // material, not stop terminating TLS. The two halves of a reload are
+    // independent, so the pool still rebuilds: the second handler
+    // variant answers differently, which is how "the reload happened" is
+    // observed — and the client that trusts only the renewed certificate
+    // still connecting is how "the acceptor was kept" is.
     std::fs::write(server.identity.key_path.as_path(), "not a key any more").expect("break key");
-    server.dir.write("app.lua", TOUCHED_APP_2);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    let resp = new_client
-        .get(server.url("/hello"))
-        .send()
-        .await
-        .expect("a failed TLS reload must keep the old acceptor serving");
-    assert_eq!(resp.status(), 200);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        server.dir.write("app.lua", TOUCHED_APP_2);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let resp = new_client
+            .get(server.url("/hello"))
+            .send()
+            .await
+            .expect("a failed TLS reload must keep the old acceptor serving");
+        assert_eq!(resp.status(), 200);
+        if resp.text().await.expect("body").contains("reloaded") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pool never reloaded after the broken key was saved"
+        );
+    }
 
     server.stop().await;
 }
 
 /// The handler variants the reload test saves to trigger the watcher;
-/// same routes, so either compiles and serves.
+/// same route, distinguishable bodies, so a reload is observable.
 const TOUCHED_APP: &str = r#"
 local app = nitr.app()
 app:get("/hello", function(req)
@@ -598,9 +617,8 @@ return app
 const TOUCHED_APP_2: &str = r#"
 local app = nitr.app()
 app:get("/hello", function(req)
-    return { status = 200, headers = { ["Content-Type"] = "text/plain" }, body = "over tls: " .. req.path }
+    return { status = 200, headers = { ["Content-Type"] = "text/plain" }, body = "over tls (reloaded): " .. req.path }
 end)
--- touched again
 return app
 "#;
 
