@@ -84,6 +84,11 @@ pub(crate) enum BodyRule {
 pub(crate) struct InputEnv {
     /// `[multipart] upload_dir`: needed by any `file` rule.
     pub(crate) upload_root: Option<std::sync::Arc<std::path::PathBuf>>,
+    /// URL paths the server answers before the router (the OpenAPI
+    /// document, the Swagger UI page and everything under it), each with
+    /// the configuration key that claimed it: a route there is a
+    /// compile-time error naming the key.
+    pub(crate) reserved: Vec<(String, &'static str)>,
 }
 
 /// A route's compiled input declaration.

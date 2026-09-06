@@ -6,10 +6,12 @@
 //! The per-section configuration structs of `nitr.toml` and their
 //! defaults; everything except `[database]`, which has its own module.
 
+mod docs;
 mod features;
 mod runtime;
 mod server;
 
+pub use docs::*;
 pub use features::*;
 pub use runtime::*;
 pub use server::*;

@@ -60,10 +60,47 @@ pub(super) fn new_pool(
 }
 
 /// What route `input` declarations may rely on in this deployment.
-fn input_env(cfg: &Config) -> crate::validation::InputEnv {
+pub(super) fn input_env(cfg: &Config) -> crate::validation::InputEnv {
+    let mut reserved = Vec::new();
+    if cfg.openapi.enabled {
+        reserved.push((cfg.openapi.path.clone(), "[openapi] path"));
+    }
+    if cfg.swagger.enabled {
+        reserved.push((cfg.swagger.path.clone(), "[swagger] path"));
+    }
     crate::validation::InputEnv {
         upload_root: cfg.multipart.upload_dir.clone().map(Arc::new),
+        reserved,
     }
+}
+
+/// Builds the OpenAPI document and page from the bootstrap state and, in
+/// dev mode with `[openapi] output` set, writes the document when it
+/// changed. Called on every (re)build so the served document always
+/// describes the live routes.
+#[cfg(feature = "openapi")]
+pub(super) fn build_docs(
+    cfg: &Config,
+    runtimes: &[Runtime],
+) -> Result<Arc<crate::openapi::docs::OpenApiDocs>> {
+    let bootstrap = runtimes
+        .first()
+        .ok_or_else(|| nitr_core::Error::Config("the runtime pool is empty".into()))?;
+    let docs = crate::openapi::docs::OpenApiDocs::build(bootstrap.lua(), cfg)?;
+    tracing::info!("{}", docs.summary());
+    if cfg.dev_mode
+        && let Some(output) = &cfg.openapi.output
+    {
+        match crate::openapi::output::write_if_changed(output, docs.spec())? {
+            crate::openapi::output::Written::Bytes(n) => tracing::info!(
+                "openapi: wrote {} ({})",
+                output.display(),
+                nitr_std::validation::fmt_size(n as u64)
+            ),
+            crate::openapi::output::Written::Unchanged => {}
+        }
+    }
+    Ok(Arc::new(docs))
 }
 
 /// Builds the full set of pooled runtimes: a bootstrap state runs the

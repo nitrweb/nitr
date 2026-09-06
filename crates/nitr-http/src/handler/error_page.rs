@@ -118,7 +118,7 @@ fn resolve_source_path(
     (is_lua && candidate.is_file() && candidate.starts_with(&root)).then_some(candidate)
 }
 
-pub(super) fn escape_html(text: &str) -> String {
+pub(crate) fn escape_html(text: &str) -> String {
     // Quotes included: the snippet is rendered in element context today,
     // but escaping is the wrong place to depend on that staying true.
     text.replace('&', "&amp;")

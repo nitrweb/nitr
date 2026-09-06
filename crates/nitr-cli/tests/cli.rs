@@ -490,7 +490,7 @@ fn scaffolded_app_tests_pass_and_filter() {
         stdout.contains("ok   notes API > creates a note"),
         "got: {stdout}"
     );
-    assert!(stdout.contains("4 passed, 0 failed"), "got: {stdout}");
+    assert!(stdout.contains("5 passed, 0 failed"), "got: {stdout}");
 
     let out = nitr()
         .current_dir(&dir)
@@ -500,7 +500,7 @@ fn scaffolded_app_tests_pass_and_filter() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "filtered run failed: {stdout}");
     assert!(
-        stdout.contains("1 passed, 0 failed, 3 filtered out"),
+        stdout.contains("1 passed, 0 failed, 4 filtered out"),
         "got: {stdout}"
     );
 
@@ -672,4 +672,155 @@ fn signal(pid: u32, sig: &str) {
         .status()
         .expect("run kill");
     assert!(status.success(), "kill {sig} {pid} failed");
+}
+
+/// Without the feature the subcommand exists and names what to rebuild
+/// with, instead of pretending there is nothing to generate.
+#[cfg(not(feature = "openapi"))]
+#[test]
+fn openapi_without_the_feature_names_the_rebuild() {
+    require_runnable_binary!();
+    let dir = scaffold("openapi-stub", true);
+    let out = nitr()
+        .current_dir(&dir)
+        .arg("openapi")
+        .output()
+        .expect("run openapi");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("rebuild with the `openapi` Cargo feature"),
+        "{stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "nothing on stdout without a document"
+    );
+}
+
+/// `nitr openapi`: the document on stdout, written with `--output`,
+/// compared with `--check` (the CI drift gate, exit 1 on drift), and laid
+/// out as a static Swagger UI site with `--ui`.
+#[cfg(feature = "swagger")]
+#[test]
+fn openapi_generates_checks_drift_and_writes_a_site() {
+    require_runnable_binary!();
+    let dir = scaffold("openapi", false);
+    let migrate = nitr()
+        .current_dir(&dir)
+        .arg("migrate")
+        .output()
+        .expect("run migrate");
+    assert!(migrate.status.success());
+
+    // Printed: the scaffold's routes, documented.
+    let out = nitr()
+        .current_dir(&dir)
+        .arg("openapi")
+        .output()
+        .expect("run openapi");
+    assert!(
+        out.status.success(),
+        "openapi failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let spec: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json on stdout");
+    assert_eq!(spec["info"]["title"], "My App");
+    assert_eq!(spec["paths"]["/api/notes"]["get"]["summary"], "List notes");
+    assert_eq!(
+        spec["paths"]["/api/notes"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/NoteInput"
+    );
+
+    // Written, then checked: up to date.
+    let out = nitr()
+        .current_dir(&dir)
+        .args(["openapi", "--output", "openapi.json"])
+        .output()
+        .expect("write");
+    assert!(out.status.success());
+    let written = std::fs::read(dir.path.join("openapi.json")).expect("written file");
+    assert!(written.ends_with(b"\n"));
+    let out = nitr()
+        .current_dir(&dir)
+        .args(["openapi", "--check"])
+        .output()
+        .expect("check");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is up to date"));
+
+    // A reformatted file is still up to date: the comparison is canonical.
+    let pretty: serde_json::Value = serde_json::from_slice(&written).unwrap();
+    std::fs::write(
+        dir.path.join("openapi.json"),
+        serde_json::to_string(&pretty).unwrap(),
+    )
+    .unwrap();
+    let out = nitr()
+        .current_dir(&dir)
+        .args(["openapi", "--check"])
+        .output()
+        .expect("check reformatted");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Drift: a changed summary names the first differing path and exits 1.
+    let routes = dir.path.join("routes").join("notes.lua");
+    let source = std::fs::read_to_string(&routes).unwrap();
+    std::fs::write(&routes, source.replace("List notes", "List all notes")).unwrap();
+    let out = nitr()
+        .current_dir(&dir)
+        .args(["openapi", "--check"])
+        .output()
+        .expect("check drift");
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("first difference at $.paths./api/notes.get.summary"),
+        "{stderr}"
+    );
+
+    // A static site, openable from file://.
+    let out = nitr()
+        .current_dir(&dir)
+        .args(["openapi", "--ui", "site"])
+        .output()
+        .expect("ui");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let index = std::fs::read_to_string(dir.path.join("site").join("index.html")).unwrap();
+    assert!(index.contains("href=\"assets/"), "relative links: {index}");
+    assert!(index.contains("\"url\":\"openapi.json\""), "{index}");
+    assert!(!index.contains("<script>"), "no inline script: {index}");
+    assert!(dir.path.join("site").join("openapi.json").is_file());
+    let assets: Vec<_> = std::fs::read_dir(dir.path.join("site").join("assets"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(assets.len(), 1, "one versioned directory: {assets:?}");
+    assert!(assets[0].join("swagger-ui-bundle.js").is_file());
+    assert!(assets[0].join("swagger-ui.css").is_file());
+    assert!(assets[0].join("init.js").is_file());
+
+    // A file where the site directory should be: refused, nothing written.
+    std::fs::write(dir.path.join("not-a-dir"), b"x").unwrap();
+    let out = nitr()
+        .current_dir(&dir)
+        .args(["openapi", "--ui", "not-a-dir"])
+        .output()
+        .expect("ui refused");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is a file, not a directory"));
+    assert_eq!(std::fs::read(dir.path.join("not-a-dir")).unwrap(), b"x");
 }

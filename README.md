@@ -63,6 +63,8 @@ every builtin to be there.
 | `compression` | on-the-fly brotli/gzip responses | `brotli`, `flate2` |
 | `multipart` | `req:multipart(fn)` file uploads | `multer` |
 | `tls` | inbound TLS termination (`[tls]`) | `rustls` (the `ring` provider) |
+| `openapi` | the OpenAPI document (`[openapi]`, `nitr openapi`) | — (pure `cfg`) |
+| `swagger` | the Swagger UI page (`[swagger]`), vendored, no CDN; implies `openapi` | — (≈1.7 MiB of assets) |
 | `all` | every feature above | — |
 
 `json`, `http`, `log`, `cache`, `dbg`, `time`, `validate`, `base64`,
@@ -85,7 +87,7 @@ feature to enable, rather than a mysterious "unknown std feature".
 cargo run
 ```
 
-With no configuration, Nitr listens on `127.0.0.1:3000` and executes `scripts/handler.lua`. Add a `nitr.toml` to change anything (see [Configuration](#configuration)). `nitr init` scaffolds a complete application; `nitr check` validates it and `nitr test` runs its Lua tests in-process.
+With no configuration, Nitr listens on `127.0.0.1:3000` and executes `scripts/handler.lua`. Add a `nitr.toml` to change anything (see [Configuration](#configuration)). `nitr init` scaffolds a complete application; `nitr check` validates it, `nitr test` runs its Lua tests in-process, and `nitr openapi` prints its OpenAPI document (`--check` is a CI drift gate, `--ui DIR` writes a static Swagger UI site).
 
 ### The handler script
 
@@ -141,6 +143,8 @@ Every Nitr API is a field of the global `nitr` table; nothing else is registered
 | `app:get/post/put/delete/patch/head/options(path, ...fns)` | Register a route; `:name` captures a parameter, a trailing `*` captures the rest. All but the last function are route middleware |
 | `app:use(fn)` | Global middleware, `function(next) return function(req) ... end end`; must precede routes |
 | `app:on_error(fn)` | `function(err, req)` — the app-wide error response |
+| `app:doc({ title, version, description, tags, security, ... })` | Document-level information for the generated OpenAPI document (once per app) |
+| `app:get(path, handler, { doc = {...} })` | Describes the operation in the document: `summary`, `description`, `tags`, `operation_id`, `responses = { [201] = { description, schema } }` (documentation only), `security`, `deprecated`, `hidden`. Request schemas stay under `input`, which both enforces and documents them |
 | `app:on_invalid(fn)` | `function(err, req)` — the app-wide answer when a route's `input` fails (default: a JSON 422 with `fields` and `errors`) |
 | `app:post(path, handler, { input = {...} })` | Validated input: `body` (JSON or form; `{ schema = S, content = { "multipart" } }` for uploads with `file` rules, `{ file = R, content = { "raw" } }` for a single-file body), `query`, `params`, `headers` — checked in Rust before the handler, coerced from text, exposed as `req.valid.{body,query,params,headers}` |
 | `app:static(mount, dir, opts?)` | Serve files from Rust (`{ spa = true, cache_control = "..." }`) |
@@ -218,6 +222,17 @@ path = "scripts/file.db"                # enables `nitr.db`
 
 [templating]
 dir = "scripts/templates"               # enables `nitr.template`
+
+[openapi]                               # needs the `openapi` Cargo feature; off by default
+enabled = true                          # serve the generated document at `path`
+path = "/openapi.json"
+servers = ["https://api.example.com"]
+output = "openapi.json"                 # dev mode: rewritten when the document changes
+
+[swagger]                               # needs the `swagger` Cargo feature; off by default
+enabled = true                          # the vendored Swagger UI page at `path`
+path = "/docs"
+try_it_out = true
 
 [tls]                                   # needs the `tls` Cargo feature
 enabled = true
@@ -326,6 +341,13 @@ reaches the code it was written for.
 Unless you explicitly state otherwise, any contribution you intentionally submitted for inclusion in current work, as defined in the Apache-2.0 license, shall be dual licensed as described below, without any additional terms or conditions.
 
 Feel free to submit a [pull request](https://github.com/nitrweb/nitr/pulls) or file an [issue](https://github.com/nitrweb/nitr/issues).
+
+## Third-party notices
+
+The `swagger` feature embeds [Swagger UI](https://github.com/swagger-api/swagger-ui)
+(© SmartBear Software, Apache License 2.0) from the `swagger-ui-dist` npm
+package, pinned and checksum-verified by `crates/nitr-http/assets/swagger-ui/update.sh`;
+its licence text ships beside it.
 
 ## License
 

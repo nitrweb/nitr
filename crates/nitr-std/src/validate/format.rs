@@ -484,15 +484,47 @@ pub(crate) struct CustomFormat {
     pub(crate) name: String,
     /// Documentation only: emitted by the API description, never read
     /// by the checker.
-    #[allow(dead_code)]
     pub(crate) description: String,
     pub(crate) message: Option<Template>,
     pub(crate) check: mlua::Function,
     /// Documentation only: emitted by the API description, never executed.
-    #[allow(dead_code)]
     pub(crate) pattern: Option<String>,
-    #[allow(dead_code)]
     pub(crate) example: Option<String>,
+}
+
+/// What the document says about a script-defined format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomFormatInfo {
+    /// The name a rule's `format` key refers to.
+    pub name: String,
+    /// What the check enforces, in the author's words.
+    pub description: String,
+    /// The advisory pattern, when the registration gave one.
+    pub pattern: Option<String>,
+    /// An example value, when the registration gave one.
+    pub example: Option<String>,
+}
+
+/// Every custom format registered in this state, sorted by name, for the
+/// document's `x-nitr-formats` vocabulary.
+pub fn custom_formats(lua: &mlua::Lua) -> Vec<CustomFormatInfo> {
+    let mut out: Vec<CustomFormatInfo> = lua
+        .app_data_ref::<FormatRegistry>()
+        .map(|registry| {
+            registry
+                .formats
+                .values()
+                .map(|f| CustomFormatInfo {
+                    name: f.name.clone(),
+                    description: f.description.clone(),
+                    pattern: f.pattern.clone(),
+                    example: f.example.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 /// The per-state registry of custom formats, kept in the Lua app data.

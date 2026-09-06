@@ -92,7 +92,7 @@ function ResponseCookies:set_signed(name, value, secret, opts) end
 ---@class nitr.App
 local App = {}
 
----Registers a GET route: `middleware..., handler` plus an optional trailing options table `{ input = {...}, on_invalid = fn, on_error = fn }`. `input` declares schemas for `body` (a schema, or `{ schema = S, content = { "json", "form", "multipart" } }`, or `{ file = R, content = { "raw" } }`), `query`, `params` and `headers`, enforced in Rust before the handler and exposed as `req.valid`; a failure answers a JSON 422 unless `on_invalid` says otherwise. Paths take `:name` parameters and a trailing `*` catch-all.
+---Registers a GET route: `middleware..., handler` plus an optional trailing options table `{ input = {...}, doc = {...}, on_invalid = fn, on_error = fn }`. `doc` describes the operation in the OpenAPI document (`summary`, `description`, `tags`, `operation_id`, `responses = { [code] = { description, schema?, content? } }` where `schema` is documentation only, `security = { name }`, `deprecated`, `hidden`); request schemas live under `input`, never `doc`. `input` declares schemas for `body` (a schema, or `{ schema = S, content = { "json", "form", "multipart" } }`, or `{ file = R, content = { "raw" } }`), `query`, `params` and `headers`, enforced in Rust before the handler and exposed as `req.valid`; a failure answers a JSON 422 unless `on_invalid` says otherwise. Paths take `:name` parameters and a trailing `*` catch-all.
 ---@param path string
 ---@param ... fun(req: nitr.Request): nitr.Response|table
 function App:get(path, ...) end
@@ -126,6 +126,10 @@ function App:head(path, ...) end
 ---@param path string
 ---@param ... fun(req: nitr.Request): nitr.Response|table
 function App:options(path, ...) end
+
+---Document-level information for the generated OpenAPI document, once per app: `title`, `version`, `description`, `terms_of_service`, `contact`, `license`, `tags = { { name, description } }`, `security = { name = scheme }` (schemes as OpenAPI security scheme objects, referenced by name from a route's `doc.security`), `external_docs`. Unknown keys fail at load. Needs the `openapi` Cargo feature and `[openapi] enabled = true` to be served; `nitr openapi` generates it regardless.
+---@param info table
+function App:doc(info) end
 
 ---The app-wide answer to a request that failed its route's `input` declaration: `function(err, req)` returning a response, where `err = { code, message, fields, errors }` (`fields` maps each path such as `body.email` to its message; `errors` lists `{ path, part, field, rule, message, params?, label? }`). A route-level `on_invalid` option wins over it.
 ---@param fn fun(err: table, req: nitr.Request): nitr.Response|table

@@ -152,6 +152,12 @@ pub(crate) fn rule_params(rule: &str) -> &'static [&'static str] {
 /// Every rule code a `messages` table may name. Unknown codes fail at
 /// load like unknown rule keys do: a typo must not silently override
 /// nothing.
+/// Every rule code an `errors[].rule` may carry, for the document's
+/// `ValidationError` component.
+pub fn rule_codes() -> &'static [&'static str] {
+    RULE_CODES
+}
+
 pub(crate) const RULE_CODES: &[&str] = &[
     "type",
     "required",

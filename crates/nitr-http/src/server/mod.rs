@@ -68,6 +68,11 @@ pub struct Server {
     /// the slot per accepted connection, never from the filesystem.
     #[cfg(feature = "tls")]
     tls: Arc<RwLock<Option<tokio_rustls::TlsAcceptor>>>,
+    /// The OpenAPI document and page, rebuilt with the pool on reload so
+    /// a document never describes routes that are no longer live. The
+    /// handler reads it through [`Protection`].
+    #[cfg(feature = "openapi")]
+    docs: crate::openapi::docs::DocsSlot,
 }
 
 mod builder;
@@ -94,6 +99,27 @@ impl Server {
     /// graceful shutdown, before in-flight requests are drained.
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Relaxed)
+    }
+
+    /// The OpenAPI document as `nitr openapi` prints it: pretty JSON with
+    /// a trailing newline, describing the routes currently compiled.
+    /// Generated whether or not `[openapi] enabled` — that flag gates
+    /// serving, not generation.
+    #[cfg(feature = "openapi")]
+    pub fn openapi_json(&self) -> Option<bytes::Bytes> {
+        self.docs
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|d| d.spec().clone()))
+    }
+
+    /// The Swagger UI page and its assets as a self-contained static site:
+    /// relative file names with their bytes (`index.html`, `openapi.json`,
+    /// `assets/<version>/…`), openable from `file://` or any static host.
+    #[cfg(feature = "swagger")]
+    pub fn openapi_site(&self) -> Option<Vec<(String, bytes::Bytes)>> {
+        let docs = self.docs.read().ok()?.clone()?;
+        docs.static_site(&self.cfg.swagger).ok()
     }
 
     /// An in-process client that dispatches requests through the full
@@ -157,6 +183,8 @@ impl Server {
         let modules = self.modules.clone();
         let cache = self.cache.clone();
         let pool = self.pool.clone();
+        #[cfg(feature = "openapi")]
+        let docs = self.docs.clone();
         let state = self.reloading.clone();
         tokio::spawn(async move {
             // Whatever happens below — a panic in an embedder's setup
@@ -165,7 +193,14 @@ impl Server {
             let _reset = ReloadReset(state.clone());
             loop {
                 let rebuild = std::panic::AssertUnwindSafe(rebuild_pool(
-                    &cfg, builtins, &setup_fns, &modules, &cache, &pool,
+                    &cfg,
+                    builtins,
+                    &setup_fns,
+                    &modules,
+                    &cache,
+                    &pool,
+                    #[cfg(feature = "openapi")]
+                    &docs,
                 ));
                 if let Err(payload) = futures_util::FutureExt::catch_unwind(rebuild).await {
                     let message = payload
@@ -256,9 +291,21 @@ async fn rebuild_pool(
     modules: &Arc<Vec<Module>>,
     cache: &Option<nitr_std::Cache>,
     pool: &Arc<RwLock<Arc<RuntimePool>>>,
+    #[cfg(feature = "openapi")] docs: &crate::openapi::docs::DocsSlot,
 ) {
     match build_runtimes(cfg, builtins, setup_fns, modules, cache.as_ref()).await {
         Ok(runtimes) => {
+            // The document comes from the new bootstrap state; a document
+            // that fails its bound keeps the old pool *and* the old
+            // document, so the two never disagree.
+            #[cfg(feature = "openapi")]
+            let fresh_docs = match pool::build_docs(cfg, &runtimes) {
+                Ok(docs) => docs,
+                Err(err) => {
+                    tracing::error!("reload failed, keeping the current pool: {err}");
+                    return;
+                }
+            };
             let fresh = Arc::new(new_pool(
                 runtimes,
                 cfg,
@@ -270,6 +317,13 @@ async fn rebuild_pool(
             match pool.write() {
                 Ok(mut pool) => {
                     *pool = fresh;
+                    // Swapped while the pool lock is held: no request can
+                    // see the new pool with the old document.
+                    #[cfg(feature = "openapi")]
+                    match docs.write() {
+                        Ok(mut slot) => *slot = Some(fresh_docs),
+                        Err(_) => tracing::error!("reload: the docs lock is poisoned"),
+                    }
                     tracing::info!("reload complete: new runtime pool is live");
                 }
                 Err(_) => tracing::error!("reload failed: pool lock is poisoned"),

@@ -12,7 +12,7 @@ documentation = "https://docs.rs/nitr-http"
 readme = "../../README.md"
 categories = ["web-programming::http-server", "network-programming"]
 keywords = ["http-server", "lua-server"]
-include = ["src/**/*.rs", "Cargo.toml", "LICENSE-APACHE", "LICENSE-MIT"]
+include = ["src/**/*.rs", "assets/swagger-ui/*", "Cargo.toml", "LICENSE-APACHE", "LICENSE-MIT"]
 
 # The crates gate `doc_cfg` behind `--cfg docsrs`.
 
@@ -31,9 +31,18 @@ all = [
     "db",
     "fetch",
     "multipart",
+    "openapi",
+    "swagger",
     "template",
     "tls",
 ]
+
+# The OpenAPI document: generated from the route table, served at
+# `[openapi] path`, written by `nitr openapi`. Pure `cfg`: no new crates.
+openapi = []
+# The Swagger UI page (vendored bundle, served from this binary), which
+# renders the document. Implies `openapi`.
+swagger = ["openapi"]
 
 # On-the-fly brotli/gzip response compression. Precompressed `.br`/`.gz`
 # sidecars are served either way: that needs no encoder, only a `stat`.

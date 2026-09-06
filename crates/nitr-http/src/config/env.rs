@@ -55,7 +55,9 @@ impl Config {
     /// `NITR_LUA_EXEC_TIMEOUT_MS`, `NITR_LIMITS_POOL_WAIT_MS`,
     /// `NITR_SHUTDOWN_GRACE`, `NITR_COMPRESSION_ENABLED`,
     /// `NITR_TLS_ENABLED`, `NITR_TLS_CERT`, `NITR_TLS_KEY`,
-    /// `NITR_TLS_MIN_VERSION`, `NITR_LOG_FORMAT`, `NITR_LOG_LEVEL`.
+    /// `NITR_TLS_MIN_VERSION`, `NITR_LOG_FORMAT`, `NITR_LOG_LEVEL`,
+    /// `NITR_OPENAPI_ENABLED`, `NITR_OPENAPI_PATH`, `NITR_SWAGGER_ENABLED`,
+    /// `NITR_SWAGGER_PATH`.
     pub fn apply_env(&mut self) -> Result {
         self.apply_env_with(&|name| std::env::var(name).ok())
     }
@@ -136,6 +138,18 @@ impl Config {
         }
         if let Some(v) = env_var("NITR_TLS_ENABLED") {
             self.tls.enabled = parse_env("NITR_TLS_ENABLED", &v)?;
+        }
+        if let Some(v) = env_var("NITR_OPENAPI_ENABLED") {
+            self.openapi.enabled = parse_env("NITR_OPENAPI_ENABLED", &v)?;
+        }
+        if let Some(v) = env_var("NITR_OPENAPI_PATH") {
+            self.openapi.path = v;
+        }
+        if let Some(v) = env_var("NITR_SWAGGER_ENABLED") {
+            self.swagger.enabled = parse_env("NITR_SWAGGER_ENABLED", &v)?;
+        }
+        if let Some(v) = env_var("NITR_SWAGGER_PATH") {
+            self.swagger.path = v;
         }
         if let Some(v) = env_var("NITR_TLS_CERT") {
             self.tls.cert = Some(PathBuf::from(v));

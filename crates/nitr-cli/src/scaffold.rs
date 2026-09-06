@@ -61,7 +61,9 @@ pub fn init(dir: &Path, minimal: bool) -> anyhow::Result<()> {
     }
     match minimal {
         true => println!("\nNext steps:\n  nitr check\n  nitr test\n  nitr dev"),
-        false => println!("\nNext steps:\n  nitr migrate\n  nitr check\n  nitr test\n  nitr dev"),
+        false => println!(
+            "\nNext steps:\n  nitr migrate\n  nitr check\n  nitr test\n  nitr dev   # then open http://127.0.0.1:3000/docs"
+        ),
     }
     Ok(())
 }
@@ -88,6 +90,18 @@ features = ["json", "http", "log", "time", "validate", "base64", "path", "url", 
 [static]
 dir = "public"
 mount = "/"
+
+# The OpenAPI document, generated from the routes' `input` and `doc`
+# tables: served at /openapi.json, and kept current in openapi.json while
+# `nitr dev` runs (`nitr openapi --check` is the CI drift gate).
+[openapi]
+enabled = true
+output = "openapi.json"
+
+# Swagger UI at /docs, rendering the document from this binary (no CDN).
+[swagger]
+enabled = true
+try_it_out = true
 "#;
 
 const CONFIG_LUA: &str = r#"-- Runs once at startup; the returned table is snapshotted into every
@@ -99,6 +113,13 @@ return {
 "#;
 
 const APP_LUA: &str = r#"local app = nitr.app()
+
+-- Document-level information for the generated OpenAPI document.
+app:doc({
+    title = "My App",
+    version = "0.1.0",
+    tags = { { name = "notes", description = "Notes" } },
+})
 
 -- App-wide middleware: a factory `fn(next) -> fn(req)`, composed once at
 -- load time. Must come before the routes.
@@ -143,10 +164,18 @@ const ROUTES_NOTES_LUA: &str = r#"-- The notes API: a route module is a plain fu
 --
 -- A route's `input` is validated in Rust before the handler runs: a bad
 -- body answers a JSON 422 naming every failing field, and the handler
--- reads the checked, stripped values from `req.valid`.
+-- reads the checked, stripped values from `req.valid`. The same `input`
+-- documents the operation in /openapi.json; `doc` adds the prose.
 local NoteInput = nitr.validate.schema({
     text = "string|trim|min_len:1|max_len:500|required",
-})
+}, { title = "NoteInput" })
+
+-- Documentation only: responses are never checked.
+local Note = nitr.validate.schema({
+    id = "integer|required",
+    text = "string|required",
+    created_at = "integer|required",
+}, { title = "Note" })
 
 return function(app)
     app:get("/api/notes", function(req)
@@ -157,6 +186,10 @@ return function(app)
         ))
     end, {
         input = { query = { limit = "integer|min:1|max:100|default:50" } },
+        doc = {
+            summary = "List notes", tags = { "notes" },
+            responses = { [200] = { description = "The newest notes", schema = { type = "array", items = Note } } },
+        },
     })
 
     app:post("/api/notes", function(req)
@@ -169,6 +202,10 @@ return function(app)
         return nitr.json(note, 201)
     end, {
         input = { body = NoteInput },
+        doc = {
+            summary = "Create a note", tags = { "notes" },
+            responses = { [201] = { description = "The created note", schema = Note } },
+        },
     })
 end
 "#;
@@ -223,6 +260,14 @@ t.describe("notes API", function()
         local resp = t.request("GET", "/api/notes?limit=500")
         t.expect(resp.status).to_equal(422)
         t.expect(resp:json().fields["query.limit"]).to_equal("must be at most 100")
+    end)
+
+    t.it("publishes what it enforces", function()
+        local spec = t.request("GET", "/openapi.json"):json()
+        local limit = spec.paths["/api/notes"].get.parameters[1]
+        t.expect(limit.name).to_equal("limit")
+        t.expect(limit.schema.maximum).to_equal(100)
+        t.expect(spec.components.schemas.NoteInput.required[1]).to_equal("text")
     end)
 end)
 "#;

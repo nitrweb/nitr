@@ -14,7 +14,7 @@ use tokio::sync::Semaphore;
 
 use crate::config::Config;
 use crate::protect::Protection;
-#[cfg(feature = "db")]
+#[cfg(any(feature = "db", feature = "openapi"))]
 use nitr_core::Error;
 use nitr_core::Result;
 use nitr_std::Builtins;
@@ -224,6 +224,21 @@ impl ServerBuilder {
             .then(|| nitr_std::Cache::new(cfg.cache_options()));
 
         let runtimes = build_runtimes(&cfg, builtins, &setup_fns, &modules, cache.as_ref()).await?;
+        // The document is built from the bootstrap state before the pool
+        // exists, so a document over its bound is a build failure like a
+        // duplicate route.
+        let protection = Protection::new(&cfg);
+        #[cfg(feature = "openapi")]
+        let docs = protection.docs_slot();
+        #[cfg(feature = "openapi")]
+        {
+            let built = super::pool::build_docs(&cfg, &runtimes)?;
+            match docs.write() {
+                Ok(mut slot) => *slot = Some(built),
+                // Unreachable in practice: nothing else holds the lock yet.
+                Err(_) => return Err(Error::Config("the docs lock is poisoned".into())),
+            }
+        }
         let pool = new_pool(
             runtimes,
             &cfg,
@@ -248,7 +263,9 @@ impl ServerBuilder {
         let tls = Arc::new(RwLock::new(load_tls(&cfg.tls)?));
 
         Ok(Server {
-            protection: Arc::new(Protection::new(&cfg)),
+            protection: Arc::new(protection),
+            #[cfg(feature = "openapi")]
+            docs,
             cfg,
             builtins,
             setup_fns,

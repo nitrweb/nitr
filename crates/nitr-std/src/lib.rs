@@ -51,14 +51,17 @@ pub use cache::{Cache, CacheOptions};
 /// `input` declarations, text coercion, the error shape, and the
 /// `nitr.File` handle for validated uploads.
 pub mod validation {
+    pub use crate::validate::format::{CustomFormatInfo, custom_formats};
     pub use crate::validate::media::{
-        Detection, MediaType, SNIFF_BYTES, detect, dimensions, executable_extension, is_text,
-        lookup, text_subtype_matches,
+        Detection, MEDIA_TYPES, MediaType, SNIFF_BYTES, detect, dimensions, executable_extension,
+        is_active_content, is_text, lookup, text_subtype_matches,
     };
-    pub use crate::validate::message::fmt_size;
+    pub use crate::validate::message::{fmt_size, rule_codes};
+    pub use crate::validate::schema_json::{Components, regex_escape};
     pub use crate::validate::{
-        CompiledSchema, ErrorEntry, FileInfo, LuaFile, SaveResolver, TextValue, ValidationError,
-        compile_file_rule, compile_schema, compile_text_schema, freeze_messages,
+        CompiledSchema, DocSchema, ErrorEntry, FileInfo, LuaFile, SaveResolver, TextValue,
+        ValidationError, compile_doc_schema, compile_file_rule, compile_schema,
+        compile_text_schema, freeze_messages,
     };
 }
 // The configuration types are always available: `nitr.toml` has one shape

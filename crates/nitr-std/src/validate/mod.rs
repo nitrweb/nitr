@@ -35,6 +35,7 @@ mod lua;
 pub(crate) mod media;
 pub(crate) mod message;
 mod presets;
+pub(crate) mod schema_json;
 mod shorthand;
 #[cfg(test)]
 mod tests;
@@ -203,7 +204,6 @@ pub(crate) struct Rule {
     /// a value of the rule's type.
     transform: Option<Function>,
     /// Documentation only; carried for the API description.
-    #[allow(dead_code)]
     description: Option<String>,
     // Strings.
     trim: bool,
@@ -266,7 +266,6 @@ pub(crate) struct CheckDef {
 pub(crate) struct SchemaDef {
     fields: Vec<(String, Arc<Rule>)>,
     /// The component name for the API description.
-    #[allow(dead_code)]
     title: Option<String>,
     strict: bool,
     messages: BTreeMap<String, Template>,
@@ -339,6 +338,23 @@ impl CompiledSchema {
     /// Whether the schema reports undeclared fields.
     pub fn strict(&self) -> bool {
         self.0.strict
+    }
+
+    /// The component name (`nitr.validate.schema(fields, { title = … })`),
+    /// when the schema has one.
+    pub fn title(&self) -> Option<&str> {
+        self.0.title.as_deref()
+    }
+
+    /// The JSON Schema view of the rules, for the OpenAPI document: a
+    /// titled schema is registered in `components` and returned as a
+    /// `$ref` (a title two different schemas claim gets a numbered suffix
+    /// for the later one), an untitled one comes back inline.
+    pub fn json_schema(
+        &self,
+        components: &mut schema_json::Components,
+    ) -> Result<serde_json::Value, String> {
+        schema_json::export(&self.0, components)
     }
 
     /// Validates a Lua value (a decoded JSON body, say). The outer `Result`
@@ -423,6 +439,55 @@ pub fn compile_file_rule(lua: &Lua, value: Value, what: &str) -> mlua::Result<Co
             "{what} must be a `file` rule"
         ))),
     }
+}
+
+/// A documentation-only schema, as a route's `doc.responses[n].schema`
+/// may give it: a compiled schema, a table of fields, or one rule table
+/// (`{ type = "array", items = Note }`). Never enforced; exported like a
+/// request schema so the document reads the same on both halves.
+#[derive(Debug, Clone)]
+pub enum DocSchema {
+    /// An object schema: compiled, or a table of field rules.
+    Fields(CompiledSchema),
+    /// One rule, compiled as the single field `value` of a wrapper.
+    Rule(CompiledSchema),
+}
+
+impl DocSchema {
+    /// The JSON Schema view, with the wrapper unwrapped for a rule.
+    pub fn json_schema(
+        &self,
+        components: &mut schema_json::Components,
+    ) -> Result<serde_json::Value, String> {
+        match self {
+            Self::Fields(schema) => schema.json_schema(components),
+            Self::Rule(wrapper) => {
+                let mut exported = wrapper.json_schema(components)?;
+                match exported
+                    .get_mut("properties")
+                    .and_then(|p| p.get_mut("value"))
+                {
+                    Some(value) => Ok(value.take()),
+                    None => Err("the rule wrapper lost its `value` property".into()),
+                }
+            }
+        }
+    }
+}
+
+/// Compiles a documentation schema: a compiled schema or a table of
+/// fields as [`compile_schema`] takes them, or a single rule table
+/// recognised by its `type` key.
+pub fn compile_doc_schema(lua: &Lua, value: Value, what: &str) -> mlua::Result<DocSchema> {
+    if let Value::Table(table) = &value
+        && let Value::String(_) = table.get::<Value>("type")?
+    {
+        let fields = lua.create_table()?;
+        fields.set("value", value)?;
+        let schema = compile::compile_schema(lua, &fields, None, what)?;
+        return Ok(DocSchema::Rule(CompiledSchema(Arc::new(schema))));
+    }
+    Ok(DocSchema::Fields(compile_schema(lua, value, what)?))
 }
 
 /// Marks the state's app-wide messages as frozen: the application has

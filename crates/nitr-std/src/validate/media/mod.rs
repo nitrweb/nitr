@@ -148,7 +148,7 @@ pub enum Detection {
 /// Types a browser runs script from when it opens them. A family
 /// wildcard (`image/*`, `text/*`) never matches one; a rule has to name
 /// it, and naming it logs a warning at load.
-pub(crate) fn is_active_content(name: &str) -> bool {
+pub fn is_active_content(name: &str) -> bool {
     matches!(
         name,
         "image/svg+xml" | "text/html" | "application/xhtml+xml"

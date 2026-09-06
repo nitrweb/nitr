@@ -96,7 +96,7 @@ app:post("/many", function(req)
     return nitr.json({ n = #req.valid.body.items })
 end, {
     input = { body = { items = { "array", items = { "integer", description = "slow",
-        check = function(v) local s = 0 for i = 1, 20000 do s = s + i end return true end } } } },
+        check = function(v) local s = 0 for i = 1, 200000 do s = s + i end return true end } } } },
 })
 
 app:get("/bytes", function(req)
@@ -1330,12 +1330,16 @@ mod adversarial {
                 cfg.workers = 1;
                 cfg.lua.exec_timeout_ms = 500;
                 cfg.limits.pool_wait_ms = 500;
-                cfg.limits.max_body_bytes = 64 * 1024;
+                // Small on purpose: an over-limit body must still fit the
+                // socket buffers, or the early 413 (the server closes
+                // without draining) races the client's own write and the
+                // request errors instead of carrying the status.
+                cfg.limits.max_body_bytes = 4096;
             })
             .spawn()
             .await;
         let started = Instant::now();
-        let body = format!("{{\"items\":[{}1]}}", "1,".repeat(20_000));
+        let body = format!("{{\"items\":[{}1]}}", "1,".repeat(1_000));
         let (status, json) = post_json(&server, "/many", &body).await;
         assert_eq!(status, 500, "{json}");
         assert_eq!(json["kind"], "timeout", "{json}");
@@ -1345,7 +1349,7 @@ mod adversarial {
             started.elapsed()
         );
 
-        let body = format!("{{\"items\":[{}1]}}", "1,".repeat(100_000));
+        let body = format!("{{\"items\":[{}1]}}", "1,".repeat(3_000));
         let (status, _) = post_json(&server, "/many", &body).await;
         assert_eq!(status, 413);
 

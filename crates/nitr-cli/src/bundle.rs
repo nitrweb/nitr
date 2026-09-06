@@ -144,6 +144,17 @@ pub fn load() -> anyhow::Result<Option<Config>> {
         eprintln!("warning: dev_mode is forced off in a bundled build (no sources to watch)");
     }
     cfg.dev_mode = false;
+    // The dev-mode writer needs sources to follow; a bundle has none, and
+    // its extraction directory is not a place to leave files. Dev mode is
+    // off here anyway, so the setting could never fire; saying so beats
+    // a silent no-op.
+    if let Some(output) = cfg.openapi.output.take() {
+        eprintln!(
+            "warning: [openapi] output = \"{}\" is ignored in a bundled build (no sources \
+             to follow; use `nitr openapi --output` instead)",
+            output.display()
+        );
+    }
     Ok(Some(cfg))
 }
 

@@ -58,9 +58,25 @@ pub(crate) struct Protection {
     cors: Option<crate::cors::Cors>,
     /// The compiled `[compression]` policy.
     compression: crate::compress::Compression,
+    /// The OpenAPI document and page, swapped with the pool on reload.
+    #[cfg(feature = "openapi")]
+    docs: crate::openapi::docs::DocsSlot,
 }
 
 impl Protection {
+    /// The current document and page, if any has been built.
+    #[cfg(feature = "openapi")]
+    pub(crate) fn docs(&self) -> Option<std::sync::Arc<crate::openapi::docs::OpenApiDocs>> {
+        self.docs.read().ok().and_then(|slot| slot.clone())
+    }
+
+    /// The docs slot, for the server to fill once the pool exists and to
+    /// swap on reload.
+    #[cfg(feature = "openapi")]
+    pub(crate) fn docs_slot(&self) -> crate::openapi::docs::DocsSlot {
+        self.docs.clone()
+    }
+
     pub(crate) fn new(cfg: &Config) -> Self {
         Self {
             max_body_bytes: cfg.limits.max_body_bytes,
@@ -87,6 +103,8 @@ impl Protection {
             },
             cors: crate::cors::Cors::new(&cfg.cors),
             compression: crate::compress::Compression::new(&cfg.compression),
+            #[cfg(feature = "openapi")]
+            docs: std::sync::Arc::new(std::sync::RwLock::new(None)),
         }
     }
 

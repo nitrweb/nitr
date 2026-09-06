@@ -25,6 +25,9 @@ use nitr_core::{Error, ErrorInfo, Result, Runtime, RuntimeGuard, RuntimePool};
 
 pub(crate) type HttpResponse = Response<BoxBody<Bytes, Infallible>>;
 
+#[cfg(feature = "swagger")]
+pub(crate) use error_page::escape_html;
+
 /// What a request resolves to after Rust-side routing.
 enum Target {
     /// A static asset resolved by a mount (already served).
@@ -181,6 +184,15 @@ async fn handle_inner(
     // keeps a pooled Lua state free for a request that needs one.
     if let Some(cors) = protection.cors()
         && let Some(resp) = cors.preflight(&req.req)
+    {
+        return resp;
+    }
+    // The OpenAPI document and the Swagger UI page: prebuilt bytes served
+    // after protection (so the rate limiter counts them) and before a Lua
+    // state is checked out (so serving the bundle never occupies one).
+    #[cfg(feature = "openapi")]
+    if let Some(docs) = protection.docs()
+        && let Some(resp) = docs.serve(&req)
     {
         return resp;
     }

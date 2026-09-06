@@ -280,13 +280,14 @@ Builder for `Set-Cookie` headers on a response.
 
 The application: routes, middleware, error handling, static mounts. Return it from the handler script.
 
-- `:get(path, ...)` — Registers a GET route: `middleware..., handler` plus an optional trailing options table `{ input = {...}, on_invalid = fn, on_error = fn }`. `input` declares schemas for `body` (a schema, or `{ schema = S, content = { "json", "form", "multipart" } }`, or `{ file = R, content = { "raw" } }`), `query`, `params` and `headers`, enforced in Rust before the handler and exposed as `req.valid`; a failure answers a JSON 422 unless `on_invalid` says otherwise. Paths take `:name` parameters and a trailing `*` catch-all.
+- `:get(path, ...)` — Registers a GET route: `middleware..., handler` plus an optional trailing options table `{ input = {...}, doc = {...}, on_invalid = fn, on_error = fn }`. `doc` describes the operation in the OpenAPI document (`summary`, `description`, `tags`, `operation_id`, `responses = { [code] = { description, schema?, content? } }` where `schema` is documentation only, `security = { name }`, `deprecated`, `hidden`); request schemas live under `input`, never `doc`. `input` declares schemas for `body` (a schema, or `{ schema = S, content = { "json", "form", "multipart" } }`, or `{ file = R, content = { "raw" } }`), `query`, `params` and `headers`, enforced in Rust before the handler and exposed as `req.valid`; a failure answers a JSON 422 unless `on_invalid` says otherwise. Paths take `:name` parameters and a trailing `*` catch-all.
 - `:post(path, ...)` — Registers a POST route (see `get`).
 - `:put(path, ...)` — Registers a PUT route (see `get`).
 - `:delete(path, ...)` — Registers a DELETE route (see `get`).
 - `:patch(path, ...)` — Registers a PATCH route (see `get`).
 - `:head(path, ...)` — Registers a HEAD route (see `get`). Without one, HEAD reuses the GET route with the body stripped.
 - `:options(path, ...)` — Registers an OPTIONS route (see `get`). Without one, OPTIONS answers 204 with `Allow`.
+- `:doc(info)` — Document-level information for the generated OpenAPI document, once per app: `title`, `version`, `description`, `terms_of_service`, `contact`, `license`, `tags = { { name, description } }`, `security = { name = scheme }` (schemes as OpenAPI security scheme objects, referenced by name from a route's `doc.security`), `external_docs`. Unknown keys fail at load. Needs the `openapi` Cargo feature and `[openapi] enabled = true` to be served; `nitr openapi` generates it regardless.
 - `:on_invalid(fn)` — The app-wide answer to a request that failed its route's `input` declaration: `function(err, req)` returning a response, where `err = { code, message, fields, errors }` (`fields` maps each path such as `body.email` to its message; `errors` lists `{ path, part, field, rule, message, params?, label? }`). A route-level `on_invalid` option wins over it.
 - `:use(mw)` — Adds app-wide middleware: a factory `fn(next) -> fn(req)`. Must be called before any route.
 - `:on_error(handler)` — Sets the app-wide error handler: `fn(err, req)` where `err` is the structured error (`kind`, `message`, `source`, `line`, `traceback`, ...).

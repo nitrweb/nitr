@@ -63,6 +63,19 @@ enum Command {
         #[arg(long, value_name = "SUBSTRING")]
         filter: Option<String>,
     },
+    /// Generate the OpenAPI document from the application's routes.
+    Openapi {
+        /// Write the document to this file instead of standard output.
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// Compare the generated document with the file at --output (or
+        /// `[openapi] output`, or openapi.json) and exit 1 when it differs.
+        #[arg(long)]
+        check: bool,
+        /// Write a self-contained Swagger UI site into this directory.
+        #[arg(long, value_name = "DIR")]
+        ui: Option<PathBuf>,
+    },
     /// Apply pending SQL migrations from migrations/.
     Migrate {
         /// Report what has run and what is pending, applying nothing.
@@ -130,7 +143,13 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
 /// Installs the tracing subscriber per the `[log]` configuration.
 /// `RUST_LOG` wins over the configured level; without either the default
 /// is `info` (`debug` in dev mode).
-fn init_logging(cfg: Option<&Config>, dev: bool) {
+/// Whether a command's standard output is a document rather than a log:
+/// `nitr openapi` prints the JSON there, so its log lines go to stderr.
+fn logs_to_stderr(command: &Option<Command>) -> bool {
+    matches!(command, Some(Command::Openapi { .. }))
+}
+
+fn init_logging(cfg: Option<&Config>, dev: bool, to_stderr: bool) {
     let fallback = || {
         let configured = cfg.and_then(|c| c.log.level.clone());
         tracing_subscriber::EnvFilter::new(configured.unwrap_or_else(|| {
@@ -162,10 +181,35 @@ fn init_logging(cfg: Option<&Config>, dev: bool) {
     // never disagree — a terminal gets all of it, a pipe or shipper
     // gets byte-clean plain text.
     use std::io::IsTerminal as _;
-    let colors = !json
-        && std::io::stdout().is_terminal()
-        && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+    let stream_is_terminal = if to_stderr {
+        std::io::stderr().is_terminal()
+    } else {
+        std::io::stdout().is_terminal()
+    };
+    let colors =
+        !json && stream_is_terminal && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     nitr::diag::set_console_colors(colors);
+    if to_stderr {
+        finish_logging(builder.with_writer(std::io::stderr), json, colors);
+    } else {
+        finish_logging(builder, json, colors);
+    }
+}
+
+/// The last step of the subscriber setup, over whichever stream was
+/// chosen.
+fn finish_logging<W>(
+    builder: tracing_subscriber::fmt::SubscriberBuilder<
+        tracing_subscriber::fmt::format::DefaultFields,
+        tracing_subscriber::fmt::format::Format,
+        tracing_subscriber::EnvFilter,
+        W,
+    >,
+    json: bool,
+    colors: bool,
+) where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
     if json {
         builder.json().init();
     } else if colors {
@@ -380,24 +424,24 @@ async fn run_main() -> anyhow::Result<()> {
     // `init` runs before any configuration exists; everything else loads
     // the configuration first so `[log]` can shape the subscriber.
     if let Some(Command::Init { dir, minimal }) = &cli.command {
-        init_logging(None, cli.dev);
+        init_logging(None, cli.dev, logs_to_stderr(&cli.command));
         return scaffold::init(dir.as_deref().unwrap_or(Path::new(".")), *minimal);
     }
     // `hash-password` needs no application at all: it is the one command
     // an operator runs *before* there is a working nitr.toml, and a
     // broken one must not stand between them and a credential.
     if let Some(Command::HashPassword) = &cli.command {
-        init_logging(None, cli.dev);
+        init_logging(None, cli.dev, logs_to_stderr(&cli.command));
         return cmd::hash_password::hash_password().await;
     }
 
     let cfg = match load_config(&cli) {
         Ok(cfg) => {
-            init_logging(Some(&cfg), cli.dev);
+            init_logging(Some(&cfg), cli.dev, logs_to_stderr(&cli.command));
             cfg
         }
         Err(err) => {
-            init_logging(None, cli.dev);
+            init_logging(None, cli.dev, logs_to_stderr(&cli.command));
             return Err(err);
         }
     };
@@ -433,6 +477,12 @@ async fn run_main() -> anyhow::Result<()> {
             }
         }
         Command::Migrate { status } => cmd::migrate::migrate(&cfg, status)?,
+        Command::Openapi { output, check, ui } => {
+            let args = cmd::openapi::OpenapiArgs { output, check, ui };
+            if cmd::openapi::run(cfg, args).await? == cmd::openapi::Outcome::Drift {
+                std::process::exit(1);
+            }
+        }
         Command::Build { output } => {
             let cfg_path = cli
                 .config

@@ -92,6 +92,10 @@ pub struct Config {
     pub lua: LuaConfig,
     /// Health and readiness endpoints (`[health]` section).
     pub health: HealthConfig,
+    /// The generated OpenAPI document (`[openapi]` section).
+    pub openapi: OpenApiConfig,
+    /// The Swagger UI page (`[swagger]` section).
+    pub swagger: SwaggerConfig,
     /// Log output (`[log]` section).
     pub log: LogConfig,
     /// File the server writes its process id to at startup (and removes at
@@ -128,6 +132,8 @@ impl Default for Config {
             env: EnvConfig::default(),
             lua: LuaConfig::default(),
             health: HealthConfig::default(),
+            openapi: OpenApiConfig::default(),
+            swagger: SwaggerConfig::default(),
             log: LogConfig::default(),
             pidfile: None,
         }

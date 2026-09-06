@@ -21,6 +21,7 @@ pub(crate) mod handler;
 pub(crate) mod health;
 #[cfg(feature = "multipart")]
 pub(crate) mod multipart;
+pub(crate) mod openapi;
 pub(crate) mod protect;
 pub(crate) mod range;
 pub(crate) mod request;
@@ -60,6 +61,7 @@ pub mod service;
 pub use config::{
     CacheConfig, CompressionConfig, Config, CookieSecure, CookiesConfig, CorsConfig,
     DatabaseConfig, FetchConfig, HealthConfig, LimitsConfig, LogConfig, LogFormat, LuaConfig,
-    MultipartConfig, RateLimitConfig, ShutdownConfig, StaticConfig, StdConfig, TlsConfig,
+    MultipartConfig, OpenApiConfig, RateLimitConfig, ShutdownConfig, StaticConfig, StdConfig,
+    SwaggerConfig, TlsConfig,
 };
 pub use server::{Server, ServerBuilder};

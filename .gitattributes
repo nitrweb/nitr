@@ -7,3 +7,7 @@ crates/nitr-cli/src/nitr-api.toml text eol=lf
 # Lua sources are embedded via include_str! and shipped into scaffolds;
 # keep them LF everywhere too.
 *.lua text eol=lf
+# Vendored Swagger UI: third-party, minified, reviewed by checksum in
+# update.sh rather than by diff.
+crates/nitr-http/assets/swagger-ui/* linguist-vendored -diff
+crates/nitr-http/assets/swagger-ui/* text eol=lf

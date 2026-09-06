@@ -296,6 +296,43 @@ dir = "scripts/templates"
 # "validate", "base64", "path", "url", "env".
 # Listing a feature is strict: a listed feature missing its configuration
 # (e.g. "db" without a `[database]` section) fails at startup.
+# The OpenAPI document, generated from the routes' `input` and `doc`
+# tables. Off by default: a route map is reconnaissance material, so
+# publishing it is a decision. `nitr openapi` generates the document
+# regardless of `enabled`; the flag gates serving only. Needs the
+# `openapi` Cargo feature (part of `all`).
+#[openapi]
+#enabled = true
+#path = "/openapi.json"
+#servers = ["https://api.example.com"]
+# Routes without a `doc` table still appear, as bare operations;
+# `doc = { hidden = true }` keeps a route out.
+#include_undocumented = true
+# Dev mode only: rewritten after each rebuild when the document changed.
+#output = "openapi.json"
+
+# The Swagger UI page: the vendored bundle served from this binary with a
+# strict Content-Security-Policy (no CDN, no inline script). Needs the
+# `swagger` Cargo feature and `[openapi] enabled = true` (or `spec_url`).
+#[swagger]
+#enabled = true
+#path = "/docs"
+#title = "API docs"            # default: the app:doc title
+#spec_url = "/openapi.json"    # default: [openapi] path
+#allow_external_spec = false   # widens the page's connect-src to spec_url's origin
+#deep_linking = true
+#doc_expansion = "list"        # list | full | none
+#filter = false
+#try_it_out = false
+#display_request_duration = false
+#persist_authorization = false # stores tokens in the browser's localStorage when true
+#display_operation_id = false
+#default_models_expand_depth = 1
+# Further Swagger UI options, verbatim (camelCase keys); may not repeat a
+# typed setting above, nor set `url` or `dom_id`.
+#[swagger.options]
+#showExtensions = true
+
 [std]
 features = [
     "dbg", "fetch", "template", "json", "db", "http", "log", "crypto",

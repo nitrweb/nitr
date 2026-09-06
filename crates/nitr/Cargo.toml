@@ -37,9 +37,16 @@ all = [
     "db",
     "fetch",
     "multipart",
+    "openapi",
+    "swagger",
     "template",
     "tls",
 ]
+
+# The OpenAPI document (`Server::openapi_json`, `[openapi]`).
+openapi = ["nitr-http/openapi"]
+# The Swagger UI page (`[swagger]`); implies `openapi`.
+swagger = ["openapi", "nitr-http/swagger"]
 
 # `nitr.crypto` / `nitr.auth`: argon2 passwords, constant-time comparison.
 crypto = ["nitr-http/crypto"]
@@ -100,6 +107,11 @@ name = "tls"
 path = "tests/tls.rs"
 required-features = ["tls"]
 
+[[test]]
+name = "openapi"
+path = "tests/openapi.rs"
+required-features = ["openapi"]
+
 [[example]]
 name = "aggregate"
 path = "examples/aggregate/main.rs"
@@ -124,6 +136,11 @@ required-features = ["db", "fetch"]
 name = "standards"
 path = "examples/standards/main.rs"
 required-features = ["compression", "multipart"]
+
+[[example]]
+name = "openapi"
+path = "examples/openapi/main.rs"
+required-features = ["swagger"]
 
 [[example]]
 name = "stdlib"

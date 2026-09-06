@@ -143,6 +143,7 @@ impl Config {
             tracing::warn!("{warning}");
         }
         self.validate_tls()?;
+        self.validate_docs()?;
         if self.health.enabled {
             for (name, path) in [
                 ("liveness", &self.health.liveness),
@@ -338,6 +339,143 @@ impl Config {
                     .map(|v| format!("\"{v}\""))
                     .join(" or ")
             )));
+        }
+        Ok(())
+    }
+
+    /// The `[openapi]` and `[swagger]` sections: feature presence, the
+    /// paths they claim (distinct from each other and from the health
+    /// probes), the page's option table, and the dev-mode output file.
+    fn validate_docs(&self) -> Result {
+        let openapi = &self.openapi;
+        let swagger = &self.swagger;
+        if openapi.enabled && cfg!(not(feature = "openapi")) {
+            return Err(Error::Config(
+                "[openapi] enabled = true, but this binary was built without the `openapi` \
+                 feature: rebuild with `--features openapi` (or `all`)"
+                    .into(),
+            ));
+        }
+        if swagger.enabled && cfg!(not(feature = "swagger")) {
+            return Err(Error::Config(
+                "[swagger] enabled = true, but this binary was built without the `swagger` \
+                 feature: rebuild with `--features swagger` (or `all`)"
+                    .into(),
+            ));
+        }
+        for (key, path) in [
+            ("[openapi] path", &openapi.path),
+            ("[swagger] path", &swagger.path),
+        ] {
+            if !path.starts_with('/') || path.len() < 2 || path.ends_with('/') {
+                return Err(Error::Config(format!(
+                    "{key} must be an absolute URL path below `/` without a trailing slash, got `{path}`"
+                )));
+            }
+        }
+        if swagger.enabled {
+            if !openapi.enabled && swagger.spec_url.is_none() {
+                return Err(Error::Config(
+                    "[swagger] enabled = true needs the document it renders: set [openapi] \
+                     enabled = true, or point `spec_url` at a document served elsewhere"
+                        .into(),
+                ));
+            }
+            if let Some(url) = &swagger.spec_url
+                && !url.starts_with('/')
+                && !swagger.allow_external_spec
+            {
+                return Err(Error::Config(format!(
+                    "[swagger] spec_url `{url}` is on another origin: set allow_external_spec = \
+                     true to let the page load it (this widens its connect-src to that origin)"
+                )));
+            }
+            if !super::sections::DOC_EXPANSIONS.contains(&swagger.doc_expansion.as_str()) {
+                return Err(Error::Config(format!(
+                    "[swagger] doc_expansion must be \"list\", \"full\" or \"none\", got `{}`",
+                    swagger.doc_expansion
+                )));
+            }
+            for key in swagger.options.keys() {
+                if super::sections::SWAGGER_RESERVED_OPTIONS.contains(&key.as_str()) {
+                    return Err(Error::Config(format!(
+                        "[swagger.options] may not set `{key}`: the page owns it"
+                    )));
+                }
+                if let Some((typed, _)) = super::sections::SWAGGER_TYPED_OPTIONS
+                    .iter()
+                    .find(|(_, camel)| camel == key)
+                {
+                    return Err(Error::Config(format!(
+                        "[swagger.options] `{key}` is the typed setting [swagger] {typed}: set it \
+                         there, once"
+                    )));
+                }
+            }
+        }
+        if openapi.enabled && swagger.enabled {
+            let (a, b) = (openapi.path.as_str(), swagger.path.as_str());
+            if a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/")) {
+                return Err(Error::Config(format!(
+                    "[openapi] path `{a}` and [swagger] path `{b}` overlap: the page's assets live \
+                     under its path, so the two must be distinct and neither below the other"
+                )));
+            }
+        }
+        if self.health.enabled && self.health.bind.is_none() {
+            for (key, enabled, path) in [
+                ("[openapi] path", openapi.enabled, &openapi.path),
+                ("[swagger] path", swagger.enabled, &swagger.path),
+            ] {
+                if enabled && (path == &self.health.liveness || path == &self.health.readiness) {
+                    return Err(Error::Config(format!(
+                        "{key} `{path}` is a [health] probe path: the probes answer first, so \
+                         the document could never be served there"
+                    )));
+                }
+            }
+        }
+        if let Some(output) = &openapi.output {
+            if output.extension().is_some_and(|e| e == "lua") {
+                return Err(Error::Config(format!(
+                    "[openapi] output {} has a `.lua` extension: the dev-mode watcher would \
+                     reload on every write, so the document may not be a script",
+                    output.display()
+                )));
+            }
+            if let Some(dir) = &self.templating.dir
+                && output.starts_with(dir)
+            {
+                return Err(Error::Config(format!(
+                    "[openapi] output {} is inside [templating] dir: the watcher would reload \
+                     on every write",
+                    output.display()
+                )));
+            }
+            match output.parent() {
+                Some(parent) if parent.as_os_str().is_empty() || parent.is_dir() => {}
+                Some(parent) => {
+                    return Err(Error::Config(format!(
+                        "[openapi] output {}: the directory {} does not exist",
+                        output.display(),
+                        parent.display()
+                    )));
+                }
+                None => {
+                    return Err(Error::Config(
+                        "[openapi] output must name a file, not a directory".into(),
+                    ));
+                }
+            }
+            if let Some(dir) = &self.static_files.dir
+                && output.starts_with(dir)
+            {
+                tracing::warn!(
+                    "[openapi] output {} is inside [static] dir: the file is served statically, \
+                     which bypasses `[openapi] enabled`",
+                    output.display()
+                );
+            }
         }
         Ok(())
     }
