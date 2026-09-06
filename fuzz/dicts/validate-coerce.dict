@@ -1,0 +1,44 @@
+# Tokens for `validate_coerce`. The whole input is the value text a form,
+# query string, path parameter or header carries.
+
+# --- the five boolean spellings, and near misses -------------------------
+"true"
+"false"
+"on"
+"off"
+"1"
+"0"
+"yes"
+"TRUE"
+
+# --- integer shapes: accepted and refused --------------------------------
+"42"
+"-7"
+"+5"
+"007"
+"9223372036854775807"
+"9223372036854775808"
+"-9223372036854775808"
+"99999999999999999999"
+
+# --- number shapes -------------------------------------------------------
+"1.5"
+"-0.0"
+".5"
+"5."
+"1e3"
+"1E3"
+"1e400"
+"0x10"
+"inf"
+"nan"
+"NaN"
+"Infinity"
+
+# --- whitespace and separators a browser never sends alone ----------------
+" "
+"\x09"
+","
+"_"
+"1_000"
+"1,000"

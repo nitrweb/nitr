@@ -17,7 +17,8 @@ export RUSTFLAGS
 FUZZ_TARGETS := cookie-verify accept-negotiation path-lexical json-lua \
                 range-header multipart static-resolve upload-resolve \
                 url-lexical cookie-header accept-encoding jwt-verify \
-                validate-formats conditional-headers basic-auth tls-pem
+                validate-formats conditional-headers basic-auth tls-pem \
+                validate-coerce sniff-file
 # Per-target fuzz time in seconds (CI uses 90).
 FUZZ_TIME ?= 60
 # A hang is a bug: bound one execution well under the run itself, since

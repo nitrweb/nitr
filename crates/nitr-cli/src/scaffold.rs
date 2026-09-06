@@ -140,27 +140,36 @@ return app
 "#;
 
 const ROUTES_NOTES_LUA: &str = r#"-- The notes API: a route module is a plain function taking the app.
-local schema = nitr.validate.schema({
-    text = { type = "string", min_len = 1, max_len = 500, required = true },
+--
+-- A route's `input` is validated in Rust before the handler runs: a bad
+-- body answers a JSON 422 naming every failing field, and the handler
+-- reads the checked, stripped values from `req.valid`.
+local NoteInput = nitr.validate.schema({
+    text = "string|trim|min_len:1|max_len:500|required",
 })
 
 return function(app)
     app:get("/api/notes", function(req)
-        return nitr.json(nitr.db:query("SELECT id, text, created_at FROM notes ORDER BY id"))
-    end)
+        local q = req.valid.query
+        return nitr.json(nitr.db:query(
+            "SELECT id, text, created_at FROM notes ORDER BY id LIMIT ?",
+            { q.limit }
+        ))
+    end, {
+        input = { query = { limit = "integer|min:1|max:100|default:50" } },
+    })
 
     app:post("/api/notes", function(req)
-        local data, err = schema:check(req:json())
-        if not data then
-            return nitr.error(422, { code = "VALIDATION_FAILED", fields = err.fields })
-        end
+        local data = req.valid.body
         nitr.db:execute(
             "INSERT INTO notes (text, created_at) VALUES (?, ?)",
             { data.text, nitr.time.now() }
         )
         local note = nitr.db:query_row("SELECT id, text, created_at FROM notes ORDER BY id DESC")
         return nitr.json(note, 201)
-    end)
+    end, {
+        input = { body = NoteInput },
+    })
 end
 "#;
 
@@ -203,10 +212,17 @@ t.describe("notes API", function()
         t.expect(resp:json().text).to_equal("hi")
     end)
 
-    t.it("rejects an empty note", function()
+    t.it("rejects an empty note before the handler runs", function()
         local resp = t.request("POST", "/api/notes", { json = {} })
         t.expect(resp.status).to_equal(422)
-        t.expect(resp:json().fields.text).to_match("required")
+        t.expect(resp:json().fields["body.text"]).to_equal("is required")
+        t.expect(resp:json().errors[1].rule).to_equal("required")
+    end)
+
+    t.it("bounds the page size", function()
+        local resp = t.request("GET", "/api/notes?limit=500")
+        t.expect(resp.status).to_equal(422)
+        t.expect(resp:json().fields["query.limit"]).to_equal("must be at most 100")
     end)
 end)
 "#;

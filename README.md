@@ -141,6 +141,8 @@ Every Nitr API is a field of the global `nitr` table; nothing else is registered
 | `app:get/post/put/delete/patch/head/options(path, ...fns)` | Register a route; `:name` captures a parameter, a trailing `*` captures the rest. All but the last function are route middleware |
 | `app:use(fn)` | Global middleware, `function(next) return function(req) ... end end`; must precede routes |
 | `app:on_error(fn)` | `function(err, req)` — the app-wide error response |
+| `app:on_invalid(fn)` | `function(err, req)` — the app-wide answer when a route's `input` fails (default: a JSON 422 with `fields` and `errors`) |
+| `app:post(path, handler, { input = {...} })` | Validated input: `body` (JSON or form; `{ schema = S, content = { "multipart" } }` for uploads with `file` rules, `{ file = R, content = { "raw" } }` for a single-file body), `query`, `params`, `headers` — checked in Rust before the handler, coerced from text, exposed as `req.valid.{body,query,params,headers}` |
 | `app:static(mount, dir, opts?)` | Serve files from Rust (`{ spa = true, cache_control = "..." }`) |
 | `nitr.cfg` | The configuration script's snapshot |
 
@@ -192,7 +194,7 @@ The `nitr.*` standard library provides building blocks — enable the features y
 | `nitr.crypto.jwt.sign/verify` | HMAC JWTs; `verify` requires an explicit `algorithms` allow-list and checks `exp`/`nbf` by default |
 | `nitr.auth.basic(req)` / `nitr.auth.bearer(req)` | Parse `Authorization` credentials |
 | `nitr.time.*` | `now`, `monotonic`, strftime `format`/`parse` (UTC), `http`/`parse_http`, `iso8601` — so scripts never need the `os` Lua library for a date |
-| `nitr.validate.schema({...})` → `schema:check(v)` | Declarative validation compiled once, checked in Rust; per-field error map, undeclared fields stripped |
+| `nitr.validate.schema({...})` → `schema:check(v)` | Declarative validation compiled once, checked in Rust: 9 types, 36 formats, shorthand rules (`"string\|trim\|min_len:1\|required"`), custom formats/checks, cross-field rules, per-field messages with placeholders; `:partial/:pick/:omit/:extend` derivations. Declared on a route as `input = {...}` it runs before the handler (see below) |
 | `nitr.csrf({ secret })` / `nitr.csrf.token(req)` | CSRF middleware (signed double-submit cookie, constant-time, unsafe methods only) |
 | `nitr.session(req, { secret })` | Stateless signed-cookie session: assign fields, `session:save(resp)`, `session:clear()` |
 | `nitr.base64.encode/decode` | Base64, standard and URL-safe (`{ url = true }`) alphabets |

@@ -490,7 +490,7 @@ fn scaffolded_app_tests_pass_and_filter() {
         stdout.contains("ok   notes API > creates a note"),
         "got: {stdout}"
     );
-    assert!(stdout.contains("3 passed, 0 failed"), "got: {stdout}");
+    assert!(stdout.contains("4 passed, 0 failed"), "got: {stdout}");
 
     let out = nitr()
         .current_dir(&dir)
@@ -500,7 +500,7 @@ fn scaffolded_app_tests_pass_and_filter() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "filtered run failed: {stdout}");
     assert!(
-        stdout.contains("1 passed, 0 failed, 2 filtered out"),
+        stdout.contains("1 passed, 0 failed, 3 filtered out"),
         "got: {stdout}"
     );
 

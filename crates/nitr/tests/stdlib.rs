@@ -149,7 +149,7 @@ return app
     let body: serde_json::Value = resp.json().await.expect("json");
     assert_eq!(body["code"], "VALIDATION_FAILED");
     assert_eq!(body["fields"]["email"], "is required");
-    assert_eq!(body["fields"]["age"], "must be >= 0");
+    assert_eq!(body["fields"]["age"], "must be at least 0");
     assert_eq!(body["fields"]["tags"], "must have at most 2 items");
 
     server.stop().await;

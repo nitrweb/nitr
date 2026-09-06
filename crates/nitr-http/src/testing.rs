@@ -92,6 +92,10 @@ impl TestClient {
             limits: Default::default(),
             cached_form: None,
             body_limit: u64::MAX,
+            cached_body: None,
+            body_consumed: false,
+            valid: None,
+            spool_dir: None,
         };
 
         let pool = current_pool(&self.pool);

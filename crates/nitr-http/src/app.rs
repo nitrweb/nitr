@@ -21,8 +21,16 @@ use std::sync::Arc;
 
 use nitr_core::{Error, Result, Runtime};
 
+use crate::validation::{InputEnv, InputHolder, InputSchemas};
+
 /// Named registry slot holding each state's compiled [`AppState`].
 const APP_STATE_KEY: &str = "nitr::app_state";
+
+/// Named registry slot holding the budgeted validation function.
+const VALIDATE_FN_KEY: &str = "nitr::validate_fn";
+
+/// The keys a route's trailing options table may carry.
+const ROUTE_OPTION_KEYS: &[&str] = &["on_error", "on_invalid", "input"];
 
 /// Route-registration methods exposed on the app object, each name paired
 /// with its `Method` so the mapping is total by construction — no lookup
@@ -54,6 +62,12 @@ struct RouteDef {
     /// A per-route error handler (`{ on_error = fn }` options), overriding
     /// the app-wide `app:on_error`.
     error_fn: Option<Function>,
+    /// A per-route validation-failure handler (`{ on_invalid = fn }`),
+    /// overriding the app-wide `app:on_invalid`.
+    invalid_fn: Option<Function>,
+    /// The `{ input = {...} }` declaration, compiled in [`compile`] where
+    /// the deployment's upload settings are known.
+    input: Option<mlua::Table>,
     /// Where the script registered this route (`source`, `line`), captured
     /// at registration so a duplicate can name both sites.
     site: Option<(String, u32)>,
@@ -83,7 +97,48 @@ struct AppDef {
     middleware: Vec<Function>,
     routes: Vec<RouteDef>,
     error_fn: Option<Function>,
+    invalid_fn: Option<Function>,
     statics: Vec<crate::static_files::StaticMount>,
+}
+
+/// Reads a route's trailing options table.
+fn route_options(
+    name: &str,
+    path: &str,
+    opts: &mlua::Table,
+) -> mlua::Result<(Option<Function>, Option<Function>, Option<mlua::Table>)> {
+    for pair in opts.pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        let key = match key {
+            Value::String(s) => s.to_string_lossy().to_string(),
+            _ => {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "app:{name}(\"{path}\", ...): option keys must be strings"
+                )));
+            }
+        };
+        if !ROUTE_OPTION_KEYS.contains(&key.as_str()) {
+            return Err(mlua::Error::RuntimeError(format!(
+                "app:{name}(\"{path}\", ...): unknown option `{key}` (allowed: {})",
+                ROUTE_OPTION_KEYS.join(", ")
+            )));
+        }
+    }
+    let input = match opts.get::<Value>("input")? {
+        Value::Nil => None,
+        Value::Table(t) => Some(t),
+        other => {
+            return Err(mlua::Error::RuntimeError(format!(
+                "app:{name}(\"{path}\", ...): `input` must be a table, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    Ok((
+        opts.get::<Option<Function>>("on_error")?,
+        opts.get::<Option<Function>>("on_invalid")?,
+        input,
+    ))
 }
 
 /// The `nitr.app()` userdata handed to the handler script.
@@ -98,13 +153,13 @@ impl UserData for LuaApp {
                 // `middleware..., handler` optionally followed by an options
                 // table: `app:get(path, handler, { on_error = fn })`.
                 move |lua, this, (path, mut args): (String, Variadic<Value>)| {
-                    let error_fn = match args.last() {
+                    let (error_fn, invalid_fn, input) = match args.last() {
                         Some(Value::Table(opts)) => {
-                            let error_fn = opts.get::<Option<Function>>("on_error")?;
+                            let parsed = route_options(name, &path, opts)?;
                             args.pop();
-                            error_fn
+                            parsed
                         }
-                        _ => None,
+                        _ => (None, None, None),
                     };
                     let fns: Vec<Function> = args
                         .into_iter()
@@ -133,12 +188,22 @@ impl UserData for LuaApp {
                         path,
                         fns,
                         error_fn,
+                        invalid_fn,
+                        input,
                         site,
                     });
                     Ok(())
                 },
             );
         }
+
+        // app:on_invalid(fn): the app-wide answer to a request that failed
+        // its route's `input` declaration, `function(err, req)` returning a
+        // response. Without one the server answers a JSON 422.
+        methods.add_method("on_invalid", |_, this, f: Function| {
+            lock(&this.0)?.invalid_fn = Some(f);
+            Ok(())
+        });
 
         methods.add_method("use", |_, this, mw: Function| {
             let mut def = lock(&this.0)?;
@@ -194,6 +259,11 @@ pub(crate) struct Dispatch(pub(crate) Box<CompiledApp>);
 pub(crate) struct Chain {
     pub(crate) fns: Function,
     pub(crate) error_fn: Option<Function>,
+    /// The route's compiled `input` declaration, plus the userdata the
+    /// budgeted validation function receives it through.
+    pub(crate) input: Option<(Arc<InputSchemas>, AnyUserData)>,
+    /// The resolved `on_invalid` (route-level first, app-wide fallback).
+    pub(crate) invalid_fn: Option<Function>,
 }
 
 pub(crate) struct CompiledApp {
@@ -223,26 +293,46 @@ pub(crate) struct AppState {
 impl UserData for AppState {}
 
 /// Mounts `nitr.app()` on the shared `nitr` namespace table (`nitr.cfg` is
-/// filled in by the server once the configuration snapshot is known).
+/// filled in by the server once the configuration snapshot is known), and
+/// registers the validation function routes with `input` run through.
 pub(crate) fn register_nitr_app(lua: &Lua) -> Result<()> {
     let nitr = nitr_core::nitr_table(lua)?;
     nitr.set(
         "app",
         lua.create_function(|_, ()| Ok(LuaApp(Mutex::new(AppDef::default()))))?,
     )?;
+    // A Rust async function called through the runtime's budgeted
+    // `call_function`, so a custom check spends the request's allowance.
+    let validate = lua.create_async_function(crate::validation::run::validate)?;
+    lua.set_named_registry_value(VALIDATE_FN_KEY, validate)?;
     Ok(())
+}
+
+/// The budgeted validation function registered by [`register_nitr_app`].
+pub(crate) fn validate_fn(lua: &Lua) -> Result<Function> {
+    lua.named_registry_value::<Function>(VALIDATE_FN_KEY)
+        .map_err(|_| Error::Script("the validation function is not registered".into()))
 }
 
 /// Evaluates the handler script and stores its compiled [`AppState`] in the
 /// Lua registry. Called at startup for every pooled state and again on
-/// dev-mode reloads.
+/// dev-mode reloads. Returns whether any route declares file uploads.
 pub(crate) fn load(
     rt: &Runtime,
     script: &Path,
     base_statics: &[crate::static_files::StaticMount],
-) -> Result<()> {
+    input_env: &InputEnv,
+) -> Result<bool> {
     let value = rt.eval_script(script)?;
-    let (dispatch, mut statics) = compile(value, script)?;
+    let (dispatch, mut statics) = compile(rt.lua(), value, script, input_env)?;
+    let has_files = dispatch
+        .0
+        .chains
+        .iter()
+        .any(|c| c.input.as_ref().is_some_and(|(i, _)| i.has_file_rules()));
+    // The application has compiled: app-wide validation messages are
+    // fixed from here, so no request can change another's wording.
+    nitr_std::validation::freeze_messages(rt.lua());
     statics.extend_from_slice(base_statics);
     // Longest mount prefix first, once: the static path used to collect
     // and sort the candidates on every request. Stable, so mounts of equal
@@ -254,7 +344,7 @@ pub(crate) fn load(
         script: script.to_path_buf(),
     })?;
     rt.lua().set_named_registry_value(APP_STATE_KEY, state)?;
-    Ok(())
+    Ok(has_files)
 }
 
 /// The state's [`AppState`] userdata, set by [`load()`].
@@ -268,7 +358,7 @@ pub(crate) fn state(lua: &Lua) -> Result<AnyUserData> {
 /// is validated so conflicts fail at startup instead of at request time.
 type Compiled = (Dispatch, Vec<crate::static_files::StaticMount>);
 
-fn compile(value: Value, script: &Path) -> Result<Compiled> {
+fn compile(lua: &Lua, value: Value, script: &Path, input_env: &InputEnv) -> Result<Compiled> {
     let app_ud = match value {
         Value::UserData(ud) if ud.is::<LuaApp>() => ud,
         // Plain-function handlers (the pre-`nitr.app()` style) are gone:
@@ -297,9 +387,28 @@ fn compile(value: Value, script: &Path) -> Result<Compiled> {
     let mut index: HashMap<String, usize> = HashMap::new();
     for route in &def.routes {
         let idx = chains.len();
+        let input = match &route.input {
+            Some(table) => {
+                let site = format!(
+                    "route `{} {}` ({})",
+                    route.method,
+                    route.path,
+                    site_label(&route.site)
+                );
+                let names = crate::validation::param_names(&route.path);
+                let schemas = InputSchemas::parse(lua, table, &names, input_env, &site)
+                    .map_err(|err| Error::Script(err.to_string()))?;
+                let schemas = Arc::new(schemas);
+                let holder = lua.create_userdata(InputHolder(schemas.clone()))?;
+                Some((schemas, holder))
+            }
+            None => None,
+        };
         chains.push(Chain {
             fns: compose(&def.middleware, route)?,
             error_fn: route.error_fn.clone().or_else(|| def.error_fn.clone()),
+            input,
+            invalid_fn: route.invalid_fn.clone().or_else(|| def.invalid_fn.clone()),
         });
         let pattern = to_matchit(&route.path)?;
         let slot = match index.get(&pattern) {

@@ -138,6 +138,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "validate-coerce"
+path = "fuzz_targets/validate_coerce.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sniff-file"
+path = "fuzz_targets/sniff_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "conditional-headers"
 path = "fuzz_targets/conditional_headers.rs"
 test = false

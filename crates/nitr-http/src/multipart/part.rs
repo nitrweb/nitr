@@ -177,7 +177,7 @@ impl UserData for LuaPart {
     }
 }
 
-pub(super) fn too_large(name: &str, kind: &str, limit: u64) -> mlua::Error {
+pub(crate) fn too_large(name: &str, kind: &str, limit: u64) -> mlua::Error {
     mlua::Error::RuntimeError(format!(
         "multipart {kind} `{name}` exceeds the {limit} byte limit"
     ))

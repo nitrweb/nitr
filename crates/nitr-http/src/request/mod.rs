@@ -50,6 +50,20 @@ pub(crate) struct LuaRequest {
     /// relying on the limiter installed in another file. `u64::MAX` until
     /// the guard runs (nothing to clamp against yet).
     pub(crate) body_limit: u64,
+    /// The whole body, once route validation read it, so a handler's
+    /// `req:json()`/`req:text()`/`req:form()` still work afterwards: the
+    /// read happens once, whoever asks first.
+    pub(crate) cached_body: Option<Bytes>,
+    /// Set when validation consumed the body as a stream (multipart or a
+    /// raw upload): there is nothing left for `req:multipart` to parse.
+    #[cfg_attr(not(feature = "multipart"), allow(dead_code))]
+    pub(crate) body_consumed: bool,
+    /// The validated input (`req.valid`), populated by route validation.
+    pub(crate) valid: Option<mlua::Table>,
+    /// Where this request's validated uploads spool; set by the handler
+    /// when the route may receive files.
+    #[cfg_attr(not(feature = "multipart"), allow(dead_code))]
+    pub(crate) spool_dir: Option<std::path::PathBuf>,
 }
 
 /// Bounds applied while parsing a request body into Lua values.
@@ -222,6 +236,9 @@ impl UserData for LuaRequest {
             }
             Ok(table)
         });
+        // req.valid — `{ body, query, params, headers }` as the route's
+        // `input` declaration validated them; nil on routes without one.
+        fields.add_field_method_get("valid", |_, req| Ok(req.valid.clone()));
         fields.add_field_method_get("cookies", |_, req| {
             // All `Cookie` headers, joined so multi-header clients work.
             let header = req
@@ -305,13 +322,16 @@ impl UserData for LuaRequest {
         // Repeated keys keep the last value, matching `req.query`.
         methods.add_async_method_mut("form", |lua, mut req, ()| async move {
             if req.cached_form.is_none() {
-                let body = req
-                    .req
-                    .body_mut()
-                    .collect()
-                    .await
-                    .into_lua_err()?
-                    .to_bytes();
+                let body = match req.cached_body.clone() {
+                    Some(cached) => cached,
+                    None => req
+                        .req
+                        .body_mut()
+                        .collect()
+                        .await
+                        .into_lua_err()?
+                        .to_bytes(),
+                };
                 req.cached_form = Some(
                     url::form_urlencoded::parse(&body)
                         .map(|(k, v)| (k.into_owned(), v.into_owned()))
@@ -330,6 +350,13 @@ impl UserData for LuaRequest {
         // collected. Returns the number of parts seen.
         #[cfg(feature = "multipart")]
         methods.add_async_method_mut("multipart", |lua, mut req, cb: mlua::Function| async move {
+            if req.body_consumed {
+                return Err(mlua::Error::RuntimeError(
+                    "req:multipart() cannot run on a route whose `input` already consumed the \
+                     body: read the validated files from req.valid instead"
+                        .into(),
+                ));
+            }
             let content_type = req
                 .req
                 .headers()
@@ -386,15 +413,22 @@ impl UserData for LuaRequest {
         );
 
         methods.add_async_method_mut("text", |lua, mut req, ()| async move {
+            if let Some(cached) = &req.cached_body {
+                return lua.create_string(cached);
+            }
             let reader = req.req.body_mut();
             let body = reader.collect().await.into_lua_err()?;
             lua.create_string(body.to_bytes())
         });
 
         methods.add_async_method_mut("json", |lua, mut req, ()| async move {
-            let reader = req.req.body_mut();
-            let collected = reader.collect().await.into_lua_err()?;
-            let buf = collected.to_bytes();
+            let buf = match req.cached_body.clone() {
+                Some(cached) => cached,
+                None => {
+                    let reader = req.req.body_mut();
+                    reader.collect().await.into_lua_err()?.to_bytes()
+                }
+            };
             if buf.is_empty() {
                 return Err(mlua::Error::external(
                     "Unexpected end of JSON input, probably request body is empty or already consumed",

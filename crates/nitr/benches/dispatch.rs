@@ -84,6 +84,17 @@ app:post("/form", function(req)
     return nitr.text(req:form().name or "none")
 end)
 
+-- The same body as /echo, validated in Rust before the handler: forty
+-- items against a four-field item schema, the cost of the checker on top
+-- of one dispatch.
+local Item = nitr.validate.schema({
+    id = "integer|min:0", name = "string|min_len:1|max_len:32",
+    tags = { "array|max_items:4", items = "string|format:alpha" }, active = "boolean",
+})
+app:post("/echo/validated", function(req)
+    return nitr.json({ received = #req.valid.body.items })
+end, { input = { body = { items = { "array|max_items:100", items = Item } } } })
+
 -- Four layers of middleware, composed once at load time; a request pays
 -- only for the closure calls.
 local function tag(name)
@@ -167,7 +178,7 @@ static REQUEST_BODY: LazyLock<String> = LazyLock::new(|| {
 /// The builtins the dispatch application needs: the JSON codec and the
 /// response helpers.
 fn builtins() -> Builtins {
-    Builtins::JSON | Builtins::HTTP
+    Builtins::JSON | Builtins::HTTP | Builtins::VALIDATE
 }
 
 /// Route matching, parameter extraction and middleware.
@@ -743,6 +754,18 @@ mod payloads {
         let body = REQUEST_BODY.as_str();
 
         bencher.bench_local(|| divan::black_box(post_json(&rt, &client, "/echo", body)));
+    }
+
+    /// `json_body`'s twin through a route `input`: the checker's cost on a
+    /// forty-item body.
+    #[divan::bench]
+    fn validated_json_body(bencher: divan::Bencher<'_, '_>) {
+        let rt = tokio_runtime();
+        let script = write_file("dispatch.lua", APP);
+        let client = client(&rt, &script, builtins());
+        let body = REQUEST_BODY.as_str();
+
+        bencher.bench_local(|| divan::black_box(post_json(&rt, &client, "/echo/validated", body)));
     }
 
     /// A urlencoded form body, parsed in Rust for `req:form()`.

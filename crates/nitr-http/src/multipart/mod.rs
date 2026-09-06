@@ -55,7 +55,7 @@ mod tests;
 mod upload;
 
 pub(crate) use part::LuaPart;
-use part::too_large;
+pub(crate) use part::too_large;
 pub use upload::{resolve_upload_path, safe_filename};
 
 /// What a fuzzed multipart walk observed: how many parts were admitted,

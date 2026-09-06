@@ -30,6 +30,7 @@ pub(crate) mod static_files;
 pub(crate) mod stream;
 #[cfg(feature = "tls")]
 pub(crate) mod tls;
+pub(crate) mod validation;
 pub(crate) mod watch;
 
 pub mod testing;

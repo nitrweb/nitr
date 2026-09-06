@@ -243,9 +243,63 @@ fn runtime_opts_like(opts: &nitr::RuntimeOpts) -> anyhow::Result<nitr::RuntimeOp
     })
 }
 
+/// A Lua scalar as form text: numbers and booleans the way a browser
+/// would send them.
+fn lua_text(value: mlua::Value) -> String {
+    match value {
+        mlua::Value::String(s) => s.to_string_lossy().to_string(),
+        mlua::Value::Integer(i) => i.to_string(),
+        mlua::Value::Number(n) => n.to_string(),
+        mlua::Value::Boolean(b) => b.to_string(),
+        mlua::Value::Nil => String::new(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Encodes a `multipart` option table: a string value is a text part; a
+/// table `{ filename, content_type, data }` is a file part (`filename =
+/// ""` with empty `data` reproduces an empty browser file input).
+fn multipart_body(parts: mlua::Table) -> mlua::Result<(String, Vec<u8>)> {
+    let boundary = format!("----nitr-test-{}", uuid::Uuid::now_v7().simple());
+    let mut body = Vec::new();
+    let mut entries: Vec<(String, mlua::Value)> = Vec::new();
+    for pair in parts.pairs::<String, mlua::Value>() {
+        entries.push(pair?);
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, value) in entries {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        match value {
+            mlua::Value::Table(file) => {
+                let filename: String = file.get::<Option<String>>("filename")?.unwrap_or_default();
+                let content_type: Option<String> = file.get("content_type")?;
+                let data: mlua::LuaString = file.get("data")?;
+                body.extend_from_slice(
+                    format!("Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n")
+                        .as_bytes(),
+                );
+                if let Some(ct) = content_type {
+                    body.extend_from_slice(format!("Content-Type: {ct}\r\n").as_bytes());
+                }
+                body.extend_from_slice(b"\r\n");
+                body.extend_from_slice(&data.as_bytes());
+            }
+            other => {
+                body.extend_from_slice(
+                    format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+                );
+                body.extend_from_slice(lua_text(other).as_bytes());
+            }
+        }
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    Ok((format!("multipart/form-data; boundary={boundary}"), body))
+}
+
 /// Mounts `nitr.test` for test scripts: `nitr.test.request(method, path,
-/// opts?)` with opts `{ headers = {...}, body = "..." }` returning
-/// `{ status, headers, body }`.
+/// opts?)` with opts `{ headers = {...}, body = "...", json = v, form =
+/// {...}, multipart = {...} }` returning `{ status, headers, body }`.
 fn register_test_global(lua: &mlua::Lua, client: nitr::testing::TestClient) -> anyhow::Result<()> {
     let test = lua.create_table()?;
     test.set(
@@ -279,6 +333,37 @@ fn register_test_global(lua: &mlua::Lua, client: nitr::testing::TestClient) -> a
                             {
                                 headers.push(("content-type".into(), "application/json".into()));
                             }
+                        }
+                        // `form = { k = v }` sends an urlencoded body; a
+                        // sequence value repeats the key (`tags = {"a","b"}`).
+                        if let Some(form) = opts.get::<Option<mlua::Table>>("form")? {
+                            let mut encoder = url::form_urlencoded::Serializer::new(String::new());
+                            for pair in form.pairs::<String, mlua::Value>() {
+                                let (k, v) = pair?;
+                                match v {
+                                    mlua::Value::Table(list) => {
+                                        for item in list.sequence_values::<mlua::Value>() {
+                                            encoder.append_pair(&k, &lua_text(item?));
+                                        }
+                                    }
+                                    other => {
+                                        encoder.append_pair(&k, &lua_text(other));
+                                    }
+                                }
+                            }
+                            body = Some(bytes::Bytes::from(encoder.finish()));
+                            headers.push((
+                                "content-type".into(),
+                                "application/x-www-form-urlencoded".into(),
+                            ));
+                        }
+                        // `multipart = { field = "v", photo = { filename,
+                        // content_type, data } }` sends a multipart body, so
+                        // upload validation is testable without a browser.
+                        if let Some(parts) = opts.get::<Option<mlua::Table>>("multipart")? {
+                            let (content_type, encoded) = multipart_body(parts)?;
+                            body = Some(bytes::Bytes::from(encoded));
+                            headers.push(("content-type".into(), content_type));
                         }
                     }
                     let resp = client

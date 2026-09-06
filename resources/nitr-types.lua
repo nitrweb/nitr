@@ -17,6 +17,7 @@ nitr = {}
 ---@field remote_addr string Peer address (`"ip:port"`).
 ---@field uri table URI components: `scheme`, `host`, `port`, `path`, `authority`, `query`.
 ---@field cookies nitr.RequestCookies Parsed request cookies.
+---@field valid table|nil The route's validated input — `{ body, query, params, headers }` as its `input` declaration coerced, stripped and normalized them; nil on routes without `input`.
 local Request = {}
 
 ---Reads and decodes the body as JSON. Errors on an empty or invalid body.
@@ -91,7 +92,7 @@ function ResponseCookies:set_signed(name, value, secret, opts) end
 ---@class nitr.App
 local App = {}
 
----Registers a GET route: `middleware..., handler` plus an optional trailing `{ on_error = fn }`. Paths take `:name` parameters and a trailing `*` catch-all.
+---Registers a GET route: `middleware..., handler` plus an optional trailing options table `{ input = {...}, on_invalid = fn, on_error = fn }`. `input` declares schemas for `body` (a schema, or `{ schema = S, content = { "json", "form", "multipart" } }`, or `{ file = R, content = { "raw" } }`), `query`, `params` and `headers`, enforced in Rust before the handler and exposed as `req.valid`; a failure answers a JSON 422 unless `on_invalid` says otherwise. Paths take `:name` parameters and a trailing `*` catch-all.
 ---@param path string
 ---@param ... fun(req: nitr.Request): nitr.Response|table
 function App:get(path, ...) end
@@ -125,6 +126,10 @@ function App:head(path, ...) end
 ---@param path string
 ---@param ... fun(req: nitr.Request): nitr.Response|table
 function App:options(path, ...) end
+
+---The app-wide answer to a request that failed its route's `input` declaration: `function(err, req)` returning a response, where `err = { code, message, fields, errors }` (`fields` maps each path such as `body.email` to its message; `errors` lists `{ path, part, field, rule, message, params?, label? }`). A route-level `on_invalid` option wins over it.
+---@param fn fun(err: table, req: nitr.Request): nitr.Response|table
+function App:on_invalid(fn) end
 
 ---Adds app-wide middleware: a factory `fn(next) -> fn(req)`. Must be called before any route.
 ---@param mw fun(next: fun): fun(req: nitr.Request): any
@@ -192,11 +197,67 @@ function FetchResponse:read() end
 ---@class nitr.Schema
 local Schema = {}
 
----Validates a value. Returns the data (declared fields only) or nil plus `{ message, fields }` mapping each failing path to its message.
+---Validates a value. Returns the data (declared fields only, transformed) or nil plus `{ code, message, fields, errors }`: `fields` maps each failing path (`email`, `home.city`, `tags[2]`) to its message, `errors` lists `{ path, field, rule, message, params?, label? }`. Custom `check`s run in the caller's coroutine.
 ---@param value any
 ---@return table|nil _ Validated data.
 ---@return table|nil _ The error, when validation failed.
 function Schema:check(value) end
+
+---A copy with every top-level field optional — the PATCH body of a POST schema.
+---@return nitr.Schema
+function Schema:partial() end
+
+---A copy keeping only the named fields.
+---@param names string[]
+---@return nitr.Schema
+function Schema:pick(names) end
+
+---A copy without the named fields. A cross-field rule naming a dropped field fails at load.
+---@param names string[]
+---@return nitr.Schema
+function Schema:omit(names) end
+
+---A copy with fields added or replaced; `false` removes one.
+---@param fields table
+---@return nitr.Schema
+function Schema:extend(fields) end
+
+---A copy with different options (`title`, `strict`, `messages`, the cross-field groups, `checks`).
+---@param opts table
+---@return nitr.Schema
+function Schema:with(opts) end
+
+---The declared field names, sorted.
+---@return string[]
+function Schema:fields() end
+
+---A validated upload from a route's `file` rule: the bytes are spooled under `[multipart] upload_dir` and never enter the Lua heap. A file neither saved nor discarded is removed when the request ends.
+---@class nitr.File
+---@field filename string|nil The client's file name, raw (display text, never a path).
+---@field safe_filename string|nil The name reduced to one safe path segment.
+---@field extension string|nil The lowercase last suffix of `safe_filename`.
+---@field content_type string The media type as detected from the bytes (the declared header only where nothing is detectable).
+---@field size integer Bytes received.
+---@field width integer|nil Image width from the header (png, jpeg, gif, webp, bmp, tiff).
+---@field height integer|nil Image height from the header.
+local File = {}
+
+---Moves the file to `rel` inside `[multipart] upload_dir` (never outside it) and returns the path.
+---@param rel string
+---@return string
+function File:save(rel) end
+
+---The contents as a string, only for a file within `[limits] max_field_bytes`.
+---@return string
+function File:text() end
+
+---A hex digest streamed from disk (`sha256`, the default and only algorithm today).
+---@param algo? string
+---@return string
+function File:hash(algo) end
+
+---Removes the spooled file now.
+function File:discard() end
 
 ---A stateless signed-cookie session from `nitr.session`. Assign fields directly (`session.user_id = 42`).
 ---@class nitr.Session
@@ -551,13 +612,81 @@ function nitr.time.parse_http(value) end
 ---@return string
 function nitr.time.iso8601(ts) end
 
----Declarative validation, compiled once and checked in Rust. (std feature: `validate`)
+---Declarative validation, compiled once and checked in Rust. Rules are tables (`{ type = "string", min_len = 1 }`), shorthand strings (`"string|trim|min_len:1|required"`), the mixed form (`{ "string|required", message = "..." }`) or compiled schemas. Types: string, integer, number, boolean, array, table, map, any, file. Every rule has a default message; `message`/`messages` override per field, schema options `messages` per schema, `nitr.validate.messages` per app, with `{min}`-style placeholders (never `{value}`). (std feature: `validate`)
 nitr.validate = {}
 
 ---Compiles a schema.
----@param fields table `{ name = { type = ..., ... } }` rules; unknown rule keys fail at load.
+---@param fields table `{ name = rule, ... }`; unknown rule keys fail at load.
+---@param opts? table `title`, `strict`, `messages`, `at_least_one`, `mutually_exclusive`, `dependent_required`, `equal_fields`, `ordered`, `checks = { { description, check = fn(data) } }`.
 ---@return nitr.Schema
-function nitr.validate.schema(fields) end
+function nitr.validate.schema(fields, opts) end
+
+---Registers a custom string format usable as `format = name`. Per state, before the schemas that use it; built-in names and duplicates fail.
+---@param name string
+---@param spec table `{ description, check = fn(s), message?, pattern?, example? }`; `pattern` is documentation only.
+function nitr.validate.format(name, spec) end
+
+---Every format name, built in and custom, sorted.
+---@return string[]
+function nitr.validate.formats() end
+
+---App-wide default messages per rule code. At load only; a call after the application compiled raises.
+---@param messages table `{ rule = "template", summary = "..." }`.
+function nitr.validate.messages(messages) end
+
+---The table form of a shorthand rule string.
+---@param shorthand string
+---@return table
+function nitr.validate.expand(shorthand) end
+
+---The media types a `file` rule may name: `{ ["image/png"] = { extensions, family, tier, dimensions } }`.
+---@return table
+function nitr.validate.media_types() end
+
+---A `file` rule preset: png, jpeg, gif, webp, bmp; `max_bytes = "5mb"`, `max_pixels = 25000000`. `opts` overrides any key.
+---@param opts? table
+---@return table
+function nitr.validate.image(opts) end
+
+---A `file` rule preset: pdf, docx, xlsx, pptx, odt, ods, odp, rtf; `max_bytes = "20mb"`.
+---@param opts? table
+---@return table
+function nitr.validate.document(opts) end
+
+---A `file` rule preset: xlsx, ods, csv; `max_bytes = "20mb"`.
+---@param opts? table
+---@return table
+function nitr.validate.spreadsheet(opts) end
+
+---A `file` rule preset: txt, csv, md, json, xml, yaml; UTF-8 required; `max_bytes = "1mb"`.
+---@param opts? table
+---@return table
+function nitr.validate.text_file(opts) end
+
+---A `file` rule preset: zip, gzip, tar, bz2, xz, zstd, 7z; `max_bytes = "50mb"`.
+---@param opts? table
+---@return table
+function nitr.validate.archive(opts) end
+
+---A `file` rule preset: mp3, wav, ogg, flac, m4a; `max_bytes = "50mb"`.
+---@param opts? table
+---@return table
+function nitr.validate.audio(opts) end
+
+---A `file` rule preset: mp4, mov, webm, mkv; `max_bytes = "500mb"` (above the default `[limits] max_file_bytes`).
+---@param opts? table
+---@return table
+function nitr.validate.video(opts) end
+
+---A `file` rule preset: woff, woff2, ttf, otf; `max_bytes = "5mb"`.
+---@param opts? table
+---@return table
+function nitr.validate.font(opts) end
+
+---A `file` rule accepting any type; executables are still refused.
+---@param opts table `max_bytes` required.
+---@return table
+function nitr.validate.any_file(opts) end
 
 ---Base64 encoding and decoding. (std feature: `base64`)
 nitr.base64 = {}

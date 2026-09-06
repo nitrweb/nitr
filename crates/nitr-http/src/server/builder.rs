@@ -210,6 +210,11 @@ impl ServerBuilder {
         // would mean two instances rolling out at once race to change the
         // schema, each believing it is alone.
         check_migrations(&cfg)?;
+        // Spooled uploads a crashed process left behind.
+        #[cfg(feature = "multipart")]
+        if let Some(root) = &cfg.multipart.upload_dir {
+            crate::validation::spool::sweep(root);
+        }
 
         // Built once and shared by every state, including states built by
         // a later reload: a cache that empties whenever the handler script

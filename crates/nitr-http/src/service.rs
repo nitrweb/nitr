@@ -100,6 +100,10 @@ impl Service<Request<Incoming>> for Svc {
             limits: Default::default(),
             cached_form: None,
             body_limit: u64::MAX,
+            cached_body: None,
+            body_consumed: false,
+            valid: None,
+            spool_dir: None,
         };
 
         Box::pin(

@@ -91,6 +91,12 @@ jobs:
             max_len: 8192
           - target: validate-formats
             max_len: 4096
+          - target: validate-coerce
+            max_len: 4096
+          # Upload prefixes: detection reads up to 64 KiB, and a JPEG's
+          # SOF marker or a ZIP's local headers sit well past 4096.
+          - target: sniff-file
+            max_len: 65536
           - target: conditional-headers
             max_len: 4096
           # Headers and PHC hash strings, both well under the default.

@@ -54,9 +54,16 @@ pub(super) fn new_pool(
             rt.set_cfg_snapshot(snapshot)?;
         }
         set_nitr_cfg(&rt)?;
-        app::load(&rt, &cfg.handler_script, &base_statics)?;
+        app::load(&rt, &cfg.handler_script, &base_statics, &input_env(&cfg))?;
         Ok(rt)
     })
+}
+
+/// What route `input` declarations may rely on in this deployment.
+fn input_env(cfg: &Config) -> crate::validation::InputEnv {
+    crate::validation::InputEnv {
+        upload_root: cfg.multipart.upload_dir.clone().map(Arc::new),
+    }
 }
 
 /// Builds the full set of pooled runtimes: a bootstrap state runs the
@@ -91,7 +98,22 @@ pub(super) async fn build_runtimes(
         None => None,
     };
     set_nitr_cfg(&bootstrap)?;
-    app::load(&bootstrap, &cfg.handler_script, &base_statics)?;
+    let env = input_env(cfg);
+    if app::load(&bootstrap, &cfg.handler_script, &base_statics, &env)? {
+        // The disk the validated uploads of one moment may occupy, so the
+        // operator has seen the number before the first upload.
+        tracing::info!(
+            "routes declare file uploads: worst case {} on disk at once ({} workers × {} parts × {} bytes)",
+            nitr_std::validation::fmt_size(
+                (workers as u64)
+                    .saturating_mul(cfg.limits.max_form_parts as u64)
+                    .saturating_mul(cfg.limits.max_file_bytes)
+            ),
+            workers,
+            cfg.limits.max_form_parts,
+            cfg.limits.max_file_bytes,
+        );
+    }
     if workers == 1 {
         return Ok(vec![bootstrap]);
     }
@@ -107,6 +129,7 @@ pub(super) async fn build_runtimes(
         let setup_fns = setup_fns.clone();
         let modules = modules.clone();
         let cache = cache.cloned();
+        let env = env.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<Runtime>> {
             let mut runtimes = Vec::with_capacity(workers - 1);
             for _ in 1..workers {
@@ -115,7 +138,7 @@ pub(super) async fn build_runtimes(
                     rt.set_cfg_snapshot(snapshot)?;
                 }
                 set_nitr_cfg(&rt)?;
-                app::load(&rt, &cfg.handler_script, &base_statics)?;
+                app::load(&rt, &cfg.handler_script, &base_statics, &env)?;
                 runtimes.push(rt);
             }
             Ok(runtimes)

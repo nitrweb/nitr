@@ -34,6 +34,9 @@ enum Target {
         chain: Function,
         params: Vec<(String, String)>,
         error_fn: Option<Function>,
+        /// The route's `input` declaration, when it has one.
+        input: Option<(Arc<crate::validation::InputSchemas>, AnyUserData)>,
+        invalid_fn: Option<Function>,
     },
     NotFound,
     /// An `OPTIONS` on a known path with no `options` route: answered with
@@ -238,28 +241,106 @@ async fn handle_inner(
             chain,
             params,
             error_fn,
+            input,
+            invalid_fn,
         } => {
             req.params = params;
             // Read before the request moves into Lua: the dev error page
             // honors `Accept` (a curl user does not want markup).
             let wants_html = dev_mode && accepts_html(req.req.headers());
+            // A body the route does not accept is refused before any Lua
+            // runs and before the body is read.
+            let content = match &input {
+                Some((schemas, _)) => match schemas.negotiate(req.req.headers()) {
+                    Ok(content) => content,
+                    Err(accepted) => {
+                        tracing::debug!("request rejected: unsupported media type");
+                        return unsupported_media_type(&accepted);
+                    }
+                },
+                None => None,
+            };
+            // Uploads spool under the request's own directory, removed
+            // with this guard when the request ends — whatever ended it.
+            #[cfg(feature = "multipart")]
+            let _spool = match (&input, &req.limits.upload_root) {
+                (Some((schemas, _)), Some(root)) if schemas.needs_spool(content) => {
+                    let spool = crate::validation::spool::SpoolDir::new(root, &req.id);
+                    req.spool_dir = Some(spool.path().to_path_buf());
+                    Some(spool)
+                }
+                _ => None,
+            };
+            #[cfg(not(feature = "multipart"))]
+            let _ = content;
             // The request becomes a Lua value up front so the error handler
             // can receive the same object the handler saw.
             let req_ud = rt.lua().create_userdata(req)?;
-            // The `lua_handler` span: how long the script itself ran, with
-            // any `nitr.log` lines it emits nested inside. DEBUG so the
-            // decomposition is opt-in via the level filter.
-            let span = tracing::debug_span!("lua_handler", elapsed_ms = tracing::field::Empty);
-            // The clock is read only when the span is enabled; a disabled
-            // span records nothing.
-            let started = (!span.is_disabled()).then(std::time::Instant::now);
-            let called = rt
-                .call_function::<LuaTable>(chain, &req_ud)
-                .instrument(span.clone())
-                .await;
-            if let Some(started) = started {
-                span.record("elapsed_ms", started.elapsed().as_millis() as u64);
-            }
+            // Validation first, under the same budget as the handler; a
+            // failure answers here, through `on_invalid` when there is one.
+            let validated = match &input {
+                Some((_, holder)) => {
+                    let validate = app::validate_fn(rt.lua())?;
+                    rt.call_function::<LuaValue>(validate, (holder, &req_ud))
+                        .await
+                }
+                None => Ok(LuaValue::Nil),
+            };
+            let called = match validated {
+                Ok(LuaValue::Nil) => {
+                    // The `lua_handler` span: how long the script itself
+                    // ran, with any `nitr.log` lines it emits nested
+                    // inside. DEBUG so the decomposition is opt-in via the
+                    // level filter.
+                    let span =
+                        tracing::debug_span!("lua_handler", elapsed_ms = tracing::field::Empty);
+                    // The clock is read only when the span is enabled; a
+                    // disabled span records nothing.
+                    let started = (!span.is_disabled()).then(std::time::Instant::now);
+                    let called = rt
+                        .call_function::<LuaTable>(chain, &req_ud)
+                        .instrument(span.clone())
+                        .await;
+                    if let Some(started) = started {
+                        span.record("elapsed_ms", started.elapsed().as_millis() as u64);
+                    }
+                    called
+                }
+                Ok(LuaValue::Table(failure)) => {
+                    tracing::debug!("request rejected: input validation failed");
+                    let hooked = match invalid_fn {
+                        Some(hook) => {
+                            match rt
+                                .call_function::<LuaTable>(hook, (failure.clone(), &req_ud))
+                                .await
+                            {
+                                Ok(lua_resp) => match to_response(lua_resp) {
+                                    Ok(resp) => Some(resp),
+                                    Err(err) => {
+                                        tracing::error!("invalid on_invalid response: {err}");
+                                        None
+                                    }
+                                },
+                                Err(err) => {
+                                    tracing::error!("the on_invalid handler failed: {err}");
+                                    None
+                                }
+                            }
+                        }
+                        None => None,
+                    };
+                    discard_body(&req_ud);
+                    return match hooked {
+                        Some(resp) => Ok(resp),
+                        None => unprocessable(rt.lua(), failure),
+                    };
+                }
+                Ok(other) => Err(Error::Script(format!(
+                    "input validation returned {}, expected nil or a table",
+                    other.type_name()
+                ))),
+                Err(err) => Err(err),
+            };
             let err = match called {
                 // `finish` releases the body itself: a streaming body may
                 // still be reading from the request.
@@ -330,6 +411,37 @@ async fn handle_inner(
             }
         }
     }
+}
+
+/// The 415 for a body the route's `input` does not accept, naming what it
+/// does.
+fn unsupported_media_type(accepted: &str) -> Result<HttpResponse> {
+    let body = serde_json::json!({
+        "code": "UNSUPPORTED_MEDIA_TYPE",
+        "message": format!("unsupported media type; accepted: {accepted}"),
+        "accepted": accepted.split(", ").collect::<Vec<_>>(),
+    });
+    let mut resp = json_response(StatusCode::UNSUPPORTED_MEDIA_TYPE, &body)?;
+    if let Ok(value) = header::HeaderValue::from_str(accepted) {
+        resp.headers_mut().insert(header::ACCEPT, value);
+    }
+    Ok(resp)
+}
+
+/// The default 422: the validation failure table as JSON.
+fn unprocessable(lua: &mlua::Lua, failure: LuaTable) -> Result<HttpResponse> {
+    use mlua::LuaSerdeExt as _;
+    let body: serde_json::Value = lua.from_value(LuaValue::Table(failure))?;
+    json_response(StatusCode::UNPROCESSABLE_ENTITY, &body)
+}
+
+fn json_response(status: StatusCode, body: &serde_json::Value) -> Result<HttpResponse> {
+    use http_body_util::Full;
+    let bytes = serde_json::to_vec(body).map_err(|err| Error::Script(err.to_string()))?;
+    Ok(Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(bytes)).boxed())?)
 }
 
 /// Releases the unread remainder of the request body once nothing will read
@@ -424,6 +536,8 @@ async fn resolve(
                         // Resolved at compile time: the route's own handler
                         // first, the app-wide one as fallback.
                         error_fn: app.chains[idx].error_fn.clone(),
+                        input: app.chains[idx].input.clone(),
+                        invalid_fn: app.chains[idx].invalid_fn.clone(),
                     },
                     None if *method == Method::OPTIONS => {
                         Target::Options(matched.value.keys().cloned().collect())

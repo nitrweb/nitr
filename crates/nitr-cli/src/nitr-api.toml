@@ -35,6 +35,7 @@ fields = [
   { name = "remote_addr", type = "string", desc = "Peer address (`\"ip:port\"`)." },
   { name = "uri", type = "table", desc = "URI components: `scheme`, `host`, `port`, `path`, `authority`, `query`." },
   { name = "cookies", type = "nitr.RequestCookies", desc = "Parsed request cookies." },
+  { name = "valid", type = "table|nil", desc = "The route's validated input — `{ body, query, params, headers }` as its `input` declaration coerced, stripped and normalized them; nil on routes without `input`." },
 ]
 
 [[fn]]
@@ -132,7 +133,7 @@ desc = "The application: routes, middleware, error handling, static mounts. Retu
 
 [[fn]]
 name = "nitr.App:get"
-desc = "Registers a GET route: `middleware..., handler` plus an optional trailing `{ on_error = fn }`. Paths take `:name` parameters and a trailing `*` catch-all."
+desc = "Registers a GET route: `middleware..., handler` plus an optional trailing options table `{ input = {...}, on_invalid = fn, on_error = fn }`. `input` declares schemas for `body` (a schema, or `{ schema = S, content = { \"json\", \"form\", \"multipart\" } }`, or `{ file = R, content = { \"raw\" } }`), `query`, `params` and `headers`, enforced in Rust before the handler and exposed as `req.valid`; a failure answers a JSON 422 unless `on_invalid` says otherwise. Paths take `:name` parameters and a trailing `*` catch-all."
 params = [
   { name = "path", type = "string" },
   { name = "...", type = "fun(req: nitr.Request): nitr.Response|table" },
@@ -185,6 +186,11 @@ params = [
   { name = "path", type = "string" },
   { name = "...", type = "fun(req: nitr.Request): nitr.Response|table" },
 ]
+
+[[fn]]
+name = "nitr.App:on_invalid"
+desc = "The app-wide answer to a request that failed its route's `input` declaration: `function(err, req)` returning a response, where `err = { code, message, fields, errors }` (`fields` maps each path such as `body.email` to its message; `errors` lists `{ path, part, field, rule, message, params?, label? }`). A route-level `on_invalid` option wins over it."
+params = [{ name = "fn", type = "fun(err: table, req: nitr.Request): nitr.Response|table" }]
 
 [[fn]]
 name = "nitr.App:use"
@@ -270,12 +276,80 @@ desc = "A compiled validation schema from `nitr.validate.schema`."
 
 [[fn]]
 name = "nitr.Schema:check"
-desc = "Validates a value. Returns the data (declared fields only) or nil plus `{ message, fields }` mapping each failing path to its message."
+desc = "Validates a value. Returns the data (declared fields only, transformed) or nil plus `{ code, message, fields, errors }`: `fields` maps each failing path (`email`, `home.city`, `tags[2]`) to its message, `errors` lists `{ path, field, rule, message, params?, label? }`. Custom `check`s run in the caller's coroutine."
 params = [{ name = "value", type = "any" }]
 returns = [
   { type = "table|nil", desc = "Validated data." },
   { type = "table|nil", desc = "The error, when validation failed." },
 ]
+
+[[fn]]
+name = "nitr.Schema:partial"
+desc = "A copy with every top-level field optional — the PATCH body of a POST schema."
+returns = [{ type = "nitr.Schema" }]
+
+[[fn]]
+name = "nitr.Schema:pick"
+desc = "A copy keeping only the named fields."
+params = [{ name = "names", type = "string[]" }]
+returns = [{ type = "nitr.Schema" }]
+
+[[fn]]
+name = "nitr.Schema:omit"
+desc = "A copy without the named fields. A cross-field rule naming a dropped field fails at load."
+params = [{ name = "names", type = "string[]" }]
+returns = [{ type = "nitr.Schema" }]
+
+[[fn]]
+name = "nitr.Schema:extend"
+desc = "A copy with fields added or replaced; `false` removes one."
+params = [{ name = "fields", type = "table" }]
+returns = [{ type = "nitr.Schema" }]
+
+[[fn]]
+name = "nitr.Schema:with"
+desc = "A copy with different options (`title`, `strict`, `messages`, the cross-field groups, `checks`)."
+params = [{ name = "opts", type = "table" }]
+returns = [{ type = "nitr.Schema" }]
+
+[[fn]]
+name = "nitr.Schema:fields"
+desc = "The declared field names, sorted."
+returns = [{ type = "string[]" }]
+
+[[class]]
+name = "nitr.File"
+desc = "A validated upload from a route's `file` rule: the bytes are spooled under `[multipart] upload_dir` and never enter the Lua heap. A file neither saved nor discarded is removed when the request ends."
+fields = [
+  { name = "filename", type = "string|nil", desc = "The client's file name, raw (display text, never a path)." },
+  { name = "safe_filename", type = "string|nil", desc = "The name reduced to one safe path segment." },
+  { name = "extension", type = "string|nil", desc = "The lowercase last suffix of `safe_filename`." },
+  { name = "content_type", type = "string", desc = "The media type as detected from the bytes (the declared header only where nothing is detectable)." },
+  { name = "size", type = "integer", desc = "Bytes received." },
+  { name = "width", type = "integer|nil", desc = "Image width from the header (png, jpeg, gif, webp, bmp, tiff)." },
+  { name = "height", type = "integer|nil", desc = "Image height from the header." },
+]
+
+[[fn]]
+name = "nitr.File:save"
+desc = "Moves the file to `rel` inside `[multipart] upload_dir` (never outside it) and returns the path."
+params = [{ name = "rel", type = "string" }]
+returns = [{ type = "string" }]
+
+[[fn]]
+name = "nitr.File:text"
+desc = "The contents as a string, only for a file within `[limits] max_field_bytes`."
+returns = [{ type = "string" }]
+
+[[fn]]
+name = "nitr.File:hash"
+desc = "A hex digest streamed from disk (`sha256`, the default and only algorithm today)."
+params = [{ name = "algo", type = "string?" }]
+returns = [{ type = "string" }]
+
+[[fn]]
+name = "nitr.File:discard"
+desc = "Removes the spooled file now."
 
 [[class]]
 name = "nitr.Session"
@@ -541,9 +615,23 @@ functions = [
 [[table]]
 name = "nitr.validate"
 feature = "validate"
-desc = "Declarative validation, compiled once and checked in Rust."
+desc = "Declarative validation, compiled once and checked in Rust. Rules are tables (`{ type = \"string\", min_len = 1 }`), shorthand strings (`\"string|trim|min_len:1|required\"`), the mixed form (`{ \"string|required\", message = \"...\" }`) or compiled schemas. Types: string, integer, number, boolean, array, table, map, any, file. Every rule has a default message; `message`/`messages` override per field, schema options `messages` per schema, `nitr.validate.messages` per app, with `{min}`-style placeholders (never `{value}`)."
 functions = [
-  { name = "schema", params = [{ name = "fields", type = "table", desc = "`{ name = { type = ..., ... } }` rules; unknown rule keys fail at load." }], returns = [{ type = "nitr.Schema" }], desc = "Compiles a schema." },
+  { name = "schema", params = [{ name = "fields", type = "table", desc = "`{ name = rule, ... }`; unknown rule keys fail at load." }, { name = "opts", type = "table?", desc = "`title`, `strict`, `messages`, `at_least_one`, `mutually_exclusive`, `dependent_required`, `equal_fields`, `ordered`, `checks = { { description, check = fn(data) } }`." }], returns = [{ type = "nitr.Schema" }], desc = "Compiles a schema." },
+  { name = "format", params = [{ name = "name", type = "string" }, { name = "spec", type = "table", desc = "`{ description, check = fn(s), message?, pattern?, example? }`; `pattern` is documentation only." }], desc = "Registers a custom string format usable as `format = name`. Per state, before the schemas that use it; built-in names and duplicates fail." },
+  { name = "formats", returns = [{ type = "string[]" }], desc = "Every format name, built in and custom, sorted." },
+  { name = "messages", params = [{ name = "messages", type = "table", desc = "`{ rule = \"template\", summary = \"...\" }`." }], desc = "App-wide default messages per rule code. At load only; a call after the application compiled raises." },
+  { name = "expand", params = [{ name = "shorthand", type = "string" }], returns = [{ type = "table" }], desc = "The table form of a shorthand rule string." },
+  { name = "media_types", returns = [{ type = "table" }], desc = "The media types a `file` rule may name: `{ [\"image/png\"] = { extensions, family, tier, dimensions } }`." },
+  { name = "image", params = [{ name = "opts", type = "table?" }], returns = [{ type = "table" }], desc = "A `file` rule preset: png, jpeg, gif, webp, bmp; `max_bytes = \"5mb\"`, `max_pixels = 25000000`. `opts` overrides any key." },
+  { name = "document", params = [{ name = "opts", type = "table?" }], returns = [{ type = "table" }], desc = "A `file` rule preset: pdf, docx, xlsx, pptx, odt, ods, odp, rtf; `max_bytes = \"20mb\"`." },
+  { name = "spreadsheet", params = [{ name = "opts", type = "table?" }], returns = [{ type = "table" }], desc = "A `file` rule preset: xlsx, ods, csv; `max_bytes = \"20mb\"`." },
+  { name = "text_file", params = [{ name = "opts", type = "table?" }], returns = [{ type = "table" }], desc = "A `file` rule preset: txt, csv, md, json, xml, yaml; UTF-8 required; `max_bytes = \"1mb\"`." },
+  { name = "archive", params = [{ name = "opts", type = "table?" }], returns = [{ type = "table" }], desc = "A `file` rule preset: zip, gzip, tar, bz2, xz, zstd, 7z; `max_bytes = \"50mb\"`." },
+  { name = "audio", params = [{ name = "opts", type = "table?" }], returns = [{ type = "table" }], desc = "A `file` rule preset: mp3, wav, ogg, flac, m4a; `max_bytes = \"50mb\"`." },
+  { name = "video", params = [{ name = "opts", type = "table?" }], returns = [{ type = "table" }], desc = "A `file` rule preset: mp4, mov, webm, mkv; `max_bytes = \"500mb\"` (above the default `[limits] max_file_bytes`)." },
+  { name = "font", params = [{ name = "opts", type = "table?" }], returns = [{ type = "table" }], desc = "A `file` rule preset: woff, woff2, ttf, otf; `max_bytes = \"5mb\"`." },
+  { name = "any_file", params = [{ name = "opts", type = "table", desc = "`max_bytes` required." }], returns = [{ type = "table" }], desc = "A `file` rule accepting any type; executables are still refused." },
 ]
 
 [[table]]

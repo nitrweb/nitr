@@ -46,6 +46,21 @@ pub(crate) mod utils;
 pub(crate) mod validate;
 
 pub use cache::{Cache, CacheOptions};
+
+/// The validation engine as the server uses it: compiled schemas for route
+/// `input` declarations, text coercion, the error shape, and the
+/// `nitr.File` handle for validated uploads.
+pub mod validation {
+    pub use crate::validate::media::{
+        Detection, MediaType, SNIFF_BYTES, detect, dimensions, executable_extension, is_text,
+        lookup, text_subtype_matches,
+    };
+    pub use crate::validate::message::fmt_size;
+    pub use crate::validate::{
+        CompiledSchema, ErrorEntry, FileInfo, LuaFile, SaveResolver, TextValue, ValidationError,
+        compile_file_rule, compile_schema, compile_text_schema, freeze_messages,
+    };
+}
 // The configuration types are always available: `nitr.toml` has one shape
 // regardless of which builtins this build compiled in.
 pub use config::{EnvOptions, FetchOptions, MAX_PASSWORD_BYTES, SqlitePragmas};
@@ -67,7 +82,9 @@ pub mod fuzzing {
     // Also driven by the `bounds_guard` benchmark, which measures the
     // guard's own walk against the serialization it precedes.
     pub use crate::utils::check_json_bounds;
+    pub use crate::validate::coerce_for_fuzzing;
     pub use crate::validate::format::{check_format, format_names};
+    pub use crate::validate::media::{detect as sniff_file, dimensions as sniff_dimensions};
 }
 
 #[cfg(feature = "db")]

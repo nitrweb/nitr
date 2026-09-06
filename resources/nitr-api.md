@@ -156,9 +156,23 @@ Safe clocks and time formatting (UTC), so scripts never need the `os` library fo
 
 ### `nitr.validate` (std feature: `validate`)
 
-Declarative validation, compiled once and checked in Rust.
+Declarative validation, compiled once and checked in Rust. Rules are tables (`{ type = "string", min_len = 1 }`), shorthand strings (`"string|trim|min_len:1|required"`), the mixed form (`{ "string|required", message = "..." }`) or compiled schemas. Types: string, integer, number, boolean, array, table, map, any, file. Every rule has a default message; `message`/`messages` override per field, schema options `messages` per schema, `nitr.validate.messages` per app, with `{min}`-style placeholders (never `{value}`).
 
-- `nitr.validate.schema(fields) -> nitr.Schema` — Compiles a schema.
+- `nitr.validate.schema(fields, opts) -> nitr.Schema` — Compiles a schema.
+- `nitr.validate.format(name, spec)` — Registers a custom string format usable as `format = name`. Per state, before the schemas that use it; built-in names and duplicates fail.
+- `nitr.validate.formats() -> string[]` — Every format name, built in and custom, sorted.
+- `nitr.validate.messages(messages)` — App-wide default messages per rule code. At load only; a call after the application compiled raises.
+- `nitr.validate.expand(shorthand) -> table` — The table form of a shorthand rule string.
+- `nitr.validate.media_types() -> table` — The media types a `file` rule may name: `{ ["image/png"] = { extensions, family, tier, dimensions } }`.
+- `nitr.validate.image(opts) -> table` — A `file` rule preset: png, jpeg, gif, webp, bmp; `max_bytes = "5mb"`, `max_pixels = 25000000`. `opts` overrides any key.
+- `nitr.validate.document(opts) -> table` — A `file` rule preset: pdf, docx, xlsx, pptx, odt, ods, odp, rtf; `max_bytes = "20mb"`.
+- `nitr.validate.spreadsheet(opts) -> table` — A `file` rule preset: xlsx, ods, csv; `max_bytes = "20mb"`.
+- `nitr.validate.text_file(opts) -> table` — A `file` rule preset: txt, csv, md, json, xml, yaml; UTF-8 required; `max_bytes = "1mb"`.
+- `nitr.validate.archive(opts) -> table` — A `file` rule preset: zip, gzip, tar, bz2, xz, zstd, 7z; `max_bytes = "50mb"`.
+- `nitr.validate.audio(opts) -> table` — A `file` rule preset: mp3, wav, ogg, flac, m4a; `max_bytes = "50mb"`.
+- `nitr.validate.video(opts) -> table` — A `file` rule preset: mp4, mov, webm, mkv; `max_bytes = "500mb"` (above the default `[limits] max_file_bytes`).
+- `nitr.validate.font(opts) -> table` — A `file` rule preset: woff, woff2, ttf, otf; `max_bytes = "5mb"`.
+- `nitr.validate.any_file(opts) -> table` — A `file` rule accepting any type; executables are still refused.
 
 ### `nitr.base64` (std feature: `base64`)
 
@@ -231,6 +245,7 @@ The incoming request, passed to every handler and middleware.
 - `remote_addr: string` — Peer address (`"ip:port"`).
 - `uri: table` — URI components: `scheme`, `host`, `port`, `path`, `authority`, `query`.
 - `cookies: nitr.RequestCookies` — Parsed request cookies.
+- `valid: table|nil` — The route's validated input — `{ body, query, params, headers }` as its `input` declaration coerced, stripped and normalized them; nil on routes without `input`.
 - `:json() -> table` — Reads and decodes the body as JSON. Errors on an empty or invalid body.
 - `:text() -> string` — Reads the whole body as a string.
 - `:form() -> table<string, string>` — Reads an `application/x-www-form-urlencoded` body as a table. The parse is cached, so middleware and handler can both call it.
@@ -265,13 +280,14 @@ Builder for `Set-Cookie` headers on a response.
 
 The application: routes, middleware, error handling, static mounts. Return it from the handler script.
 
-- `:get(path, ...)` — Registers a GET route: `middleware..., handler` plus an optional trailing `{ on_error = fn }`. Paths take `:name` parameters and a trailing `*` catch-all.
+- `:get(path, ...)` — Registers a GET route: `middleware..., handler` plus an optional trailing options table `{ input = {...}, on_invalid = fn, on_error = fn }`. `input` declares schemas for `body` (a schema, or `{ schema = S, content = { "json", "form", "multipart" } }`, or `{ file = R, content = { "raw" } }`), `query`, `params` and `headers`, enforced in Rust before the handler and exposed as `req.valid`; a failure answers a JSON 422 unless `on_invalid` says otherwise. Paths take `:name` parameters and a trailing `*` catch-all.
 - `:post(path, ...)` — Registers a POST route (see `get`).
 - `:put(path, ...)` — Registers a PUT route (see `get`).
 - `:delete(path, ...)` — Registers a DELETE route (see `get`).
 - `:patch(path, ...)` — Registers a PATCH route (see `get`).
 - `:head(path, ...)` — Registers a HEAD route (see `get`). Without one, HEAD reuses the GET route with the body stripped.
 - `:options(path, ...)` — Registers an OPTIONS route (see `get`). Without one, OPTIONS answers 204 with `Allow`.
+- `:on_invalid(fn)` — The app-wide answer to a request that failed its route's `input` declaration: `function(err, req)` returning a response, where `err = { code, message, fields, errors }` (`fields` maps each path such as `body.email` to its message; `errors` lists `{ path, part, field, rule, message, params?, label? }`). A route-level `on_invalid` option wins over it.
 - `:use(mw)` — Adds app-wide middleware: a factory `fn(next) -> fn(req)`. Must be called before any route.
 - `:on_error(handler)` — Sets the app-wide error handler: `fn(err, req)` where `err` is the structured error (`kind`, `message`, `source`, `line`, `traceback`, ...).
 - `:static(mount, dir, opts)` — Mounts a static directory, served in Rust. Options: `{ spa = boolean, cache_control = string, dotfiles = boolean }` — dotfiles are hidden unless `dotfiles = true` (`.well-known/` is always served).
@@ -309,7 +325,29 @@ An outbound response.
 
 A compiled validation schema from `nitr.validate.schema`.
 
-- `:check(value) -> table|nil, table|nil` — Validates a value. Returns the data (declared fields only) or nil plus `{ message, fields }` mapping each failing path to its message.
+- `:check(value) -> table|nil, table|nil` — Validates a value. Returns the data (declared fields only, transformed) or nil plus `{ code, message, fields, errors }`: `fields` maps each failing path (`email`, `home.city`, `tags[2]`) to its message, `errors` lists `{ path, field, rule, message, params?, label? }`. Custom `check`s run in the caller's coroutine.
+- `:partial() -> nitr.Schema` — A copy with every top-level field optional — the PATCH body of a POST schema.
+- `:pick(names) -> nitr.Schema` — A copy keeping only the named fields.
+- `:omit(names) -> nitr.Schema` — A copy without the named fields. A cross-field rule naming a dropped field fails at load.
+- `:extend(fields) -> nitr.Schema` — A copy with fields added or replaced; `false` removes one.
+- `:with(opts) -> nitr.Schema` — A copy with different options (`title`, `strict`, `messages`, the cross-field groups, `checks`).
+- `:fields() -> string[]` — The declared field names, sorted.
+
+### `nitr.File`
+
+A validated upload from a route's `file` rule: the bytes are spooled under `[multipart] upload_dir` and never enter the Lua heap. A file neither saved nor discarded is removed when the request ends.
+
+- `filename: string|nil` — The client's file name, raw (display text, never a path).
+- `safe_filename: string|nil` — The name reduced to one safe path segment.
+- `extension: string|nil` — The lowercase last suffix of `safe_filename`.
+- `content_type: string` — The media type as detected from the bytes (the declared header only where nothing is detectable).
+- `size: integer` — Bytes received.
+- `width: integer|nil` — Image width from the header (png, jpeg, gif, webp, bmp, tiff).
+- `height: integer|nil` — Image height from the header.
+- `:save(rel) -> string` — Moves the file to `rel` inside `[multipart] upload_dir` (never outside it) and returns the path.
+- `:text() -> string` — The contents as a string, only for a file within `[limits] max_field_bytes`.
+- `:hash(algo) -> string` — A hex digest streamed from disk (`sha256`, the default and only algorithm today).
+- `:discard()` — Removes the spooled file now.
 
 ### `nitr.Session`
 

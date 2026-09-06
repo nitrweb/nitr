@@ -361,6 +361,10 @@ mod tests {
             )
             .expect("request");
         LuaRequest {
+            cached_body: None,
+            body_consumed: false,
+            valid: None,
+            spool_dir: None,
             peer_addr: format!("{peer}:1234").parse().expect("addr"),
             req,
             params: Vec::new(),

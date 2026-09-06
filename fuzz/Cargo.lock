@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "nitr-core"
-version = "0.0.0-beta.3"
+version = "0.0.0-beta.4"
 dependencies = [
  "async-channel",
  "http",
@@ -1143,7 +1143,7 @@ dependencies = [
 
 [[package]]
 name = "nitr-http"
-version = "0.0.0-beta.3"
+version = "0.0.0-beta.4"
 dependencies = [
  "async-channel",
  "brotli",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "nitr-std"
-version = "0.0.0-beta.3"
+version = "0.0.0-beta.4"
 dependencies = [
  "argon2",
  "base64 0.23.1",
