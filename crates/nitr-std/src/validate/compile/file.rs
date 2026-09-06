@@ -37,6 +37,14 @@ fn compile_types(rule: &Table, path: &str) -> mlua::Result<Vec<TypePattern>> {
                         ),
                     ));
                 }
+                if media::is_active_content(other) {
+                    tracing::warn!(
+                        rule = %path,
+                        media_type = other,
+                        "the rule accepts active content: a browser runs script from such a \
+                         file, so never serve it back from a static root or inline"
+                    );
+                }
                 TypePattern::Exact(other.to_string())
             }
         });

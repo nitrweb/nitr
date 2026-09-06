@@ -88,6 +88,21 @@ app:get("/plain", function(req)
     return nitr.json({ valid = req.valid })
 end)
 
+app:post("/html", function(req)
+    return nitr.json({ ok = true })
+end, { input = { body = { a = { "string|max_len:2", message = "<b>too long</b> & \"quoted\"" } } } })
+
+app:post("/many", function(req)
+    return nitr.json({ n = #req.valid.body.items })
+end, {
+    input = { body = { items = { "array", items = { "integer", description = "slow",
+        check = function(v) local s = 0 for i = 1, 20000 do s = s + i end return true end } } } },
+})
+
+app:get("/bytes", function(req)
+    return nitr.json({ tags = req.valid.query.tags, q = req.valid.query.q })
+end, { input = { query = { tags = { "array", items = "string|format:slug" }, q = "string" } } })
+
 app:on_error(function(err, req)
     return nitr.error(500, { code = "HANDLER", kind = err.kind, message = err.message })
 end)
@@ -464,6 +479,29 @@ app:post("/legacy", function(req)
     return nitr.json({ parts = n })
 end, { input = { body = { schema = { name = "string" }, content = { "multipart" } } } })
 
+app:post("/vector", function(req)
+    local f = req.valid.body.file
+    return nitr.json({ type = f and f.content_type })
+end, { input = { body = { schema = { file = "file|max_bytes:64kb|types:image/*" }, content = { "multipart" } } } })
+
+app:post("/vector-named", function(req)
+    local f = req.valid.body.file
+    return nitr.json({ type = f and f.content_type })
+end, { input = { body = { schema = { file = "file|max_bytes:64kb|types:image/svg+xml" }, content = { "multipart" } } } })
+
+app:put("/octet", function(req)
+    local f = req.valid.body
+    return nitr.json({ type = f.content_type, size = f.size })
+end, { input = { body = { file = { type = "file", types = { "application/octet-stream" }, max_bytes = "1mb" }, content = { "raw" } } } })
+
+app:post("/hang", function(req)
+    while true do end
+end, { input = { body = { schema = { avatar = S.image({ max_bytes = "1mb" }) }, content = { "multipart" } } } })
+
+app:on_error(function(err, req)
+    return nitr.error(500, { code = "HANDLER", kind = err.kind, message = err.message })
+end)
+
 return app
 "#;
 
@@ -566,7 +604,7 @@ return app
         assert_eq!(json["csv"], "id,name\n1,ada\n");
         let saved = json["saved"].as_str().expect("saved path");
         assert!(std::path::Path::new(saved).is_file(), "{saved}");
-        assert!(saved.starts_with(server.dir().join("uploads").to_str().unwrap()));
+        assert!(std::path::Path::new(saved).starts_with(server.dir().join("uploads")));
         // Only the saved file remains under the upload root: the docs and
         // csv temporaries go with the request (removed off the request
         // thread, so poll briefly), the sneaky exe was never stored.
@@ -575,7 +613,7 @@ return app
         let names = loop {
             let mut names: Vec<String> = walk(&uploads)
                 .into_iter()
-                .map(|p| p.strip_prefix(&uploads).unwrap().display().to_string())
+                .map(|p| rel(&p, &uploads))
                 .collect();
             names.sort();
             if names.iter().all(|n| !n.starts_with(".nitr-tmp"))
@@ -681,11 +719,13 @@ return app
         assert_eq!(json["type"], "application/gzip");
         assert_eq!(json["size"], gz.len());
         assert_eq!(json["name"], "backup.tar.gz");
+        // `save` returns the native path: compare by components, not by
+        // separator (a `/` literal fails on Windows).
         assert!(
+            std::path::Path::new(json["saved"].as_str().unwrap())
+                .ends_with(std::path::Path::new("blobs").join("backup.tar.gz")),
+            "{}",
             json["saved"]
-                .as_str()
-                .unwrap()
-                .ends_with("blobs/backup.tar.gz")
         );
 
         let resp = server
@@ -739,6 +779,323 @@ return app
             .expect_err("must not build")
             .to_string();
         assert!(err.contains("[multipart] upload_dir"), "{err}");
+    }
+
+    /// The shapes a browser's `FormData` produces that a hand-written
+    /// client never would (F27): `append("photo", blob)` names the file
+    /// `blob`, `file.type === ""` sends no part type, an empty
+    /// `<input type=file>` sends an empty part with an empty filename,
+    /// and filenames are whatever the OS allowed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn browser_form_data_shapes_are_handled() {
+        let mut server = TestServer::builder("validation-upload")
+            .upload_dir()
+            .handler(UPLOAD_APP)
+            .spawn()
+            .await;
+        std::fs::create_dir_all(server.dir().join("uploads/avatars")).expect("mkdir");
+
+        // `formData.append("avatar", blob)`: the filename is `blob`.
+        let (status, json) = post_multipart(
+            &server,
+            "/profile",
+            &[
+                ("name", None, None, b"Ada"),
+                (
+                    "avatar",
+                    Some("blob"),
+                    Some("application/octet-stream"),
+                    PNG,
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(status, 422, "{json}");
+        assert_eq!(json["errors"][0]["rule"], "extensions", "{json}");
+
+        // `file.type === ""`: no part Content-Type; the bytes decide.
+        let (status, json) = post_multipart(
+            &server,
+            "/profile",
+            &[
+                ("name", None, None, b"Ada"),
+                ("avatar", Some("me.png"), None, PNG),
+            ],
+        )
+        .await;
+        assert_eq!(status, 200, "{json}");
+        assert_eq!(json["type"], "image/png");
+
+        // An empty `<input type=file>`: empty filename, empty body → absent.
+        let (status, json) = post_multipart(
+            &server,
+            "/profile",
+            &[
+                ("name", None, None, b"Ada"),
+                ("avatar", Some(""), Some("application/octet-stream"), b""),
+            ],
+        )
+        .await;
+        assert_eq!(status, 200, "{json}");
+        assert!(json["saved"].is_null(), "{json}");
+
+        // Names the OS allowed: long, traversing, with separators or a
+        // right-to-left override. Each is reduced to one safe segment.
+        let long = format!("{}.png", "a".repeat(4000));
+        for name in [
+            long.as_str(),
+            "../../evil.png",
+            "a/b\\c.png",
+            "\u{202E}gnp.exe.png",
+            " photo .png ",
+        ] {
+            let (status, json) = post_multipart(
+                &server,
+                "/profile",
+                &[
+                    ("name", None, None, b"Ada"),
+                    ("avatar", Some(name), Some("image/png"), PNG),
+                ],
+            )
+            .await;
+            assert_eq!(status, 200, "{name:?}: {json}");
+            let saved = json["saved"].as_str().expect("saved path");
+            let saved_path = std::path::Path::new(saved);
+            let avatars = server.dir().join("uploads/avatars");
+            assert!(
+                saved_path.starts_with(&avatars),
+                "{name:?} saved at {saved}"
+            );
+            let base = saved_path.file_name().unwrap().to_string_lossy();
+            assert!(base.len() <= 255, "{name:?} → {} bytes", base.len());
+            for forbidden in ["..", "/", "\\", "\u{202E}"] {
+                assert!(!base.contains(forbidden), "{name:?} → {base}");
+            }
+            assert!(base.ends_with(".png"), "{name:?} → {base}");
+        }
+
+        // A NUL in a part header is not a multipart body at all: a 422 on
+        // the body itself (the `multipart` rule), never a 500, and nothing
+        // spooled.
+        let (content_type, mut body) = multipart(&[("name", None, None, b"Ada")]);
+        let boundary = content_type.split("boundary=").nth(1).unwrap().to_string();
+        let tail = format!("--{boundary}--\r\n");
+        body.truncate(body.len() - tail.len());
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"avatar\"; filename=\"a\0b.png\"\r\nContent-Type: image/png\r\n\r\n");
+        body.extend_from_slice(PNG);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let resp = server
+            .client()
+            .post(server.url("/profile"))
+            .header("content-type", content_type)
+            .body(body)
+            .send()
+            .await
+            .expect("post");
+        let status = resp.status().as_u16();
+        let text = resp.text().await.expect("body");
+        assert_eq!(status, 422, "{text}");
+        let json: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(json["errors"][0]["rule"], "multipart", "{text}");
+        assert_eq!(json["errors"][0]["path"], "body", "{text}");
+        assert!(walk(&server.dir().join("uploads/.nitr-tmp")).is_empty());
+        server.stop().await;
+    }
+
+    /// Temporaries never outlive their request (F7): a client that
+    /// disconnects mid-upload, and a handler that times out after the
+    /// upload validated, both leave `.nitr-tmp` empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn temporaries_are_removed_on_disconnect_and_on_handler_timeout() {
+        use tokio::io::AsyncWriteExt;
+        let mut server = TestServer::builder("validation-upload")
+            .upload_dir()
+            .handler(UPLOAD_APP)
+            .config(|cfg| {
+                cfg.workers = 1;
+                cfg.lua.exec_timeout_ms = 500;
+                cfg.limits.pool_wait_ms = 500;
+                cfg.limits.body_read_ms = 300;
+            })
+            .spawn()
+            .await;
+        let tmp = server.dir().join("uploads/.nitr-tmp");
+
+        // Headers, the name part, and the first bytes of a file part —
+        // then the socket closes.
+        let (content_type, full) = multipart(&[
+            ("name", None, None, b"Ada"),
+            (
+                "avatar",
+                Some("me.png"),
+                Some("image/png"),
+                &[PNG, &[0u8; 4096]].concat(),
+            ),
+        ]);
+        let cut = full.len() - 2048;
+        let mut sock = tokio::net::TcpStream::connect(server.addr())
+            .await
+            .expect("connect");
+        sock.write_all(
+            format!(
+                "POST /profile HTTP/1.1\r\nHost: localhost\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+                full.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write headers");
+        sock.write_all(&full[..cut])
+            .await
+            .expect("write partial body");
+        drop(sock);
+        // The read guard notices within `body_read_ms`; the guard's Drop
+        // removes the directory.
+        let mut left = walk(&tmp);
+        for _ in 0..40 {
+            if left.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            left = walk(&tmp);
+        }
+        assert!(left.is_empty(), "left behind after a disconnect: {left:?}");
+
+        // A handler that spins after a valid upload: the budget answers
+        // 500, and the temporaries go with the request.
+        let (status, json) = post_multipart(
+            &server,
+            "/hang",
+            &[("avatar", Some("me.png"), Some("image/png"), PNG)],
+        )
+        .await;
+        assert_eq!(status, 500, "{json}");
+        assert_eq!(json["kind"], "timeout", "{json}");
+        assert!(
+            walk(&tmp).is_empty(),
+            "left behind after a timeout: {:?}",
+            walk(&tmp)
+        );
+
+        // And the state is fine.
+        let (status, _) =
+            post_multipart(&server, "/profile", &[("name", None, None, b"Ada")]).await;
+        assert_eq!(status, 200);
+        server.stop().await;
+    }
+
+    /// `file:text()` is bounded by `[limits] max_field_bytes` (F13): a
+    /// bigger file raises with the limit named, never fills the heap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn file_text_refuses_above_the_field_limit() {
+        let mut server = TestServer::builder("validation-upload")
+            .upload_dir()
+            .handler(UPLOAD_APP)
+            .config(|cfg| cfg.limits.max_field_bytes = 1024)
+            .spawn()
+            .await;
+        let csv = "id,name\n".repeat(300);
+        let (status, json) = post_multipart(
+            &server,
+            "/profile",
+            &[
+                ("name", None, None, b"Ada"),
+                ("data", Some("rows.csv"), Some("text/csv"), csv.as_bytes()),
+            ],
+        )
+        .await;
+        assert_eq!(status, 500, "{json}");
+        let message = json["message"].as_str().unwrap_or_default();
+        assert!(message.contains("max_field_bytes"), "{json}");
+        assert!(message.contains("1024"), "{json}");
+        server.stop().await;
+    }
+
+    /// An SVG is active content (F24): `image/*` never matches it, only a
+    /// rule naming `image/svg+xml` takes it, and the `image` preset does
+    /// not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn svg_is_only_accepted_by_name() {
+        let mut server = TestServer::builder("validation-upload")
+            .upload_dir()
+            .handler(UPLOAD_APP)
+            .spawn()
+            .await;
+        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>";
+        let part: Part<'_> = ("file", Some("logo.svg"), Some("image/svg+xml"), svg);
+        let (status, json) = post_multipart(&server, "/vector", &[part]).await;
+        assert_eq!(status, 422, "{json}");
+        assert_eq!(json["errors"][0]["rule"], "types");
+        let (status, json) = post_multipart(&server, "/vector-named", &[part]).await;
+        assert_eq!(status, 200, "{json}");
+        assert_eq!(json["type"], "image/svg+xml");
+        let (status, json) = post_multipart(
+            &server,
+            "/profile",
+            &[
+                ("name", None, None, b"Ada"),
+                ("avatar", Some("logo.svg"), Some("image/svg+xml"), svg),
+            ],
+        )
+        .await;
+        assert_eq!(status, 422, "{json}");
+        server.stop().await;
+    }
+
+    /// A blob with no detectable family (F26): the declared header counts
+    /// only when the rule names that header; a detectable type claimed
+    /// by header alone is not believed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn undetectable_blobs_follow_the_declared_header_only_when_named() {
+        let mut server = TestServer::builder("validation-upload")
+            .upload_dir()
+            .handler(UPLOAD_APP)
+            .spawn()
+            .await;
+        std::fs::create_dir_all(server.dir().join("uploads/blobs")).expect("mkdir");
+        let blob: Vec<u8> = (0..512u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        for (path, declared, expected) in [
+            ("/octet", "application/octet-stream", 200),
+            ("/octet", "application/zip", 200),
+            ("/blob", "application/zip", 422),
+            ("/blob", "application/octet-stream", 422),
+        ] {
+            let resp = server
+                .client()
+                .put(server.url(path))
+                .header("content-type", declared)
+                .body(blob.clone())
+                .send()
+                .await
+                .expect("put");
+            let status = resp.status().as_u16();
+            let text = resp.text().await.expect("body");
+            assert_eq!(status, expected, "{path} as {declared}: {text}");
+            if expected == 200 {
+                let json: serde_json::Value = serde_json::from_str(&text).expect("json");
+                assert_eq!(json["type"], "application/octet-stream", "{text}");
+            } else {
+                assert!(text.contains("\"rule\":\"types\""), "{text}");
+            }
+        }
+        server.stop().await;
+    }
+
+    /// A path relative to `root`, spelled with `/` whatever the host
+    /// separator is, so a test can compare it with a literal. Native
+    /// paths (what `save` returns, what `walk` yields) must never be
+    /// compared as strings against a `/`-spelled literal: that passes on
+    /// Linux and fails on Windows.
+    fn rel(path: &std::path::Path, root: &std::path::Path) -> String {
+        path.strip_prefix(root)
+            .expect("under the root")
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/")
     }
 
     fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -886,6 +1243,152 @@ mod adversarial {
         assert_eq!(status, 422, "{json}");
         assert_eq!(json["errors"][0]["rule"], "json");
         assert_eq!(json["errors"][0]["path"], "body");
+        server.stop().await;
+    }
+
+    /// Bytes that are not UTF-8 in a query value or a header (V6) are
+    /// decoded lossily and then judged by the rule: a 422, never a panic,
+    /// and nothing of them in the answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_utf8_in_text_inputs_is_a_422() {
+        let mut server = TestServer::builder("validation").handler(APP).spawn().await;
+        let resp = server
+            .client()
+            .get(server.url("/bytes?tags=%FF%FEabc&q=%C3%28"))
+            .send()
+            .await
+            .expect("get");
+        assert_eq!(resp.status(), 422);
+        let json: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(json["errors"][0]["rule"], "format", "{json}");
+        assert_eq!(json["errors"][0]["path"], "query.tags[1]", "{json}");
+
+        let resp = server
+            .client()
+            .post(server.url("/notes"))
+            .header("content-type", "application/json")
+            .header(
+                "x-team",
+                reqwest::header::HeaderValue::from_bytes(b"core\xff\xfe").unwrap(),
+            )
+            .body(r#"{"text":"hi"}"#)
+            .send()
+            .await
+            .expect("post");
+        assert_eq!(resp.status(), 422);
+        let json: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(json["errors"][0]["path"], "headers.x-team[1]", "{json}");
+        server.stop().await;
+    }
+
+    /// A message with HTML in it (M3) reaches the client as a JSON string
+    /// under `application/json`: the encoder, not the author, keeps the
+    /// document well-formed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn messages_with_markup_stay_json_strings() {
+        let mut server = TestServer::builder("validation").handler(APP).spawn().await;
+        let resp = server
+            .client()
+            .post(server.url("/html"))
+            .header("content-type", "application/json")
+            .body(r#"{"a":"long"}"#)
+            .send()
+            .await
+            .expect("post");
+        assert_eq!(resp.status(), 422);
+        let content_type = resp.headers()["content-type"].to_str().unwrap().to_string();
+        assert!(
+            content_type.starts_with("application/json"),
+            "{content_type}"
+        );
+        let text = resp.text().await.expect("body");
+        let json: serde_json::Value = serde_json::from_str(&text).expect("well-formed json");
+        assert_eq!(json["fields"]["body.a"], "<b>too long</b> & \"quoted\"");
+        server.stop().await;
+    }
+
+    /// An array without `max_items` whose items each run a check (C11)
+    /// is bounded by the body limit first and the budget second: a 413
+    /// or a 500, never a hang.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unbounded_arrays_of_checks_hit_the_body_limit_or_the_budget() {
+        let mut server = TestServer::builder("validation")
+            .handler(APP)
+            .config(|cfg| {
+                cfg.workers = 1;
+                cfg.lua.exec_timeout_ms = 500;
+                cfg.limits.pool_wait_ms = 500;
+                cfg.limits.max_body_bytes = 64 * 1024;
+            })
+            .spawn()
+            .await;
+        let started = Instant::now();
+        let body = format!("{{\"items\":[{}1]}}", "1,".repeat(20_000));
+        let (status, json) = post_json(&server, "/many", &body).await;
+        assert_eq!(status, 500, "{json}");
+        assert_eq!(json["kind"], "timeout", "{json}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+
+        let body = format!("{{\"items\":[{}1]}}", "1,".repeat(100_000));
+        let (status, _) = post_json(&server, "/many", &body).await;
+        assert_eq!(status, 413);
+
+        let (status, json) = post_json(&server, "/many", r#"{"items":[1,2,3]}"#).await;
+        assert_eq!(status, 200, "{json}");
+        assert_eq!(json["n"], 3);
+        server.stop().await;
+    }
+
+    #[cfg(feature = "fetch")]
+    const BUDGET: &str = r#"
+local app = nitr.app()
+app:post("/probe", function(req)
+    return nitr.json({ ok = true })
+end, {
+    input = { body = { host = { "string", description = "probes the host", check = function(h)
+        local seen = {}
+        for i = 1, 4 do
+            local ok, err = pcall(function() return nitr.fetch("GET", "http://" .. h .. "/"):send() end)
+            if not ok then seen[#seen + 1] = tostring(err) end
+        end
+        for _, e in ipairs(seen) do
+            if e:find("max_per_request", 1, true) then return false, "budget exhausted after " .. #seen .. " errors" end
+        end
+        return false, "budget never applied: " .. (seen[1] or "no error")
+    end } } },
+})
+return app
+"#;
+
+    /// `[fetch] max_per_request` applies inside a check (C2): the request's
+    /// outbound allowance is what validation spends.
+    #[cfg(feature = "fetch")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_fetch_budget_applies_inside_checks() {
+        let mut server = TestServer::builder("validation-budget")
+            .handler(BUDGET)
+            .std_features(&["json", "http", "fetch"])
+            .config(|cfg| {
+                cfg.fetch.allow_private_networks = true;
+                cfg.fetch.max_per_request = 2;
+            })
+            .spawn()
+            .await;
+        // Port 9 is discard, never listening: every send fails, and only
+        // the budget can make a failure say `max_per_request`.
+        let (status, json) = post_json(&server, "/probe", r#"{"host":"127.0.0.1:9"}"#).await;
+        assert_eq!(status, 422, "{json}");
+        assert!(
+            json["fields"]["body.host"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("budget exhausted"),
+            "{json}"
+        );
         server.stop().await;
     }
 

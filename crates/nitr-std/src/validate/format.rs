@@ -300,13 +300,15 @@ impl Format {
             Self::Ipv4 => value.parse::<std::net::Ipv4Addr>().is_ok(),
             Self::Ipv6 => value.parse::<std::net::Ipv6Addr>().is_ok(),
             Self::Cidr => {
-                let Some((ip, prefix)) = value.split_once('/') else {
+                let Some((ip, prefix_text)) = value.split_once('/') else {
                     return false;
                 };
-                let Ok(prefix) = prefix.parse::<u8>() else {
+                let Ok(prefix) = prefix_text.parse::<u8>() else {
                     return false;
                 };
-                if prefix.to_string() != prefix.to_string().trim_start_matches('0') && prefix != 0 {
+                // The prefix is written the one canonical way: no leading
+                // zero, no sign (`u8::parse` takes `+8`).
+                if prefix.to_string() != prefix_text {
                     return false;
                 }
                 match ip.parse::<std::net::IpAddr>() {
@@ -387,12 +389,18 @@ impl Format {
             }),
             Self::Json => serde_json::from_str::<serde_json::Value>(value).is_ok(),
             Self::Jwt => {
+                // Shape only, in linear time: three base64url segments,
+                // header and payload non-empty, the signature possibly
+                // empty (an unsecured JWS). Verification is `nitr.jwt`'s
+                // job, not a format's.
+                let alphabet = |p: &str| {
+                    p.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                };
                 let parts: Vec<&str> = value.split('.').collect();
                 parts.len() == 3
-                    && parts[..2].iter().all(|p| is_base64url(p))
-                    && parts[2]
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    && parts[..2].iter().all(|p| !p.is_empty() && alphabet(p))
+                    && alphabet(parts[2])
             }
         }
     }
@@ -442,6 +450,29 @@ impl Format {
 
 /// Parses a 24-hour time in the shapes `HH:MM`, `HH:MM:SS`, `HH:MM:SS.frac`.
 pub(super) fn parse_time(value: &str) -> Option<chrono::NaiveTime> {
+    // `HH:MM`, `HH:MM:SS` or `HH:MM:SS.fff`: two digits each, no leap
+    // second (chrono would take `9:00` and `23:59:60`).
+    let two_digits = |p: &str| p.len() == 2 && p.bytes().all(|b| b.is_ascii_digit());
+    let mut parts = value.split(':');
+    let (Some(h), Some(m)) = (parts.next(), parts.next()) else {
+        return None;
+    };
+    if !two_digits(h) || !two_digits(m) {
+        return None;
+    }
+    if let Some(s) = parts.next() {
+        let (whole, frac) = s.split_once('.').unwrap_or((s, "0"));
+        if !two_digits(whole)
+            || whole >= "60"
+            || frac.is_empty()
+            || !frac.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+    }
+    if parts.next().is_some() {
+        return None;
+    }
     ["%H:%M:%S%.f", "%H:%M:%S", "%H:%M"]
         .iter()
         .find_map(|fmt| chrono::NaiveTime::parse_from_str(value, fmt).ok())

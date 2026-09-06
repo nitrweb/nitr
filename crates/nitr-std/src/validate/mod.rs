@@ -28,6 +28,7 @@ use mlua::{AnyUserData, Function, Lua, Table, Value};
 mod coerce;
 mod compile;
 mod engine;
+pub(crate) mod exemplars;
 pub(crate) mod file;
 pub(crate) mod format;
 mod lua;

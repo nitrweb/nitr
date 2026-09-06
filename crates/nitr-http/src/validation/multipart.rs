@@ -9,7 +9,7 @@
 
 use http_body_util::BodyExt as _;
 use mlua::{ExternalResult as _, Lua};
-use nitr_std::validation::{CompiledSchema, LuaFile, TextValue};
+use nitr_std::validation::{CompiledSchema, LuaFile, TextValue, ValidationError};
 
 use super::spool::{Spooler, resolver};
 use crate::request::LuaRequest;
@@ -19,7 +19,7 @@ pub(super) async fn read(
     lua: &Lua,
     req: &mut LuaRequest,
     schema: &CompiledSchema,
-) -> mlua::Result<Vec<(String, TextValue)>> {
+) -> mlua::Result<Result<Vec<(String, TextValue)>, ValidationError>> {
     let content_type = req
         .req
         .headers()
@@ -44,7 +44,22 @@ pub(super) async fn read(
     let mut out = Vec::new();
     let mut count = 0usize;
     let mut index = 0usize;
-    while let Some(mut field) = parser.next_field().await.into_lua_err()? {
+    while let Some(mut field) = match parser.next_field().await {
+        Ok(field) => field,
+        // The body stream failing is the read guard's verdict (408, 413)
+        // or a disconnect: not the client's syntax.
+        Err(err @ (multer::Error::StreamReadFailed(_) | multer::Error::LockFailure)) => {
+            return Err(err).into_lua_err();
+        }
+        // Anything else is a malformed body: a rule failure on the body
+        // itself, like invalid JSON, never a handler error.
+        Err(_) => {
+            return Ok(Err(ValidationError::single(
+                "multipart",
+                "must be a well-formed multipart body",
+            )));
+        }
+    } {
         count += 1;
         if count > limits.max_parts {
             return Err(mlua::Error::RuntimeError(format!(
@@ -107,5 +122,5 @@ pub(super) async fn read(
         let file = LuaFile::new(info, path, resolver(root.clone()), limits.max_field_bytes);
         out.push((name, TextValue::File(lua.create_userdata(file)?)));
     }
-    Ok(out)
+    Ok(Ok(out))
 }

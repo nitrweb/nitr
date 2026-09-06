@@ -311,3 +311,83 @@ async fn cross_field_rules_are_attributed_to_the_last_field() {
     .await;
     assert_eq!(field(&err, "phone"), r#"requires "phone_cc""#);
 }
+
+/// Lengths count characters, not bytes: an emoji is one, a base letter
+/// plus a combining mark is two; `trim` strips Unicode whitespace.
+#[tokio::test]
+async fn lengths_count_characters_and_trim_strips_unicode_space() {
+    let lua = Lua::new();
+    let s = schema(
+        &lua,
+        r#"{
+            one = { type = "string", min_len = 1, max_len = 1 },
+            name = { type = "string", trim = true, min_len = 1 },
+        }"#,
+    );
+    let (data, err) = check(
+        &lua,
+        &s,
+        r#"{ one = "\u{1F44D}", name = "\u{A0}\u{2003}x\u{A0}" }"#,
+    )
+    .await;
+    assert!(err.is_nil(), "unexpected error: {err:?}");
+    let data = data_table(data);
+    assert_eq!(data.get::<String>("name").unwrap(), "x");
+    assert_eq!(data.get::<String>("one").unwrap(), "\u{1F44D}");
+
+    let (data, err) = check(&lua, &s, r#"{ one = "e\u{301}", name = "\u{A0}\u{A0}" }"#).await;
+    assert!(data.is_nil());
+    assert!(field(&err, "one").contains("at most 1"), "{err:?}");
+    assert!(field(&err, "name").contains("at least 1"), "{err:?}");
+}
+
+/// The literal rules compare text, so regex metacharacters mean
+/// themselves.
+#[tokio::test]
+async fn literal_rules_take_metacharacters_literally() {
+    let lua = Lua::new();
+    let s = schema(
+        &lua,
+        r#"{
+            a = { type = "string", starts_with = "(", ends_with = "$", contains = ".*", does_not_contain = "[x]" },
+            b = { type = "string", starts_with = "^\\d+", ends_with = "|", contains = "?" },
+        }"#,
+    );
+    let (data, err) = check(&lua, &s, r#"{ a = "(hello.*world$", b = "^\\d+ what?|" }"#).await;
+    assert!(err.is_nil(), "unexpected error: {err:?}");
+    let data = data_table(data);
+    assert_eq!(data.get::<String>("a").unwrap(), "(hello.*world$");
+
+    for (input, field_name) in [
+        (r#"{ a = "(hello world$", b = "^\\d+?|" }"#, "a"),
+        (r#"{ a = "xhello.*$", b = "^\\d+?|" }"#, "a"),
+        (r#"{ a = "(a.*[x]$", b = "^\\d+?|" }"#, "a"),
+        (r#"{ a = "(.*$", b = "12 what?|" }"#, "b"),
+        (r#"{ a = "(.*$", b = "^\\d+ what|" }"#, "b"),
+    ] {
+        let (data, err) = check(&lua, &s, input).await;
+        assert!(data.is_nil(), "{input} passed");
+        assert!(!field(&err, field_name).is_empty(), "{input}: {err:?}");
+    }
+}
+
+/// A CIDR prefix is written one way: `/8`, never `/08` or `/+8`, and `/0`
+/// is a prefix too.
+#[test]
+fn cidr_prefixes_are_canonical() {
+    use format::Format;
+    for ok in ["0.0.0.0/0", "10.0.0.0/8", "::/0", "2001:db8::/128"] {
+        assert!(Format::Cidr.check(ok), "{ok}");
+    }
+    for bad in [
+        "10.0.0.0/08",
+        "10.0.0.0/+8",
+        "10.0.0.0/8 ",
+        "10.0.0.0/",
+        "10.0.0.0/00",
+        "::/129",
+        "10.0.0.0/8/8",
+    ] {
+        assert!(!Format::Cidr.check(bad), "{bad}");
+    }
+}

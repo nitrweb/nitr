@@ -23,6 +23,10 @@ fn safe_filename_always_yields_a_plain_name() {
     assert_eq!(safe_filename("/absolute/name.txt"), "name.txt");
     // Control characters and NUL cannot survive into a path.
     assert_eq!(safe_filename("a\0b\u{7}c.txt"), "abc.txt");
+    // Bidi overrides and zero-width characters spoof what a name looks
+    // like; they are not part of a name.
+    assert_eq!(safe_filename("photo\u{202E}gnp.exe"), "photognp.exe");
+    assert_eq!(safe_filename("re\u{200B}port\u{FEFF}.pdf"), "report.pdf");
     // Leading dots (hidden files) and trailing dots/spaces (silently
     // dropped by some filesystems, so two names would collide).
     assert_eq!(safe_filename(".hidden"), "hidden");
@@ -35,6 +39,17 @@ fn safe_filename_always_yields_a_plain_name() {
     // Truncated to NAME_MAX on a character boundary, never mid-glyph.
     let long = safe_filename(&"é".repeat(500));
     assert!(long.len() <= NAME_MAX, "{} bytes", long.len());
+    // A long name keeps its extension: the stem gives way.
+    let long = safe_filename(&format!("{}.tar.gz", "a".repeat(4000)));
+    assert!(
+        long.len() <= NAME_MAX && long.ends_with(".tar.gz"),
+        "{long}"
+    );
+    let long = safe_filename(&format!("{}.png", "é".repeat(500)));
+    assert!(long.len() <= NAME_MAX && long.ends_with(".png"), "{long}");
+    // ...unless the "extension" is itself the whole name.
+    let long = safe_filename(&format!(".{}", "a".repeat(4000)));
+    assert_eq!(long.len(), NAME_MAX);
     assert!(
         std::str::from_utf8(long.as_bytes()).is_ok(),
         "truncation split a character"

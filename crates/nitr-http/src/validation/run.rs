@@ -110,7 +110,13 @@ async fn body_part(
         }
         #[cfg(feature = "multipart")]
         (BodyRule::Schema(schema), Content::Multipart) => {
-            let pairs = super::multipart::read(lua, req, schema).await?;
+            let pairs = match super::multipart::read(lua, req, schema).await? {
+                Ok(pairs) => pairs,
+                Err(err) => {
+                    record(failures, "body", err);
+                    return Ok(());
+                }
+            };
             text_part(lua, schema, pairs, strict, "body", valid, failures).await?;
         }
         #[cfg(feature = "multipart")]

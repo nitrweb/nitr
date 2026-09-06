@@ -71,7 +71,8 @@ impl Ctx<'_> {
             let family = effective.split('/').next().unwrap_or_default();
             let matched = file.types.iter().any(|t| match t {
                 TypePattern::Any => true,
-                TypePattern::Family(f) => f == family,
+                // `image/*` means pictures, not an SVG with a script.
+                TypePattern::Family(f) => f == family && !media::is_active_content(effective),
                 TypePattern::Exact(name) => name == effective,
             });
             if !matched {

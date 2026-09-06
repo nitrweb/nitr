@@ -83,6 +83,7 @@ pub mod fuzzing {
     // guard's own walk against the serialization it precedes.
     pub use crate::utils::check_json_bounds;
     pub use crate::validate::coerce_for_fuzzing;
+    pub use crate::validate::exemplars::FORMAT_EXEMPLARS;
     pub use crate::validate::format::{check_format, format_names};
     pub use crate::validate::media::{detect as sniff_file, dimensions as sniff_dimensions};
 }

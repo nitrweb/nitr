@@ -114,14 +114,29 @@ pub(super) const FALLBACK_NAME: &str = "upload";
 /// replacement. By construction the result contains no path separator, so
 /// `part:save(part.safe_filename)` is safe on its own and the upload root
 /// is a backstop rather than the only defense.
+/// A character that renders as nothing or reorders what follows it.
+fn is_invisible(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
 #[doc(hidden)]
 pub fn safe_filename(raw: &str) -> String {
     // Only the last segment is a name; a client may send a whole path,
     // and both separators count because the sender's OS is not ours.
     let last = raw.rsplit(['/', '\\']).next().unwrap_or_default();
     // C0/C1 controls and NUL: a name the OS would refuse opaquely, or
-    // that would truncate a log line.
-    let cleaned: String = last.chars().filter(|c| !c.is_control()).collect();
+    // that would truncate a log line. Bidirectional overrides and
+    // zero-width characters too: `gnp.exe` shown as `exe.png` is the
+    // oldest filename spoof, and they are format characters, not controls.
+    let cleaned: String = last.chars().filter(|c| !is_invisible(*c)).collect();
     // Leading dots hide the file; trailing dots and spaces are silently
     // dropped by some filesystems, which makes two names collide. Both
     // classes are trimmed in one pass rather than chained — `". . "`
@@ -129,13 +144,29 @@ pub fn safe_filename(raw: &str) -> String {
     // behind on the second alternation.
     let trimmed = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
 
+    // A name longer than the filesystem allows keeps its extension: the
+    // extension is what an `extensions` rule and the handler decide by,
+    // so it is the stem that gives way.
+    // Up to 16 bytes of suffix count as the extension, `.tar.gz` included.
+    let ext_at = trimmed
+        .rmatch_indices('.')
+        .map(|(i, _)| i)
+        .take_while(|i| trimmed.len() - i <= 17)
+        .filter(|i| *i > 0)
+        .last();
+    let (stem, ext) = match ext_at {
+        Some(i) if trimmed.len() > NAME_MAX => (&trimmed[..i], &trimmed[i..]),
+        _ => (trimmed, ""),
+    };
+    let budget = NAME_MAX.saturating_sub(ext.len());
     let mut out = String::new();
-    for ch in trimmed.chars() {
-        if out.len() + ch.len_utf8() > NAME_MAX {
+    for ch in stem.chars() {
+        if out.len() + ch.len_utf8() > budget {
             break;
         }
         out.push(ch);
     }
+    out.push_str(ext);
     if out.is_empty() || out == "." || out == ".." {
         return FALLBACK_NAME.to_string();
     }

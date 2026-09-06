@@ -53,8 +53,13 @@ jobs:
     runs-on: ubuntu-24.04
     # `-max_total_time` bounds only the fuzzing loop: the nightly install,
     # the cargo-fuzz fetch, the ASan build of vendored Lua, and cmin are
-    # all outside it, leaving GitHub's 360-minute default as the only cap.
-    timeout-minutes: 45
+    # all outside it. The cap therefore follows the event, like the loop
+    # length below does: a PR fuzzes 90 s a target and is done well inside
+    # 30 minutes; the nightly fuzzes an hour a target, so its cap has to
+    # hold the hour plus the build and a cmin over a corpus that grew all
+    # night. A flat 45 here killed every nightly job at 45 minutes, before
+    # it could finish, upload a crash, or save its corpus.
+    timeout-minutes: ${{ github.event_name == 'schedule' && 90 || 30 }}
     strategy:
       fail-fast: false
       matrix:

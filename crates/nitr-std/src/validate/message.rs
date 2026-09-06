@@ -206,6 +206,7 @@ pub(crate) const RULE_CODES: &[&str] = &[
     "keys",
     "check",
     "json",
+    "multipart",
     "body",
 ];
 
@@ -289,6 +290,7 @@ pub(crate) fn default_message(rule: &str, kind: &str, params: &BTreeMap<&str, Pa
         "filename" => "must have a name".into(),
         "check" => "is invalid".into(),
         "json" => "must be valid JSON".into(),
+        "multipart" => "must be a well-formed multipart body".into(),
         "body" => "must be an object".into(),
         other => format!("failed the {other} rule"),
     }

@@ -145,6 +145,16 @@ pub enum Detection {
     Unknown,
 }
 
+/// Types a browser runs script from when it opens them. A family
+/// wildcard (`image/*`, `text/*`) never matches one; a rule has to name
+/// it, and naming it logs a warning at load.
+pub(crate) fn is_active_content(name: &str) -> bool {
+    matches!(
+        name,
+        "image/svg+xml" | "text/html" | "application/xhtml+xml"
+    )
+}
+
 /// Looks a media type up by name.
 pub fn lookup(name: &str) -> Option<&'static MediaType> {
     MEDIA_TYPES.iter().find(|m| m.name == name)
