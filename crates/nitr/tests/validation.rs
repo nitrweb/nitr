@@ -898,7 +898,8 @@ return app
         let json: serde_json::Value = serde_json::from_str(&text).expect("json");
         assert_eq!(json["errors"][0]["rule"], "multipart", "{text}");
         assert_eq!(json["errors"][0]["path"], "body", "{text}");
-        assert!(walk(&server.dir().join("uploads/.nitr-tmp")).is_empty());
+        let left = spool_leftovers(&server.dir().join("uploads/.nitr-tmp")).await;
+        assert!(left.is_empty(), "left behind after a 422: {left:?}");
         server.stop().await;
     }
 
@@ -951,14 +952,7 @@ return app
         drop(sock);
         // The read guard notices within `body_read_ms`; the guard's Drop
         // removes the directory.
-        let mut left = walk(&tmp);
-        for _ in 0..100 {
-            if left.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            left = walk(&tmp);
-        }
+        let left = spool_leftovers(&tmp).await;
         assert!(left.is_empty(), "left behind after a disconnect: {left:?}");
 
         // A handler that spins after a valid upload: the budget answers
@@ -971,11 +965,8 @@ return app
         .await;
         assert_eq!(status, 500, "{json}");
         assert_eq!(json["kind"], "timeout", "{json}");
-        assert!(
-            walk(&tmp).is_empty(),
-            "left behind after a timeout: {:?}",
-            walk(&tmp)
-        );
+        let left = spool_leftovers(&tmp).await;
+        assert!(left.is_empty(), "left behind after a timeout: {left:?}");
 
         // And the state is fine.
         let (status, _) =
@@ -1108,6 +1099,22 @@ return app
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("/")
+    }
+
+    /// The files still under `dir` once the spool has had time to go.
+    /// `SpoolDir`'s Drop removes the directory on a blocking thread, so
+    /// the response can reach the client a moment before the files are
+    /// gone — noticeably on Windows CI. Empty means the spool was removed.
+    async fn spool_leftovers(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut left = walk(dir);
+        for _ in 0..100 {
+            if left.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            left = walk(dir);
+        }
+        left
     }
 
     fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
