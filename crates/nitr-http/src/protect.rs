@@ -270,13 +270,24 @@ impl RateLimiter {
     /// Returns `Err(retry_after_seconds)` when the client exceeded its
     /// budget for the current window.
     fn check(&self, req: &LuaRequest) -> std::result::Result<(), u64> {
-        self.check_at(req, Instant::now())
+        // The standard library's clock, so `nitr.test.clock.advance` can
+        // move a test past the window; the real monotonic clock otherwise.
+        self.check_with(req, nitr_std::clock::now_instant)
     }
 
     /// [`check`](Self::check) at an explicit instant — the seam that lets
     /// tests drive window expiry and bucket eviction deterministically
     /// instead of sleeping against the real clock.
+    #[cfg(test)]
     fn check_at(&self, req: &LuaRequest, now: Instant) -> std::result::Result<(), u64> {
+        self.check_with(req, || now)
+    }
+
+    fn check_with(
+        &self,
+        req: &LuaRequest,
+        clock: impl FnOnce() -> Instant,
+    ) -> std::result::Result<(), u64> {
         let key = self.client_key(req);
         let mut buckets = match self.buckets.lock() {
             Ok(guard) => guard,
@@ -284,6 +295,10 @@ impl RateLimiter {
             // failing open beats taking the server down.
             Err(_) => return Ok(()),
         };
+        // Read under the lock, so the instants the buckets see only move
+        // forward: two requests that read the clock before contending for
+        // the lock could otherwise record their windows out of order.
+        let now = clock();
         if buckets.map.len() > BUCKET_PURGE_THRESHOLD
             && now.duration_since(buckets.last_purge) >= BUCKET_PURGE_INTERVAL
         {
@@ -301,7 +316,16 @@ impl RateLimiter {
             return Ok(());
         }
         let bucket = buckets.map.entry(key).or_insert((now, 0));
-        if now.duration_since(bucket.0) >= self.window {
+        // A window that starts after `now` starts over. With the clock read
+        // under the lock that happens only when `nitr test` resets its clock
+        // after a test that advanced it: a bucket stamped in that test's
+        // future would otherwise saturate `duration_since` to zero and stay
+        // open for the whole advance. A racing request cannot reach this
+        // branch, so it cannot reset another request's count.
+        if now
+            .checked_duration_since(bucket.0)
+            .is_none_or(|elapsed| elapsed >= self.window)
+        {
             *bucket = (now, 0);
         }
         bucket.1 += 1;
@@ -428,6 +452,26 @@ mod tests {
                 .is_ok(),
             "a new window starts fresh"
         );
+    }
+
+    /// A window that starts after `now` starts over: under `nitr test` the
+    /// clock is reset after a test that advanced it, and a bucket stamped
+    /// in that future used to saturate `duration_since` to zero — the
+    /// client stayed throttled for the whole advance (a day, for a test
+    /// that aged a session).
+    #[test]
+    fn a_window_from_the_future_starts_over() {
+        let limiter = limiter(1, 60_000, false);
+        let req = request("10.0.0.1", None);
+        let now = Instant::now();
+        let advanced = now + Duration::from_secs(86_400);
+        assert!(limiter.check_at(&req, advanced).is_ok());
+        assert!(limiter.check_at(&req, advanced).is_err());
+        assert!(
+            limiter.check_at(&req, now).is_ok(),
+            "back at the real clock, the future window is gone"
+        );
+        assert!(limiter.check_at(&req, now).is_err(), "and counting resumes");
     }
 
     /// The purge backstop (guard against unbounded `HashMap` growth from

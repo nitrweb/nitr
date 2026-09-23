@@ -44,7 +44,7 @@ Nitr is both a **binary** (`nitr`, configured via `nitr.toml`) and a **library c
 - **One-file deploys:** `nitr build --output myapp` appends the whole application (config, Lua, templates, static files, migrations) to the binary — copy one executable; the database stays external.
 - **Dev mode (`--dev`)**: instant hot reload (a `notify` watcher rebuilds on save — scripts, `routes/`, templates) and error details in responses.
 - **Editor completion for everything:** `nitr init` writes generated LuaCATS type definitions (`nitr-types.lua`) covering the whole `nitr.*` surface — completion, signatures and inline docs in any editor with the Lua Language Server. Generated from the same [single API description](resources/nitr-api.md) as the reference docs; a test fails if an undocumented builtin ships.
-- **A test framework worth using:** `nitr.test` gives `describe`/`it`/`expect` matchers, `before_each`/`after_each`, `t.request(..., { json = ... })` and `resp:json()`, `nitr test --filter <name>` — failures name the assertion, both values, and the file:line. Requests dispatch through the real router, middleware included.
+- **A test framework worth using:** `nitr test` runs unit tests of plain modules, integration tests through the real router with a cookie-keeping client, and handlers in isolation with a fake request. Every test gets its own budget, duration, captured logs and fresh doubles — canned `nitr.fetch` responses, a movable clock, environment overrides — and database fixtures reset what a test wrote (`t.db.reset`, `t.db.isolate`). A failed request shows its status, body and the handler's error; `--bail`, `--list`, `--watch` and JUnit/JSON reports are built in. See [Testing](#testing).
 - **Extensible:** `ServerBuilder::module("name", ...)` mounts a Rust table at `nitr.ext.name` in every Lua state — user modules live under `nitr.ext.*`, one level below the std, so no future builtin can ever collide with them, third-party extension crates need no fork.
 
 ## Cargo features
@@ -249,7 +249,72 @@ features = ["dbg", "fetch", "template", "json", "db", "http", "log", "crypto"]
 stdlib = ["math", "table", "string", "utf8", "coroutine", "package"]  # "io"/"os" are opt-in
 memory_limit = 8388608                  # bytes, per state
 exec_timeout_ms = 30000                 # 0 disables the execution budget
+
+[testing]                               # `nitr test`
+dir = "tests"                           # *.lua test files (not recursive)
+# database = "test.db"                  # recreated each run; default: a private file per run
+seed = "tests/fixtures/seed.sql"        # applied after the migrations
+capture = true                          # logs shown under a failed test only
+slow_ms = 1000                          # tests slower than this are marked `slow`
 ```
+
+## Testing
+
+`nitr test` runs the `*.lua` files in `[testing] dir` against an in-process server — the real router, middleware, validation and handlers, on a fresh private database file with the migrations applied (never `[database] path`; `[testing] database` names a file to keep instead). Files and tests run one after another; each file gets a fresh Lua state.
+
+```lua
+-- tests/notes_test.lua
+local t = nitr.test
+local notes = require("lib.notes")        -- the app's own module (resolved from the app directory)
+local fixtures = require("helpers.notes") -- tests/helpers/notes.lua: a helper, never run as a test
+
+t.describe("lib.notes (unit)", function()
+    t.it("normalizes text", function()
+        t.expect(notes.normalize("  hi  ")).to_equal("hi")
+    end)
+    t.each({ { "", "TEXT_REQUIRED" }, { ("x"):rep(501), "TEXT_TOO_LONG" } })
+    ("rejects %q with %s", function(text, code)
+        local ok, err = notes.validate({ text = text })
+        t.expect(ok).to_be_false()
+        t.expect(err.code).to_equal(code)
+    end)
+end)
+
+t.describe("notes API (integration)", function()
+    local api = t.client({ base = "/api", cookies = true })
+    t.before_each(t.db.reset)
+
+    t.it("creates and lists", function()
+        t.expect(api:post("/notes", { json = fixtures.note })).to_have_status(201)
+        t.expect(api:get("/notes"):json()).to_match_object({ { text = "hi" } })
+    end)
+
+    t.it("publishes to the webhook once", function()
+        t.fetch.mock({ method = "POST", url = "https://hooks.example/notes", status = 202 })
+        api:post("/notes", { json = { text = "ping" } })
+        t.expect(t.fetch.calls()[1].json.text).to_equal("ping")
+    end)
+end)
+```
+
+The rule of thumb: *if a function does not take `req`, unit test it; if it does, go through `t.request`.* What a test file has, under `nitr.test` (all of it absent from every state that serves requests):
+
+- **Structure.** `describe`/`it`, hooks scoped to their `describe` (`before_each`/`after_each`, `before_all`/`after_all`), `skip`, `todo`, `only` (the run fails while one is left in place), `each` for table-driven cases, `fail`. A throw inside a `describe` body fails that group and the file carries on. Each test runs under its own `[lua] exec_timeout_ms` budget, so one `while true do end` fails one test.
+- **Matchers.** `to_equal`, `to_match_object` (a subset, recursively), `to_throw`, `to_be_false`, `to_be_a`, `to_have_length`, the comparisons, `to_have_key`, the `to_not_*` negatives — and for responses `to_have_status`, `to_have_header`, `to_have_json`, whose failure shows a body excerpt and the handler's error.
+- **The client.** `t.request(method, path, opts)` and `t.get`/`post`/…: `query`, `cookies`, `auth`, one of `json`/`form`/`multipart`/`body`, `remote_addr` (the peer the rate limiter sees), `timeout`. The response has `status`, `headers`, `raw_headers` (every line, in order), `cookies` (parsed), `body`, `:json()`, `:sse()`, and `error` — the handler's classified error when it raised, without `--dev`. `t.client({ cookies = true })` keeps a jar across calls.
+- **Doubles, as data.** A test's state and the server's states are separate Lua universes, so nothing is monkey-patched: `t.fetch.mock` answers `nitr.fetch` in the handlers (before the `[fetch]` policy, which unmatched requests still meet; `t.fetch.strict()` refuses them), `t.clock.set/advance` moves `nitr.time`, sessions, JWT expiry, cache TTLs and the rate limiter (never the execution budget), `t.env.set` overrides `nitr.env` under the `[env]` policy, and `t.logs()` returns the test's captured log entries. All of them reset before every test.
+- **Database fixtures.** Every state owns its SQLite connection, so a test cannot wrap a handler in a transaction; instead `t.db.reset()` restores the database as it was after the migrations and `[testing] seed`, `t.db.truncate()` empties tables, `t.db.seed("fixtures/x.sql" | { table = rows })` loads data, `t.db.isolate()` resets after every test of the file.
+- **Unit tools.** `t.fake_request({...})` builds a real request object (sessions, CSRF and `nitr.auth` accept it) without protection, body limits or validation; `t.app()` loads the application into the test state for `app:handler(method, path)`, `app:dispatch(...)` (router and middleware only) and `app:routes()`; `t.session_cookie(data, { secret })` forges what `session:save` would write. `schema:check(v)` runs route validation rules outside a route. `nitr.cfg` is the handler's configuration snapshot.
+
+```sh
+nitr test --filter checkout --bail                       # the red one, stop at the first failure
+nitr test --list                                         # every test with its file:line, nothing run
+nitr test --watch                                        # re-run on every saved Lua file or template
+nitr test --reporter junit --output target/junit.xml     # CI annotations (also --reporter json)
+nitr test --nocapture                                    # stream log lines instead of capturing them
+```
+
+The complete reference is `nitr.test` in [resources/nitr-api.md](resources/nitr-api.md).
 
 ## Library usage
 

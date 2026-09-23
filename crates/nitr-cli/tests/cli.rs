@@ -298,8 +298,11 @@ fn env_files_feed_overrides_and_the_process_environment_wins() {
     let dir = scaffold("env-file", true);
     // `.env` next to nitr.toml loads implicitly; NITR_* values it carries
     // become overrides exactly as if they came from the environment.
-    std::fs::write(dir.join(".env"), "NITR_WORKERS=7\nNITR_TESTING_DIR=spec\n")
-        .expect("write .env");
+    std::fs::write(
+        dir.join(".env"),
+        "NITR_WORKERS=7\nNITR_TESTING_DIR=spec\nNITR_TESTING_DATABASE=scratch.db\n",
+    )
+    .expect("write .env");
     let out = nitr()
         .current_dir(&dir)
         .args(["check", "--print-config"])
@@ -313,6 +316,10 @@ fn env_files_feed_overrides_and_the_process_environment_wins() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("workers = 7"), "got: {stdout}");
     assert!(stdout.contains("dir = \"spec\""), "got: {stdout}");
+    assert!(
+        stdout.contains("database = \"scratch.db\""),
+        "got: {stdout}"
+    );
 
     // The real process environment beats the file.
     let out = nitr()
@@ -490,7 +497,7 @@ fn scaffolded_app_tests_pass_and_filter() {
         stdout.contains("ok   notes API > creates a note"),
         "got: {stdout}"
     );
-    assert!(stdout.contains("5 passed, 0 failed"), "got: {stdout}");
+    assert!(stdout.contains("10 passed, 0 failed"), "got: {stdout}");
 
     let out = nitr()
         .current_dir(&dir)
@@ -500,7 +507,7 @@ fn scaffolded_app_tests_pass_and_filter() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "filtered run failed: {stdout}");
     assert!(
-        stdout.contains("1 passed, 0 failed, 4 filtered out"),
+        stdout.contains("4 passed, 0 failed, 6 filtered out"),
         "got: {stdout}"
     );
 
@@ -824,3 +831,8 @@ fn openapi_generates_checks_drift_and_writes_a_site() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("is a file, not a directory"));
     assert_eq!(std::fs::read(dir.path.join("not-a-dir")).unwrap(), b"x");
 }
+
+// `nitr test` end to end, in its own file. Under `tests/cli/` rather than
+// `tests/` so cargo does not also build it as a test crate of its own.
+#[path = "cli/test_runner.rs"]
+mod test_runner;

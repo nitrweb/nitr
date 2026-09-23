@@ -17,7 +17,9 @@ use sha2::Sha256;
 
 mod cookies;
 
-pub use cookies::{CookieDefaults, RequestCookies, ResponseCookies, sign, verify};
+pub use cookies::{
+    CookieDefaults, RequestCookies, ResponseCookies, SetCookie, parse_set_cookie, sign, verify,
+};
 pub(crate) use cookies::{attach_cookie, build_cookie, merge_cookie_opts};
 
 /// Builds the skeleton of a helper response table: status, empty headers,
@@ -166,6 +168,30 @@ pub(crate) fn register(lua: &Lua, nitr: &Table) -> mlua::Result<()> {
             lua.create_string(format!("{prefix}\"{tag}\""))
         })?,
     )?;
+
+    // nitr.cookie.sign / verify — the HMAC-SHA256 signing behind
+    // `res.cookies:set_signed` and `req.cookies:verify`, as plain
+    // functions: for a signed value that travels outside a cookie header,
+    // and for a test that forges a cookie (or a session) for a client jar.
+    let cookie = lua.create_table()?;
+    cookie.set(
+        "sign",
+        lua.create_function(|_, (name, value, secret): (String, String, String)| {
+            Ok(sign(&name, &value, &secret))
+        })?,
+    )?;
+    cookie.set(
+        "verify",
+        lua.create_function(
+            |lua, (name, signed, secret): (String, String, String)| match verify(
+                &name, &signed, &secret,
+            ) {
+                Some(value) => Ok(Value::String(lua.create_string(value)?)),
+                None => Ok(Value::Nil),
+            },
+        )?,
+    )?;
+    nitr.set("cookie", cookie)?;
 
     Ok(())
 }

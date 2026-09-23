@@ -67,6 +67,9 @@ nitr-core = { workspace = true }
 nitr-std = { workspace = true }
 
 async-channel = { workspace = true }
+# `nitr test`'s `auth = { basic = ... }` request option; already in the
+# graph through nitr-std.
+base64 = { workspace = true }
 dotenvy = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }

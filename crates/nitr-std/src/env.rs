@@ -23,7 +23,7 @@ pub(crate) fn create_env_table(lua: &Lua, opts: &EnvOptions) -> mlua::Result<Tab
     env.set(
         "get",
         lua.create_function(move |lua, (name, default): (String, Option<Value>)| {
-            match read(&policy, &name) {
+            match read(lua, &policy, &name) {
                 Some(v) => Ok(Value::String(lua.create_string(&v)?)),
                 None => Ok(default.unwrap_or(Value::Nil)),
             }
@@ -35,14 +35,14 @@ pub(crate) fn create_env_table(lua: &Lua, opts: &EnvOptions) -> mlua::Result<Tab
         "has",
         // Existence without the value; a name the policy hides reports
         // `false` rather than leaking that it is set.
-        lua.create_function(move |_, name: String| Ok(read(&policy, &name).is_some()))?,
+        lua.create_function(move |lua, name: String| Ok(read(lua, &policy, &name).is_some()))?,
     )?;
 
     let policy = opts.clone();
     env.set(
         "number",
-        lua.create_function(move |_, (name, default): (String, Option<Value>)| {
-            match read(&policy, &name).and_then(|v| v.trim().parse::<f64>().ok()) {
+        lua.create_function(move |lua, (name, default): (String, Option<Value>)| {
+            match read(lua, &policy, &name).and_then(|v| v.trim().parse::<f64>().ok()) {
                 Some(n) => Ok(Value::Number(n)),
                 None => Ok(default.unwrap_or(Value::Nil)),
             }
@@ -52,8 +52,8 @@ pub(crate) fn create_env_table(lua: &Lua, opts: &EnvOptions) -> mlua::Result<Tab
     let policy = opts.clone();
     env.set(
         "bool",
-        lua.create_function(move |_, (name, default): (String, Option<Value>)| {
-            match read(&policy, &name).as_deref().and_then(parse_bool) {
+        lua.create_function(move |lua, (name, default): (String, Option<Value>)| {
+            match read(lua, &policy, &name).as_deref().and_then(parse_bool) {
                 Some(b) => Ok(Value::Boolean(b)),
                 None => Ok(default.unwrap_or(Value::Nil)),
             }
@@ -65,8 +65,21 @@ pub(crate) fn create_env_table(lua: &Lua, opts: &EnvOptions) -> mlua::Result<Tab
 
 /// Reads one variable under the policy; `None` for unset *and* for hidden,
 /// so callers cannot distinguish the two.
-fn read(opts: &EnvOptions, name: &str) -> Option<String> {
-    visible(opts, name).then(|| std::env::var(name).ok())?
+///
+/// A test's override (`nitr.test.env`, installed as
+/// [`Doubles`](crate::testing::Doubles) app data) is consulted only
+/// *after* the policy: an override of a hidden name stays hidden, so a
+/// test exercises the real `[env]` rules rather than a way around them.
+fn read(lua: &Lua, opts: &EnvOptions, name: &str) -> Option<String> {
+    if !visible(opts, name) {
+        return None;
+    }
+    if let Some(doubles) = crate::testing::installed(lua)
+        && let Some(overridden) = doubles.env_override(name)
+    {
+        return overridden;
+    }
+    std::env::var(name).ok()
 }
 
 /// Whether the policy lets scripts see this name.
@@ -158,5 +171,41 @@ mod tests {
         assert_eq!(b, "fallback");
         assert_eq!(c, 42.0);
         assert!(d);
+    }
+
+    /// A test's override answers only for names the policy lets scripts
+    /// see: overriding a hidden name must not become a way to read it,
+    /// and an explicit unset reads as unset even when the process has it.
+    #[test]
+    fn overrides_obey_the_policy() {
+        let lua = mlua::Lua::new();
+        let doubles = crate::testing::Doubles::new();
+        lua.set_app_data(doubles.clone());
+        let opts = EnvOptions {
+            allow: Some(vec!["APP_".into(), "PATH".into()]),
+        };
+        let table = create_env_table(&lua, &opts).expect("table");
+        lua.globals().set("env", table).expect("set");
+
+        doubles.set_env("APP_KEY", Some("sk_test_1".into()));
+        doubles.set_env("SECRET", Some("leaked".into()));
+        doubles.set_env("NITR_LISTEN", Some("leaked".into()));
+        // PATH is set in every test environment; the override unsets it.
+        doubles.set_env("PATH", None);
+        let (key, secret, internal, path, has_path): (String, Value, Value, Value, bool) = lua
+            .load(
+                r#"return env.get("APP_KEY"), env.get("SECRET"), env.get("NITR_LISTEN"),
+                          env.get("PATH"), env.has("PATH")"#,
+            )
+            .eval()
+            .expect("eval");
+        assert_eq!(key, "sk_test_1");
+        assert!(secret.is_nil(), "outside the allow list stays hidden");
+        assert!(internal.is_nil(), "NITR_* stays hidden");
+        assert!(path.is_nil() && !has_path, "an explicit unset wins");
+
+        doubles.reset();
+        let path: Value = lua.load(r#"return env.get("PATH")"#).eval().expect("eval");
+        assert!(!path.is_nil(), "reset restores the process environment");
     }
 }

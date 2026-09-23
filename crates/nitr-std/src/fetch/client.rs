@@ -71,17 +71,82 @@ pub(crate) struct LuaFetch {
 
 impl UserData for LuaFetch {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_async_method("send", |_, this, ()| {
+        methods.add_async_method("send", |lua, this, ()| {
             let client = this.client.clone();
             let spec = this.spec.clone();
             let opts = this.opts.clone();
             let budget = this.budget.clone();
+            let doubles = crate::testing::installed(&lua);
             async move {
                 budget.take(opts.max_per_request)?;
+                if let Some(doubles) = doubles
+                    && let Some(canned) = mocked(&doubles, &spec, &opts)?
+                {
+                    return Ok(canned);
+                }
                 send_with_retries(&client, spec, &opts).await
             }
         });
     }
+}
+
+/// Consults a `nitr test` fetch double, when one is installed.
+///
+/// Runs after the budget is taken — a mocked call still counts against
+/// `max_per_request`, so that bound stays testable — and **before**
+/// retries, redirects and [`check_url`]: a matched rule answers without
+/// the request going anywhere, which is what lets a test mock an internal
+/// host without widening `[fetch]`. An unmatched request returns `None`
+/// and goes down the unchanged path, policy and guarded resolver
+/// included; in strict mode it is refused instead. A canned `3xx` is
+/// returned as is, and `retry` options are never exercised.
+fn mocked(
+    doubles: &crate::testing::Doubles,
+    spec: &RequestSpec,
+    opts: &FetchOptions,
+) -> mlua::Result<Option<LuaResponse>> {
+    use crate::testing::FetchAnswer;
+    let headers = spec
+        .headers
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    let body = spec.body.as_ref().map(|b| b.to_vec());
+    let answer = doubles
+        .fetch()?
+        .answer(spec.method.as_str(), spec.url.as_str(), headers, body);
+    let canned = match answer {
+        FetchAnswer::PassThrough => return Ok(None),
+        FetchAnswer::Refused => {
+            return Err(mlua::Error::RuntimeError(format!(
+                "no fetch mock matched {} {} (nitr.test.fetch.strict is on)",
+                spec.method, spec.url
+            )));
+        }
+        FetchAnswer::Canned(canned) => canned,
+    };
+    // The URL rides in the response extensions (`ResponseBuilderExt`):
+    // without it the conversion substitutes a placeholder, and
+    // `resp.url` would not describe the request that was answered.
+    use reqwest::ResponseBuilderExt as _;
+    let mut builder = http::Response::builder()
+        .status(canned.status)
+        .url(spec.url.clone());
+    for (name, value) in &canned.headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    let resp = builder
+        .body(canned.body)
+        .map_err(|err| mlua::Error::RuntimeError(format!("invalid fetch mock response: {err}")))?;
+    Ok(Some(LuaResponse::new(
+        reqwest::Response::from(resp),
+        opts.max_response_bytes,
+    )))
 }
 
 /// Performs a request, repeating it when the policy allows.
@@ -423,16 +488,25 @@ pub(crate) fn create_await_all_fn(lua: &Lua, opts: Arc<FetchOptions>) -> mlua::R
             // to the bigger of the two.
             enum Job {
                 Fetch(Box<(Arc<HttpClient>, RequestSpec, Arc<FetchOptions>)>),
+                /// Answered by a `nitr test` fetch double.
+                Mocked(Box<LuaResponse>),
                 #[cfg(feature = "db")]
                 Query(crate::db::PendingQuery),
             }
 
             let budget = lua.app_data_ref::<Arc<OutboundBudget>>().map(|b| b.clone());
+            let doubles = crate::testing::installed(&lua);
             let mut jobs = Vec::with_capacity(handles.len());
             for handle in handles.iter() {
                 if let Ok(fetch) = handle.borrow::<LuaFetch>() {
                     if let Some(budget) = &budget {
                         budget.take(opts.max_per_request)?;
+                    }
+                    if let Some(doubles) = &doubles
+                        && let Some(canned) = mocked(doubles, &fetch.spec, &fetch.opts)?
+                    {
+                        jobs.push(Job::Mocked(Box::new(canned)));
+                        continue;
                     }
                     jobs.push(Job::Fetch(Box::new((
                         fetch.client.clone(),
@@ -460,6 +534,7 @@ pub(crate) fn create_await_all_fn(lua: &Lua, opts: Arc<FetchOptions>) -> mlua::R
                             let resp = send_with_retries(&client, spec, &opts).await?;
                             lua.create_userdata(resp).map(Value::UserData)
                         }
+                        Job::Mocked(resp) => lua.create_userdata(*resp).map(Value::UserData),
                         #[cfg(feature = "db")]
                         Job::Query(query) => query.run(&lua).await,
                     }

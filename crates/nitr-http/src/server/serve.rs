@@ -93,7 +93,7 @@ impl Server {
         let _watcher = self
             .cfg
             .dev_mode
-            .then(|| crate::watch::spawn(&self.cfg, reload_tx.clone()))
+            .then(|| crate::watch::spawn(&self.cfg, &[], reload_tx.clone()))
             .flatten();
         let _reload_tx = reload_tx;
 

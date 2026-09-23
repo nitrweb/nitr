@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 
 pub(crate) mod pool;
 mod script;
+pub use script::eval_script;
 use script::load_error;
 #[cfg(test)]
 mod tests;
@@ -171,6 +172,13 @@ pub struct RuntimeOpts {
     /// `package.loadlib` removed and `package.cpath` emptied regardless, so
     /// native modules can never load.
     pub package_dir: Option<PathBuf>,
+    /// Further `require` roots, tried in order after
+    /// [`package_dir`](Self::package_dir), each under the same rules (a
+    /// dotted-identifier name, text-only chunks, no path from
+    /// `package.path`). Ignored without a `package_dir`. `nitr test`
+    /// puts its tests directory here, so shared helpers load in test
+    /// states and never in the states that serve requests.
+    pub extra_package_dirs: Vec<PathBuf>,
 }
 
 impl Runtime {
@@ -203,6 +211,7 @@ impl Runtime {
             dev_mode: false,
             exec_timeout: Some(EXEC_TIMEOUT),
             package_dir: None,
+            extra_package_dirs: Vec::new(),
         })
     }
 
@@ -267,13 +276,24 @@ impl Runtime {
             // module name to a path without ever consulting `package.path`,
             // and compiles text only.
             if let Some(dir) = &opts.package_dir {
-                let shown = dir.to_string_lossy();
-                package.set("path", format!("{shown}/?.lua;{shown}/?/init.lua"))?;
+                let roots: Vec<PathBuf> = std::iter::once(dir)
+                    .chain(&opts.extra_package_dirs)
+                    .cloned()
+                    .collect();
+                let shown = roots
+                    .iter()
+                    .map(|root| {
+                        let shown = root.to_string_lossy();
+                        format!("{shown}/?.lua;{shown}/?/init.lua")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(";");
+                package.set("path", shown)?;
                 let searchers: Table = package.get("searchers")?;
                 let preload: Value = searchers.get(1)?;
                 let confined = lua.create_table()?;
                 confined.set(1, preload)?;
-                confined.set(2, confined_searcher(&lua, dir.clone())?)?;
+                confined.set(2, confined_searcher(&lua, roots)?)?;
                 package.set("searchers", confined)?;
             }
         }
@@ -615,15 +635,16 @@ impl Runtime {
 }
 
 /// The `require` searcher for a confined state: `a.b` resolves to
-/// `<dir>/a/b.lua` or `<dir>/a/b/init.lua`, nothing else.
+/// `<root>/a/b.lua` or `<root>/a/b/init.lua` for each root in order, and
+/// nothing else.
 ///
 /// The module name is restricted to a dotted identifier before it touches
 /// a path, so no spelling of a name can name a parent directory or an
-/// absolute location; the directory is captured at construction rather
-/// than read back from `package.path`, so a script cannot widen the search
-/// by reassigning that string. Chunks compile as text only, for the same
+/// absolute location; the roots are captured at construction rather than
+/// read back from `package.path`, so a script cannot widen the search by
+/// reassigning that string. Chunks compile as text only, for the same
 /// reason `load` does (see [`PRELUDE`]).
-fn confined_searcher(lua: &Lua, dir: PathBuf) -> mlua::Result<Function> {
+fn confined_searcher(lua: &Lua, roots: Vec<PathBuf>) -> mlua::Result<Function> {
     lua.create_function(move |lua, name: String| {
         let well_formed = !name.is_empty()
             && name
@@ -641,10 +662,13 @@ fn confined_searcher(lua: &Lua, dir: PathBuf) -> mlua::Result<Function> {
         }
         let rel = name.replace('.', "/");
         let mut tried = String::new();
-        for candidate in [
-            dir.join(format!("{rel}.lua")),
-            dir.join(&rel).join("init.lua"),
-        ] {
+        let candidates = roots.iter().flat_map(|dir| {
+            [
+                dir.join(format!("{rel}.lua")),
+                dir.join(&rel).join("init.lua"),
+            ]
+        });
+        for candidate in candidates {
             match std::fs::read(&candidate) {
                 Ok(data) => {
                     let loader = lua

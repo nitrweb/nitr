@@ -306,6 +306,49 @@ fn check_cookie_attribute(attr: &str, value: &str) -> mlua::Result<()> {
     }
 }
 
+/// One `Set-Cookie` line as a client reads it: the pair plus every
+/// attribute, `Expires` as unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetCookie {
+    /// Cookie name.
+    pub name: String,
+    /// Cookie value, as sent.
+    pub value: String,
+    /// `Path`, when present.
+    pub path: Option<String>,
+    /// `Domain`, when present.
+    pub domain: Option<String>,
+    /// `Max-Age` in seconds, when present (`0` or less deletes).
+    pub max_age: Option<i64>,
+    /// `Expires` as unix seconds, when present and parseable.
+    pub expires: Option<i64>,
+    /// Whether `Secure` is set.
+    pub secure: bool,
+    /// Whether `HttpOnly` is set.
+    pub http_only: bool,
+    /// `SameSite` as written (`Strict`, `Lax`, `None`), when present.
+    pub same_site: Option<String>,
+}
+
+/// Parses one `Set-Cookie` header value, or `None` when it has no valid
+/// `name=value` pair. The attribute grammar is the `cookie` crate's (the
+/// same crate that serializes Nitr's own cookies), so a round trip cannot
+/// disagree with the writer.
+pub fn parse_set_cookie(line: &str) -> Option<SetCookie> {
+    let parsed = cookie::Cookie::parse(line).ok()?;
+    Some(SetCookie {
+        name: parsed.name().to_string(),
+        value: parsed.value().to_string(),
+        path: parsed.path().map(str::to_string),
+        domain: parsed.domain().map(str::to_string),
+        max_age: parsed.max_age().map(|age| age.whole_seconds()),
+        expires: parsed.expires_datetime().map(|at| at.unix_timestamp()),
+        secure: parsed.secure().unwrap_or(false),
+        http_only: parsed.http_only().unwrap_or(false),
+        same_site: parsed.same_site().map(|s| s.to_string()),
+    })
+}
+
 /// Encodes and signs a cookie value: `b64(value) . b64(hmac)`, with the
 /// cookie name bound into the MAC so values cannot be swapped between
 /// cookies.
@@ -497,7 +540,97 @@ mod tests {
         }
     }
 
+    #[test]
+    fn set_cookie_lines_parse_into_their_attributes() {
+        let full = parse_set_cookie(
+            "sid=abc; Path=/app; Domain=example.com; Max-Age=60; \
+             Expires=Wed, 21 Oct 2015 07:28:00 GMT; Secure; HttpOnly; SameSite=Strict",
+        )
+        .expect("parses");
+        assert_eq!(
+            full,
+            SetCookie {
+                name: "sid".into(),
+                value: "abc".into(),
+                path: Some("/app".into()),
+                domain: Some("example.com".into()),
+                max_age: Some(60),
+                expires: Some(1_445_412_480),
+                secure: true,
+                http_only: true,
+                same_site: Some("Strict".into()),
+            }
+        );
+        let bare = parse_set_cookie("theme=dark").expect("bare");
+        assert_eq!((bare.path, bare.max_age, bare.secure), (None, None, false));
+        let deleted = parse_set_cookie("sid=; Max-Age=0").expect("deletion");
+        assert_eq!((deleted.value.as_str(), deleted.max_age), ("", Some(0)));
+        assert_eq!(parse_set_cookie("no pair here"), None);
+        assert_eq!(parse_set_cookie(""), None);
+    }
+
+    #[test]
+    fn nitr_cookie_signs_and_verifies_like_the_cookie_builders() {
+        let lua = mlua::Lua::new();
+        let nitr = lua.create_table().expect("table");
+        super::super::register(&lua, &nitr).expect("register");
+        lua.globals().set("nitr", nitr).expect("global");
+        let (signed, back, forged, swapped): (String, String, Value, Value) = lua
+            .load(
+                r#"local s = nitr.cookie.sign("session", '{"user":"ann"}', "k")
+                   return s, nitr.cookie.verify("session", s, "k"),
+                          nitr.cookie.verify("session", s, "other"),
+                          nitr.cookie.verify("tracking", s, "k")"#,
+            )
+            .eval()
+            .expect("eval");
+        assert_eq!(signed, sign("session", r#"{"user":"ann"}"#, "k"));
+        assert_eq!(back, r#"{"user":"ann"}"#);
+        assert!(forged.is_nil() && swapped.is_nil());
+    }
+
     proptest::proptest! {
+        /// Property: a cookie Nitr serializes parses back to exactly the
+        /// name, value and attributes it was built with — the client jar
+        /// in `nitr test` reads what production writes.
+        #[test]
+        fn prop_set_cookie_round_trip(
+            name in "[A-Za-z0-9_!#$%&'*+.^`|~-]{1,16}",
+            value in "[A-Za-z0-9!#$%&'()*+./:<=>?@^_`{|}~-]{0,32}",
+            path in proptest::option::of("/[A-Za-z0-9_./-]{0,16}"),
+            max_age in proptest::option::of(-10i64..100_000),
+            same_site in proptest::option::of(proptest::sample::select(vec!["Strict", "Lax", "None"])),
+            secure in proptest::bool::ANY,
+            http_only in proptest::bool::ANY,
+        ) {
+            let lua = mlua::Lua::new();
+            let opts = lua.create_table().expect("opts");
+            opts.set("secure", secure).expect("secure");
+            opts.set("http_only", http_only).expect("http_only");
+            if let Some(path) = &path {
+                opts.set("path", path.as_str()).expect("path");
+            }
+            if let Some(age) = max_age {
+                opts.set("max_age", age).expect("max_age");
+            }
+            if let Some(same_site) = same_site {
+                opts.set("same_site", same_site).expect("same_site");
+            }
+            let line = build_cookie(&lua, &name, &value, Some(&opts)).expect("build");
+            let parsed = parse_set_cookie(&line).expect("parse back");
+            proptest::prop_assert_eq!(parsed.name, name);
+            proptest::prop_assert_eq!(parsed.value, value);
+            proptest::prop_assert_eq!(parsed.path, path);
+            // A negative `Max-Age` is written as given and read as 0 —
+            // both mean "delete now" (RFC 6265 §5.2.2).
+            proptest::prop_assert_eq!(parsed.max_age, max_age.map(|age| age.max(0)));
+            proptest::prop_assert_eq!(parsed.same_site.as_deref(), same_site);
+            // The `cookie` crate writes `Secure` whenever `SameSite=None`
+            // is set, as browsers require.
+            proptest::prop_assert_eq!(parsed.secure, secure || same_site == Some("None"));
+            proptest::prop_assert_eq!(parsed.http_only, http_only);
+        }
+
         /// Property: sign/verify round-trips arbitrary printable inputs,
         /// and flipping any single character of the signed value breaks
         /// it — as do the wrong secret and a swapped cookie name.

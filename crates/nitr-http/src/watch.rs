@@ -85,8 +85,9 @@ fn relevant(event: &notify::Event, filter: &InputFilter) -> bool {
     content_change && event.paths.iter().any(|path| filter.is_input(path))
 }
 
-/// The directories dev mode should react to.
-fn watch_roots(cfg: &Config) -> Vec<PathBuf> {
+/// The directories dev mode should react to, plus any `extra` ones (the
+/// tests directory under `nitr test --watch`).
+fn watch_roots(cfg: &Config, extra: &[PathBuf]) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut push = |path: Option<&Path>| {
         // A bare `app.lua` has the empty path as its parent: that is the
@@ -107,6 +108,9 @@ fn watch_roots(cfg: &Config) -> Vec<PathBuf> {
     push(cfg.handler_script.parent());
     push(cfg.config_script.as_deref().and_then(Path::parent));
     push(cfg.templating.dir.as_deref());
+    for dir in extra {
+        push(Some(dir.as_path()));
+    }
     roots
 }
 
@@ -118,8 +122,12 @@ fn watch_roots(cfg: &Config) -> Vec<PathBuf> {
 /// large tree can be slow, and `serve()` must never wait on it (a CI
 /// hang taught this the hard way). Dropping the returned guard stops the
 /// thread and with it the watcher.
-pub(crate) fn spawn(cfg: &Config, reload: tokio::sync::mpsc::Sender<()>) -> Option<WatchGuard> {
-    let roots = watch_roots(cfg);
+pub(crate) fn spawn(
+    cfg: &Config,
+    extra: &[PathBuf],
+    reload: tokio::sync::mpsc::Sender<()>,
+) -> Option<WatchGuard> {
+    let roots = watch_roots(cfg, extra);
     if roots.is_empty() {
         return None;
     }
@@ -204,12 +212,12 @@ mod tests {
         };
         // Config script shares the handler's directory; templates are
         // inside it too — one root covers everything.
-        let roots = watch_roots(&cfg);
+        let roots = watch_roots(&cfg, &[]);
         assert_eq!(roots, vec![dir.clone()]);
 
         // A missing templates dir elsewhere is skipped rather than fatal.
         cfg.templating.dir = Some(PathBuf::from("/nonexistent/templates"));
-        let roots = watch_roots(&cfg);
+        let roots = watch_roots(&cfg, &[]);
         assert_eq!(roots, vec![dir.clone()]);
 
         std::fs::remove_dir_all(&dir).ok();

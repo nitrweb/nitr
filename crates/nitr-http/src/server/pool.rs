@@ -33,17 +33,16 @@ pub(crate) fn current_pool(pool: &Arc<RwLock<Arc<RuntimePool>>>) -> Arc<RuntimeP
 /// snapshot, and the compiled handler. The configuration *script* is never
 /// re-run — its snapshot is captured once, so a recycle has no side effects.
 pub(super) fn new_pool(
-    runtimes: Vec<Runtime>,
+    built: Built,
     cfg: &Config,
     builtins: Builtins,
     setup_fns: &Arc<Vec<SetupFn>>,
     modules: &Arc<Vec<Module>>,
     cache: Option<nitr_std::Cache>,
 ) -> RuntimePool {
-    // A rebuilt state needs the same configuration snapshot the others got.
-    let snapshot = runtimes
-        .first()
-        .and_then(|rt| rt.cfg_snapshot().ok().flatten());
+    // A rebuilt state gets the snapshot every other state got: the
+    // configuration script's result, before any handler touched it.
+    let Built { runtimes, snapshot } = built;
     let cfg = cfg.clone();
     let setup_fns = setup_fns.clone();
     let modules = modules.clone();
@@ -54,13 +53,18 @@ pub(super) fn new_pool(
             rt.set_cfg_snapshot(snapshot)?;
         }
         set_nitr_cfg(&rt)?;
-        app::load(&rt, &cfg.handler_script, &base_statics, &input_env(&cfg))?;
+        app::load(
+            rt.lua(),
+            &cfg.handler_script,
+            &base_statics,
+            &input_env(&cfg),
+        )?;
         Ok(rt)
     })
 }
 
 /// What route `input` declarations may rely on in this deployment.
-pub(super) fn input_env(cfg: &Config) -> crate::validation::InputEnv {
+pub(crate) fn input_env(cfg: &Config) -> crate::validation::InputEnv {
     let mut reserved = Vec::new();
     if cfg.openapi.enabled {
         reserved.push((cfg.openapi.path.clone(), "[openapi] path"));
@@ -103,6 +107,17 @@ pub(super) fn build_docs(
     Ok(Arc::new(docs))
 }
 
+/// The pooled runtimes of one (re)build, with the configuration
+/// snapshot they were given.
+pub(super) struct Built {
+    pub(super) runtimes: Vec<Runtime>,
+    /// The configuration script's result, taken before the handler script
+    /// loaded: a handler may add anything to `nitr.cfg` (a function, a
+    /// userdata), and that must neither fail a boot nor reach a state
+    /// that did not run it.
+    pub(super) snapshot: Option<serde_json::Value>,
+}
+
 /// Builds the full set of pooled runtimes: a bootstrap state runs the
 /// configuration script exactly once and its snapshot is injected into the
 /// rest. Also used by reloads, so the configuration script's side effects
@@ -113,7 +128,7 @@ pub(super) async fn build_runtimes(
     setup_fns: &Arc<Vec<SetupFn>>,
     modules: &Arc<Vec<Module>>,
     cache: Option<&nitr_std::Cache>,
-) -> Result<Vec<Runtime>> {
+) -> Result<Built> {
     let workers = cfg.workers.max(1);
     let base_statics = crate::static_files::base_mounts(cfg);
 
@@ -136,7 +151,7 @@ pub(super) async fn build_runtimes(
     };
     set_nitr_cfg(&bootstrap)?;
     let env = input_env(cfg);
-    if app::load(&bootstrap, &cfg.handler_script, &base_statics, &env)? {
+    if app::load(bootstrap.lua(), &cfg.handler_script, &base_statics, &env)? {
         // The disk the validated uploads of one moment may occupy, so the
         // operator has seen the number before the first upload.
         tracing::info!(
@@ -152,7 +167,10 @@ pub(super) async fn build_runtimes(
         );
     }
     if workers == 1 {
-        return Ok(vec![bootstrap]);
+        return Ok(Built {
+            runtimes: vec![bootstrap],
+            snapshot,
+        });
     }
 
     // Remaining states: inject the snapshot instead of re-running the
@@ -167,6 +185,7 @@ pub(super) async fn build_runtimes(
         let modules = modules.clone();
         let cache = cache.cloned();
         let env = env.clone();
+        let snapshot = snapshot.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<Runtime>> {
             let mut runtimes = Vec::with_capacity(workers - 1);
             for _ in 1..workers {
@@ -175,7 +194,7 @@ pub(super) async fn build_runtimes(
                     rt.set_cfg_snapshot(snapshot)?;
                 }
                 set_nitr_cfg(&rt)?;
-                app::load(&rt, &cfg.handler_script, &base_statics, &env)?;
+                app::load(rt.lua(), &cfg.handler_script, &base_statics, &env)?;
                 runtimes.push(rt);
             }
             Ok(runtimes)
@@ -188,7 +207,7 @@ pub(super) async fn build_runtimes(
     let mut runtimes = Vec::with_capacity(workers);
     runtimes.push(bootstrap);
     runtimes.extend(rest);
-    Ok(runtimes)
+    Ok(Built { runtimes, snapshot })
 }
 
 fn new_runtime(

@@ -248,9 +248,19 @@ dir = "scripts/templates"
 
 # The `nitr test` runner.
 #[testing]
-#dir = "tests"             # where *.lua test files are discovered
-#database = "test.db"      # SQLite file tests run against; unset = a fresh
-                           # private file per run (never [database] path)
+#dir = "tests"             # where *.lua test files are discovered (not
+                           # recursive: tests/helpers/*.lua are modules a
+                           # test can `require`, never test files)
+#database = "test.db"      # SQLite file tests run against, recreated at the
+                           # start of every run and kept afterwards; unset =
+                           # a private file per run, removed after it (never
+                           # [database] path, which is refused here)
+#seed = "tests/fixtures/seed.sql"  # applied after the migrations (and the
+                           # config script), before the snapshot that
+                           # `nitr.test.db.reset()` restores
+#capture = true            # capture log lines per test and print them only
+                           # under a failed one (`--nocapture` streams them)
+#slow_ms = 1000            # tests slower than this are marked `slow`
 
 # Environment handling: a dotenv-style file loaded at startup, and what
 # the opt-in `nitr.env` builtin may read. The file's values never override

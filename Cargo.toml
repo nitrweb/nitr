@@ -128,8 +128,10 @@ reqwest = { version = "0.13.4", default-features = false, features = [
     "rustls-no-provider",
 ] }
 # `hooks` is the statement authorizer that keeps `ATTACH` out of reach of
-# scripts (see `nitr-std/src/db/pragmas.rs`).
-rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
+# scripts (see `nitr-std/src/db/pragmas.rs`). `backup` is SQLite's online
+# backup API, the only snapshot path `nitr test` has (`t.db.reset`):
+# `VACUUM INTO` and `ATTACH` are denied by that same authorizer.
+rusqlite = { version = "0.40.2", features = ["bundled", "hooks", "backup"] }
 # Inbound TLS termination (`[tls]`, the `tls` feature).
 #
 # `default-features = false` is what picks the crypto provider: rustls

@@ -1,0 +1,13 @@
+# Tokens for `sse_parse`: the whole input is an event-stream body.
+"data:"
+"data: "
+"event:"
+"id:"
+"retry:"
+": "
+"\x0a"
+"\x0d"
+"\x0d\x0a"
+"\x0a\x0a"
+"\xef\xbb\xbf"
+"\x00"

@@ -112,6 +112,9 @@ jobs:
           # keep the parser from ever seeing a multi-block chain.
           - target: tls-pem
             max_len: 16384
+          # An event-stream body from `nitr test`'s `resp:sse()`.
+          - target: sse-parse
+            max_len: 8192
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4

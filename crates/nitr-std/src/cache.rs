@@ -155,6 +155,21 @@ impl Cache {
         }
     }
 
+    /// Drops every entry (the counters stay). `nitr test` calls it
+    /// between test files, so no file sees what the previous one cached.
+    ///
+    /// # Errors
+    ///
+    /// Only when a panic poisoned the lock.
+    pub fn clear(&self) -> mlua::Result<()> {
+        let mut inner = self.lock()?;
+        inner.entries.clear();
+        inner.lru.clear();
+        inner.expiry.clear();
+        inner.bytes = 0;
+        Ok(())
+    }
+
     fn lock(&self) -> mlua::Result<std::sync::MutexGuard<'_, Inner>> {
         self.inner
             .lock()
@@ -166,7 +181,9 @@ impl Cache {
     }
 
     fn get_raw(&self, key: &str) -> mlua::Result<Option<Vec<u8>>> {
-        let now = Instant::now();
+        // Expiry reads the standard library's clock, so a test can age an
+        // entry with `nitr.test.clock.advance` instead of sleeping.
+        let now = crate::clock::now_instant();
         let touched = self.tick();
         let mut inner = self.lock()?;
         let inner = &mut *inner;
@@ -220,7 +237,9 @@ impl Cache {
         // from request data must not be able to reach that. Anything past
         // the clamp is "effectively forever" and behaves like it.
         let expires_at = (ttl > 0)
-            .then(|| Instant::now().checked_add(Duration::from_secs(ttl.min(MAX_TTL_SECS))))
+            .then(|| {
+                crate::clock::now_instant().checked_add(Duration::from_secs(ttl.min(MAX_TTL_SECS)))
+            })
             .flatten();
         let touched = self.tick();
         let mut inner = self.lock()?;
@@ -254,7 +273,7 @@ impl Cache {
     /// than by a sweep on every write. Dropping expired entries does not
     /// count as an eviction — they were dead already.
     fn evict(&self, inner: &mut Inner) {
-        let now = Instant::now();
+        let now = crate::clock::now_instant();
         while inner.entries.len() > self.opts.max_entries || inner.bytes > self.opts.max_bytes {
             let expired = inner
                 .expiry
@@ -318,14 +337,7 @@ impl UserData for Cache {
             Ok(inner.remove(&key).is_some())
         });
 
-        methods.add_method("clear", |_, cache, ()| {
-            let mut inner = cache.lock()?;
-            inner.entries.clear();
-            inner.lru.clear();
-            inner.expiry.clear();
-            inner.bytes = 0;
-            Ok(())
-        });
+        methods.add_method("clear", |_, cache, ()| cache.clear());
 
         // cache:remember(key, opts?, fn) — get, or compute and store.
         //
@@ -450,6 +462,23 @@ mod tests {
         // Key and value both count.
         assert_eq!(inner.bytes, Entry::cost("a", b"{\"n\":1}"));
         assert_eq!((inner.hits, inner.misses), (1, 1));
+    }
+
+    /// `Cache::clear` (the runner's between-files reset) empties the
+    /// entries and the byte count together, and a clone — the handle
+    /// every state holds — sees the same empty cache.
+    #[test]
+    fn clear_empties_every_handle_to_the_cache() {
+        let c = cache(CacheOptions::default());
+        let shared = c.clone();
+        c.set_raw("a".into(), b"1".to_vec(), Some(60)).expect("set");
+        c.set_raw("b".into(), b"2".to_vec(), None).expect("set");
+        shared.clear().expect("clear");
+        assert_eq!(c.get_raw("a").expect("get"), None);
+        assert_eq!(c.get_raw("b").expect("get"), None);
+        let inner = c.inner.lock().expect("lock");
+        assert!(inner.entries.is_empty() && inner.lru.is_empty() && inner.expiry.is_empty());
+        assert_eq!(inner.bytes, 0);
     }
 
     #[test]

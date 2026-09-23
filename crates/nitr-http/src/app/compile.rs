@@ -90,8 +90,20 @@ pub(super) fn compile(
             None => None,
         };
         inputs.push(input.as_ref().map(|(schemas, _)| schemas.clone()));
+        // Invariant: route registration refuses an empty function list, so
+        // a compiled route always carries at least its handler.
+        #[allow(clippy::expect_used)]
+        let handler = route
+            .fns
+            .last()
+            .expect("route registration requires at least a handler")
+            .clone();
         chains.push(Chain {
             fns: compose(&def.middleware, route)?,
+            handler,
+            method: route.method.clone(),
+            path: route.path.clone(),
+            site: route.site.clone(),
             error_fn: route.error_fn.clone().or_else(|| def.error_fn.clone()),
             input,
             invalid_fn: route.invalid_fn.clone().or_else(|| def.invalid_fn.clone()),

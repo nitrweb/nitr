@@ -278,6 +278,84 @@ function Session:clear() end
 ---@class nitr.Tx
 local Tx = {}
 
+---A response from `t.request`.
+---@class nitr.test.Response
+---@field status integer The status code.
+---@field headers table<string, string> Lowercase name → last value (call it as `resp:headers(name)` for every value).
+---@field raw_headers table[] `{ name, value }` pairs in order, repeats included.
+---@field body string The whole body (streams are collected).
+---@field cookies table<string, table> Name → `{ value, path, domain, max_age, expires, secure, http_only, same_site }` from every `Set-Cookie`.
+---@field error table|nil When the handler raised: the table `on_error` receives (`kind`, `message`, `source`, `line`, `traceback`, ...) plus `handled` (true when `on_error` answered). The bytes sent to a client never carry it.
+local Response = {}
+
+---The body decoded as JSON; raises when it does not decode.
+---@return any
+function Response:json() end
+
+---The body as a string.
+---@return string
+function Response:text() end
+
+---The first value of a header, or nil.
+---@param name string
+---@return string|nil
+function Response:header(name) end
+
+---The body parsed as a `text/event-stream`: `{ event?, data, id?, retry? }` per dispatched event (`id`/`retry` as the event carried them).
+---@return table[]
+function Response:sse() end
+
+---A client from `t.client`: `:request(method, path, opts)` and `:get`/`:post`/`:put`/`:patch`/`:delete`/`:head`/`:options`.
+---@class nitr.test.Client
+---@field jar nitr.test.Jar|nil The cookie jar, with `cookies = true`.
+local Client = {}
+
+---A request with the client's defaults and jar.
+---@param method string
+---@param path string
+---@param opts? table
+---@return nitr.test.Response
+function Client:request(method, path, opts) end
+
+---A client's cookie jar.
+---@class nitr.test.Jar
+local Jar = {}
+
+---The stored cookie `{ name, value, path, domain?, secure?, http_only?, same_site?, expires_at? }`, or nil once deleted or expired.
+---@param name string
+---@return table|nil
+function Jar:get(name) end
+
+---Stores a cookie as if the server had set it (a forged or signed one).
+---@param name string
+---@param value string
+---@param opts? table `{ path? }`
+function Jar:set(name, value, opts) end
+
+---Forgets every cookie.
+function Jar:clear() end
+
+---The application compiled into the test state (`t.app()`), for unit tests. `dispatch` runs the composed middleware chain only: route `input` validation, `on_invalid`, `on_error` and the protection layer are what `t.request` exercises.
+---@class nitr.test.App
+local App = {}
+
+---A route's own handler function, without its middleware: by the pattern as registered (`"/notes/:id"`) or a path the router matches.
+---@param method string
+---@param path string
+---@return fun(req: nitr.Request): table
+function App:handler(method, path) end
+
+---The server's router lookup (params filled into `req`, `HEAD` falling back to `GET`) and the composed middleware chain; a `404`/`405`/`OPTIONS` answer for what the router does not match.
+---@param method string
+---@param path string
+---@param req nitr.Request
+---@return table
+function App:dispatch(method, path, req) end
+
+---`{ method, path, file, line }` per route, in registration order.
+---@return table[]
+function App:routes() end
+
 ---As a function: a JSON response (`nitr.json({ ok = true })`). Also the codec: `nitr.json:encode(v)` / `nitr.json:decode(s)`. (std feature: `json`)
 ---@class nitr.json
 ---@overload fun(value: any, status: integer?): nitr.Response
@@ -380,6 +458,14 @@ function nitr.fetch(method, url, opts) end
 ---@param ... nitr.FetchHandle|table
 ---@return ...
 function nitr.await_all(...) end
+
+---The current test's captured log entries, `{ level, target, message, fields?, request_id? }` each (`nitr.log` fields decoded), including `debug` from `nitr.log` whatever the console level. Needs `[testing] capture` (the default); a failed test prints its entries. (available in `nitr test` files)
+---@class nitr.test.logs
+---@overload fun(): table[]
+nitr.test.logs = {}
+
+---Drops the entries captured so far.
+function nitr.test.logs.clear() end
 
 ---The minijinja template engine, loading from `[templating] dir`. (std feature: `template`)
 nitr.template = {}
@@ -796,38 +882,216 @@ function nitr.env.number(name, default) end
 ---@return boolean|nil
 function nitr.env.bool(name, default) end
 
----The `nitr test` framework: available in test files only. (available in `nitr test` files)
+---HMAC-SHA256 cookie signing, the same as `res.cookies:set_signed` and `req.cookies:verify` use — for a signed value that travels outside a cookie header, or a test that forges one. (std feature: `http`)
+nitr.cookie = {}
+
+---`b64(value).b64(hmac)`, the cookie name bound into the MAC so a value cannot move between cookies.
+---@param name string
+---@param value string
+---@param secret string
+---@return string
+function nitr.cookie.sign(name, value, secret) end
+
+---The value, or nil when the signature does not match (constant-time comparison).
+---@param name string
+---@param signed string
+---@param secret string
+---@return string|nil
+function nitr.cookie.verify(name, signed, secret) end
+
+---The `nitr test` framework: available in test files only, never in a state that serves requests. A file registers tests; the runner then runs each with its own budget, timeout, duration, captured logs and fresh doubles. Doubles are per test: set them in the test or in `before_each`. (available in `nitr test` files)
 nitr.test = {}
 
----Dispatches through the real router/middleware/handler path.
+---Dispatches through the real protection/router/middleware/handler path, as a request from a client would.
 ---@param method string
 ---@param path string
----@param opts? table `{ headers?, body?, json? }`.
----@return table _ `{ status, headers, body }` plus `:json()`.
+---@param opts? table `{ headers?, query?, cookies?, auth?, body? | json? | form? | multipart?, remote_addr?, timeout? }`: `query` is appended (a list repeats the key); `cookies` becomes one `cookie:` header; `auth` is `{ bearer = token }` or `{ basic = { user, password } }`; exactly one body option (two is an error), and `json`/`form`/`multipart` set `content-type` only when the caller did not; `remote_addr` is the peer the server sees (default `127.0.0.1`), which `[rate_limit]` keys by; `timeout` (seconds, default `[lua] exec_timeout_ms`) bounds the whole exchange, so an endless stream fails the test instead of hanging the run.
+---@return nitr.test.Response
 function nitr.test.request(method, path, opts) end
 
----Groups tests; names are prefixed.
+---`t.request("GET", ...)`. Also `post`, `put`, `patch`, `delete`, `head`, `options`.
+---@param path string
+---@param opts? table
+---@return nitr.test.Response
+function nitr.test.get(path, opts) end
+
+---`t.request("POST", ...)`.
+---@param path string
+---@param opts? table
+---@return nitr.test.Response
+function nitr.test.post(path, opts) end
+
+---`t.request("PUT", ...)`.
+---@param path string
+---@param opts? table
+---@return nitr.test.Response
+function nitr.test.put(path, opts) end
+
+---`t.request("PATCH", ...)`.
+---@param path string
+---@param opts? table
+---@return nitr.test.Response
+function nitr.test.patch(path, opts) end
+
+---`t.request("DELETE", ...)`.
+---@param path string
+---@param opts? table
+---@return nitr.test.Response
+function nitr.test.delete(path, opts) end
+
+---`t.request("HEAD", ...)`.
+---@param path string
+---@param opts? table
+---@return nitr.test.Response
+function nitr.test.head(path, opts) end
+
+---`t.request("OPTIONS", ...)`.
+---@param path string
+---@param opts? table
+---@return nitr.test.Response
+function nitr.test.options(path, opts) end
+
+---A client with defaults and, with `cookies = true`, a jar: cookies stored by name and path (a `Set-Cookie` without `Path` gets the RFC 6265 default, the request path's directory), `Max-Age=0` and a past `Expires` delete, expiry follows `t.clock`. `Secure` and `Domain` are stored and reported but not enforced (there is no transport and one host).
+---@param opts? table `{ base?, headers?, cookies = true?, remote_addr? }`: a path prefix, headers merged under every call's, a cookie jar, the peer address.
+---@return nitr.test.Client
+function nitr.test.client(opts) end
+
+---Groups tests: names are prefixed and hooks registered inside apply to the group. The body runs protected: a throw fails the tests it registered so far plus one `<name> (describe body)` failure, and the file carries on.
 ---@param name string
 ---@param fn fun()
 function nitr.test.describe(name, fn) end
 
----One test case.
+---Registers one test.
 ---@param name string
 ---@param fn fun()
 function nitr.test.it(name, fn) end
 
+---Registers a skipped test (reported apart from `--filter`'s filtered-out tests).
+---@param name string
+---@param fn_or_reason? fun()|string
+function nitr.test.skip(name, fn_or_reason) end
+
+---A test not written yet; `--list` shows it.
+---@param name string
+function nitr.test.todo(name) end
+
+---Focuses the file: its other tests are skipped (reason `only`). The run exits 1 while any `only` is left in place.
+---@param name string
+---@param fn fun()
+function nitr.test.only(name, fn) end
+
+---`t.each(cases)(name, fn)`: one test per case. A positional case (a list) is `string.format`ted into `name` and unpacked into `fn`; a named case (a table with string keys) is passed whole and `name` formats its `name` field.
+---@param cases table[]
+---@return fun(name: string, fn: fun(...))
+function nitr.test.each(cases) end
+
+---Fails the current test from anywhere.
+---@param message? string
+function nitr.test.fail(message) end
+
 ---Starts an assertion.
 ---@param actual any
----@return table _ Matchers: `to_equal`, `to_not_equal`, `to_be_nil`, `to_be_truthy`, `to_match`, `to_contain`.
+---@return table _ Matchers: `to_equal`, `to_not_equal`, `to_be_nil`, `to_not_be_nil`, `to_be_truthy`, `to_be_false`, `to_be_a(type)` (`"integer"`/`"float"` via `math.type`), `to_have_length`, `to_be_greater_than`, `to_be_greater_than_or_equal`, `to_be_less_than`, `to_be_less_than_or_equal`, `to_have_key`, `to_match_object(subset)` (recursive; extra keys ignored), `to_match(pattern)`, `to_not_match`, `to_contain`, `to_not_contain`, `to_throw(text?)` (plain substring of the message), `to_not_throw`, `to_contain_log(subset)`; on a response (from `t.request`, or a table a handler returned): `to_have_status(n)` (a failure shows a body excerpt and `resp.error`), `to_have_header(name, value_or_pattern?)`, `to_have_json(subset)`. Values render bounded (40 entries, 256 bytes).
 function nitr.test.expect(actual) end
 
----Runs before every test in the file.
+---Runs before every test registered after it in this group (and nested ones), outer groups first.
 ---@param fn fun()
 function nitr.test.before_each(fn) end
 
----Runs after every test in the file (even failing ones).
+---Runs after every test registered after it in this group, inner groups first, even when the test failed; its own failure fails a test that passed.
 ---@param fn fun()
 function nitr.test.after_each(fn) end
+
+---Runs once before the group's first test that runs (inside that test's budget). A group left with no test to run runs neither `before_all` nor `after_all`.
+---@param fn fun()
+function nitr.test.before_all(fn) end
+
+---Runs once after the group's last test that runs.
+---@param fn fun()
+function nitr.test.after_all(fn) end
+
+---A real request object for a unit test: `req.*`, `req:json()`, `nitr.session(req, ...)`, `nitr.csrf.token(req)` and `nitr.auth.*` work on it. It passes no protection layer, no body guard and no route validation (`valid` is what the spec says), and multipart parts cannot `:save()`.
+---@param spec? table `{ method?, path?, params?, valid?, ... }` plus every `t.request` option.
+---@return nitr.Request
+function nitr.test.fake_request(spec) end
+
+---The application compiled into this test state (once per file): its handler script's top level and every `app:use` factory run once more here, and nothing it registers is served.
+---@return nitr.test.App
+function nitr.test.app() end
+
+---Exactly the value `session:save` would write for `data`, for a client's jar: `api.jar:set("session", t.session_cookie({ user = "ann" }, { secret = nitr.cfg.session_secret }))`.
+---@param data table
+---@param opts table `{ secret, name?, max_age? }`
+---@return string
+function nitr.test.session_cookie(data, opts) end
+
+---Canned responses for `nitr.fetch` in the handlers under test, answered in Rust before the `[fetch]` policy and the resolver: a matched rule never leaves the process (so a test can mock an internal host without widening `[fetch]`), an unmatched request goes out unchanged, policy included. A mocked call still counts against `max_per_request`; a canned `3xx` is returned as is and `retry` is not exercised. Reset before every test. (available in `nitr test` files)
+nitr.test.fetch = {}
+
+---Adds rules; the first one that matches (method, URL, uses left) answers.
+---@param ... table `{ url, method?, status?, headers?, json? | body?, times? }`: `url` exact, or a prefix written with a trailing `*`; `json` sets `content-type`; `times` spends the rule.
+function nitr.test.fetch.mock(...) end
+
+---With strict on (the default argument), a request no rule matches raises `no fetch mock matched ...` instead of going out.
+---@param on? boolean
+function nitr.test.fetch.strict(on) end
+
+---Every outbound call made since the test started, answered or not.
+---@return table[] _ `{ method, url, headers, body?, json?, mocked }` per call, oldest first (at most 10 000).
+function nitr.test.fetch.calls() end
+
+---Drops the rules, the recorded calls and the strict flag.
+function nitr.test.fetch.reset() end
+
+---The standard library's clock — `nitr.time`, session and JWT expiry, the `after`/`before` validation rules, cache TTLs, the rate limiter's window — but never the execution budget or any timeout. Reset after every test. (available in `nitr test` files)
+nitr.test.clock = {}
+
+---Freezes the wall clock at `ts` (elapsed time keeps flowing).
+---@param ts number Unix seconds.
+function nitr.test.clock.set(ts) end
+
+---Moves wall and elapsed time forward together (at most a century in total).
+---@param secs number
+function nitr.test.clock.advance(secs) end
+
+---Back to the real clock.
+function nitr.test.clock.reset() end
+
+---The clock's unix seconds.
+---@return integer
+function nitr.test.clock.now() end
+
+---Overrides for `nitr.env`, applied after the `[env]` policy: a name the policy hides stays hidden. Reset before every test. (available in `nitr test` files)
+nitr.test.env = {}
+
+---Makes `nitr.env.get(name)` answer `value`.
+---@param name string
+---@param value string
+function nitr.test.env.set(name, value) end
+
+---Makes the variable read as unset.
+---@param name string
+function nitr.test.env.unset(name) end
+
+---Drops every override.
+function nitr.test.env.reset() end
+
+---Fixtures over the test database (never `[database] path`: a scratch file, or `[testing] database`). Every Lua state owns its connection, so the transaction-and-rollback trick cannot work here; a snapshot taken after the migrations, the configuration script and `[testing] seed` is restored instead. The file is created fresh for every run. (available in `nitr test` files)
+nitr.test.db = {}
+
+---Restores the post-migration (+ seed) snapshot. A connection holding a write lock past `[database] busy_timeout` fails it with an error naming the cause.
+function nitr.test.db.reset() end
+
+---Empties the named tables (every application table without an argument) in one transaction, foreign keys checked at commit, `AUTOINCREMENT` counters reset.
+---@param tables? string[]
+function nitr.test.db.truncate(tables) end
+
+---Seeds the database in one transaction.
+---@param spec string|table A SQL file under `[testing] dir` (a regular file, no `..`), or `{ table = { { column = value }, ... } }` inserted with bound parameters.
+function nitr.test.db.seed(spec) end
+
+---Restores the snapshot after every test of this file.
+function nitr.test.db.isolate() end
 
 ---The configuration snapshot returned by `config.lua` (nil without one). (set when a `config_script` is configured)
 nitr.cfg = {}

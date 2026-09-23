@@ -51,8 +51,18 @@ pub struct TestingConfig {
     /// migrations applied — never `[database] path`: a test's
     /// `before_each` is typically a `DELETE FROM ...`, and `nitr test`
     /// on a host whose `nitr.toml` names the live database must not
-    /// empty it.
+    /// empty it. A named file is recreated at the start of every run and
+    /// kept afterwards for inspection; naming `[database] path` here is
+    /// refused.
     pub database: Option<PathBuf>,
+    /// A SQL file applied to the test database after the migrations and
+    /// before the snapshot `nitr.test.db.reset()` restores.
+    pub seed: Option<PathBuf>,
+    /// Whether log lines are captured per test and printed only under a
+    /// failed one (`--nocapture` streams them instead).
+    pub capture: bool,
+    /// Tests slower than this many milliseconds are marked `slow`.
+    pub slow_ms: u64,
 }
 
 impl Default for TestingConfig {
@@ -60,6 +70,9 @@ impl Default for TestingConfig {
         Self {
             dir: PathBuf::from("tests"),
             database: None,
+            seed: None,
+            capture: true,
+            slow_ms: 1000,
         }
     }
 }

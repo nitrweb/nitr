@@ -23,6 +23,7 @@ fn test_runtime(exec_timeout: Option<Duration>) -> Runtime {
         dev_mode: false,
         exec_timeout,
         package_dir: None,
+        extra_package_dirs: Vec::new(),
     })
     .expect("runtime")
 }
@@ -37,6 +38,7 @@ fn package_runtime(package_dir: Option<PathBuf>) -> Runtime {
         dev_mode: false,
         exec_timeout: None,
         package_dir,
+        extra_package_dirs: Vec::new(),
     })
     .expect("runtime")
 }
@@ -261,6 +263,7 @@ async fn the_execution_budget_cannot_be_caught_and_ignored() {
             dev_mode: false,
             exec_timeout: Some(Duration::from_millis(100)),
             package_dir: None,
+            extra_package_dirs: Vec::new(),
         })
         .expect("runtime");
         let looping = eval_function(&rt, &format!("return function() {body} end"));
@@ -464,6 +467,70 @@ async fn require_is_confined_to_the_package_dir() {
         .eval()
         .expect("require init");
     assert_eq!(init, "init");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A second `require` root (`RuntimeOpts::extra_package_dirs`, the tests
+/// directory under `nitr test`) resolves modules after the first, under
+/// the same confinement: no escape shape reaches a file beside either
+/// root, and the first root wins a name both define.
+#[tokio::test]
+async fn extra_require_roots_keep_the_confinement() {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("nitr-rt-roots-{}-{id}", std::process::id()));
+    let app = root.join("app");
+    let tests = root.join("tests");
+    std::fs::create_dir_all(tests.join("helpers")).expect("mkdir tests");
+    std::fs::create_dir_all(&app).expect("mkdir app");
+    std::fs::write(app.join("shared.lua"), "return 'app'").expect("write shared");
+    std::fs::write(tests.join("shared.lua"), "return 'tests'").expect("write shadow");
+    std::fs::write(tests.join("helpers/auth.lua"), "return 'helper'").expect("write helper");
+    std::fs::write(root.join("secret.lua"), "return 'secret'").expect("write secret");
+
+    let rt = Runtime::new_with(RuntimeOpts {
+        libs: StdLib::MATH | StdLib::TABLE | StdLib::STRING | StdLib::PACKAGE,
+        memory_limit: MEMORY_LIMIT,
+        dev_mode: false,
+        exec_timeout: None,
+        package_dir: Some(app.clone()),
+        extra_package_dirs: vec![tests.clone()],
+    })
+    .expect("runtime");
+    let lua = rt.lua();
+
+    let helper: String = lua
+        .load("return require('helpers.auth')")
+        .eval()
+        .expect("helper from the second root");
+    assert_eq!(helper, "helper");
+    let shared: String = lua.load("return require('shared')").eval().expect("shared");
+    assert_eq!(shared, "app", "the application root is searched first");
+
+    // `secret.lua` exists beside both roots, so a hole in either root's
+    // confinement would load it rather than fail.
+    for escape in ["secret", "..secret", "../secret", "helpers/../../secret"] {
+        lua.load(format!("return require('{escape}')"))
+            .eval::<Value>()
+            .expect_err(escape);
+    }
+    let err = lua
+        .load("return require('..secret')")
+        .eval::<Value>()
+        .expect_err("dotted escape");
+    assert!(
+        err.to_string().contains("is not a dotted identifier"),
+        "got: {err}"
+    );
+    let err = lua
+        .load("return require('/etc/passwd')")
+        .eval::<Value>()
+        .expect_err("absolute path");
+    assert!(
+        err.to_string().contains("is not a dotted identifier"),
+        "got: {err}"
+    );
 
     std::fs::remove_dir_all(&root).ok();
 }

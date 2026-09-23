@@ -171,3 +171,10 @@ path = "fuzz_targets/basic_auth.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "sse-parse"
+path = "fuzz_targets/sse_parse.rs"
+test = false
+doc = false
+bench = false

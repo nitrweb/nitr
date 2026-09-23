@@ -4,16 +4,23 @@ listen = "127.0.0.1:3000"
 handler_script = "crates/nitr/examples/app-package/app.lua"
 config_script = "crates/nitr/examples/app-package/config.lua"
 
+# `nitr test` never touches this file: it runs against a fresh private
+# database with the schema applied (see [testing] database in the
+# annotated nitr.toml).
 [database]
-path = "/tmp/nitr-app-package.db"
+path = "/tmp/nitr-app-package-notes.db"
 
 [testing]
 dir = "crates/nitr/examples/app-package/tests"
 
-# Opt into the `db` standard library feature on top of the minimal
-# defaults (json, http, log, time, validate, base64, path, url).
+# The minimal defaults plus the database, the clock, outbound HTTP and
+# environment reads (the webhook URL).
 [std]
-features = ["json", "http", "log", "db"]
+features = ["json", "http", "log", "time", "db", "fetch", "env"]
+
+# Scripts may read APP_* variables only.
+[env]
+allow = ["APP_"]
 
 [static]
 dir = "crates/nitr/examples/app-package/public"

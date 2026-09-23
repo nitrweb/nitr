@@ -105,7 +105,7 @@ impl<'a> Ctx<'a> {
     /// feature), so a request sees one instant.
     fn now(&mut self) -> chrono::DateTime<chrono::Utc> {
         *self.now.get_or_insert_with(|| {
-            chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
+            chrono::DateTime::<chrono::Utc>::from(crate::clock::now_system())
         })
     }
 

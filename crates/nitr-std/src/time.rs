@@ -12,7 +12,7 @@
 //! database.
 
 use std::sync::OnceLock;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// The first second `httpdate` cannot format (year 10000): its
 /// `From<SystemTime>` panics from there on.
@@ -22,11 +22,10 @@ use chrono::format::{Item, StrftimeItems};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use mlua::{Lua, Table, Value};
 
-/// Current unix time in whole seconds.
+/// Current unix time in whole seconds, through the standard library's
+/// clock so `nitr.test.clock` reaches it.
 fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+    crate::clock::now_unix()
 }
 
 /// Converts a unix timestamp into a UTC datetime, rejecting values chrono
@@ -78,8 +77,15 @@ pub(crate) fn create_time_table(lua: &Lua) -> mlua::Result<Table> {
     time.set(
         "monotonic",
         lua.create_function(|_, ()| {
+            // The anchor is real time, only the reading follows the
+            // standard library's clock: an anchor taken while a test had
+            // advanced it would sit in the future after the reset and pin
+            // every later reading at zero.
             static ANCHOR: OnceLock<Instant> = OnceLock::new();
-            Ok(ANCHOR.get_or_init(Instant::now).elapsed().as_secs_f64())
+            let anchor = *ANCHOR.get_or_init(Instant::now);
+            Ok(crate::clock::now_instant()
+                .saturating_duration_since(anchor)
+                .as_secs_f64())
         })?,
     )?;
 

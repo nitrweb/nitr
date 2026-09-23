@@ -50,8 +50,8 @@ impl Config {
     /// `NITR_HANDLER_SCRIPT`, `NITR_CONFIG_SCRIPT`, `NITR_WORKERS`,
     /// `NITR_MAX_STREAMS`, `NITR_DEV_MODE`, `NITR_PIDFILE`. A sectioned
     /// option is named `NITR_<SECTION>_<OPTION>`: `NITR_DATABASE_PATH`,
-    /// `NITR_TEMPLATING_DIR`,
-    /// `NITR_TESTING_DIR`, `NITR_ENV_FILE`, `NITR_LUA_MEMORY_LIMIT`,
+    /// `NITR_TEMPLATING_DIR`, `NITR_TESTING_DIR`, `NITR_TESTING_DATABASE`,
+    /// `NITR_ENV_FILE`, `NITR_LUA_MEMORY_LIMIT`,
     /// `NITR_LUA_EXEC_TIMEOUT_MS`, `NITR_LIMITS_POOL_WAIT_MS`,
     /// `NITR_SHUTDOWN_GRACE`, `NITR_COMPRESSION_ENABLED`,
     /// `NITR_TLS_ENABLED`, `NITR_TLS_CERT`, `NITR_TLS_KEY`,
@@ -111,6 +111,9 @@ impl Config {
         }
         if let Some(v) = env_var("NITR_TESTING_DIR") {
             self.testing.dir = PathBuf::from(v);
+        }
+        if let Some(v) = env_var("NITR_TESTING_DATABASE") {
+            self.testing.database = Some(PathBuf::from(v));
         }
         if let Some(v) = env_var("NITR_WORKERS") {
             self.workers = parse_env("NITR_WORKERS", &v)?;

@@ -16,7 +16,25 @@ use nitr_core::{Error, ErrorInfo, Result};
 /// A generic 500 that never leaks internals to clients; in development mode
 /// the classified error is rendered in context for fast iteration.
 pub(super) fn error_response(err: &Error, dev_mode: bool) -> Result<HttpResponse> {
-    error_page_with_source(&ErrorInfo::from_error(err), dev_mode, false, None)
+    let info = ErrorInfo::from_error(err);
+    let resp = error_page_with_source(&info, dev_mode, false, None)?;
+    Ok(with_failure(resp, info, false))
+}
+
+/// Attaches why the request failed to its response, as an
+/// `http::Extensions` value — the whole [`ErrorInfo`], traceback included.
+///
+/// `nitr test` reads it into `resp.error`, so a red integration test shows
+/// the cause without `--dev` and without hunting the log. Hyper never
+/// serializes extensions, and compression and `HEAD` stripping carry them
+/// through `into_parts`/`from_parts`, so the bytes a real client receives
+/// are unchanged: the dev page is still the only place a traceback is
+/// ever *sent*. `handled` is true when the app's `on_error` produced the
+/// response.
+pub(super) fn with_failure(mut resp: HttpResponse, info: ErrorInfo, handled: bool) -> HttpResponse {
+    resp.extensions_mut()
+        .insert(crate::testing::HandlerFailure { info, handled });
+    resp
 }
 
 /// Whether the client would rather see HTML than plain text.

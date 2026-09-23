@@ -31,8 +31,8 @@ pub use nitr_http::testing;
 
 // Re-exports
 pub use nitr_core::{
-    DeadlineHandle, Error, ModuleFn, Result, Runtime, RuntimeGuard, RuntimeOpts, RuntimePool,
-    mount, nitr_table,
+    DeadlineHandle, Error, ErrorInfo, ModuleFn, Result, Runtime, RuntimeGuard, RuntimeOpts,
+    RuntimePool, mount, nitr_table,
 };
 pub use nitr_http::{
     CacheConfig, CompressionConfig, Config, CookieSecure, CookiesConfig, CorsConfig,

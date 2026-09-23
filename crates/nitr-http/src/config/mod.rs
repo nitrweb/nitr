@@ -242,6 +242,10 @@ impl Config {
                 ms => Some(std::time::Duration::from_millis(ms)),
             },
             package_dir: Some(package_dir),
+            // Server states resolve `require` against the application
+            // alone; only `nitr test` adds a second root, and only to its
+            // own test states.
+            extra_package_dirs: Vec::new(),
         })
     }
 }

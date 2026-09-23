@@ -24,6 +24,7 @@ pub mod pragmas;
 pub(crate) mod query;
 pub(crate) mod query_one;
 pub(crate) mod query_row;
+pub mod testing;
 pub(crate) mod types;
 
 use crate::config::SqlitePragmas;

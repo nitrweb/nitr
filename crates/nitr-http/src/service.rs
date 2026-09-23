@@ -88,23 +88,14 @@ impl Service<Request<Incoming>> for Svc {
             path = %req.uri().path(),
             status = tracing::field::Empty,
         );
-        let req = LuaRequest {
-            peer_addr: self.peer_addr,
-            req: req.map(|body| {
+        let req = LuaRequest::synthetic(
+            req.map(|body| {
                 use http_body_util::BodyExt as _;
                 body.map_err(|err| Box::new(err) as _).boxed()
             }),
-            params: Vec::new(),
-            id: id.into(),
-            // Replaced with the configured bounds by the handler.
-            limits: Default::default(),
-            cached_form: None,
-            body_limit: u64::MAX,
-            cached_body: None,
-            body_consumed: false,
-            valid: None,
-            spool_dir: None,
-        };
+            self.peer_addr,
+            id.into(),
+        );
 
         Box::pin(
             async move { handler::handle(&pool, req, streams, protection).await }.instrument(span),

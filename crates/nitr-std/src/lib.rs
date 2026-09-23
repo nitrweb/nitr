@@ -24,6 +24,7 @@ use nitr_core::Result;
 pub(crate) mod base64;
 pub(crate) mod bounded;
 pub mod cache;
+pub mod clock;
 pub(crate) mod config;
 #[cfg(feature = "crypto")]
 pub(crate) mod crypto;
@@ -40,6 +41,7 @@ pub(crate) mod path;
 pub(crate) mod session;
 #[cfg(feature = "template")]
 pub(crate) mod template;
+pub mod testing;
 pub(crate) mod time;
 pub(crate) mod url;
 pub(crate) mod utils;
@@ -67,7 +69,7 @@ pub mod validation {
 // The configuration types are always available: `nitr.toml` has one shape
 // regardless of which builtins this build compiled in.
 pub use config::{EnvOptions, FetchOptions, MAX_PASSWORD_BYTES, SqlitePragmas};
-pub use http::{RequestCookies, ResponseCookies, best_match};
+pub use http::{RequestCookies, ResponseCookies, SetCookie, best_match, parse_set_cookie};
 pub use utils::error_lua_value;
 
 /// Internal functions exposed for the fuzz targets in `fuzz/` only.
@@ -95,8 +97,23 @@ pub mod fuzzing {
 pub use db::migrate;
 #[cfg(feature = "db")]
 pub use db::pragmas::open as db_open;
+/// Database fixtures for `nitr test`: snapshot/restore, truncate, seed.
+#[cfg(feature = "db")]
+pub use db::testing as db_fixtures;
 #[cfg(feature = "fetch")]
 pub use fetch::{reset_outbound_budget, set_trace_context};
+
+/// Encodes a Lua value as JSON under the standard library's bounds (depth,
+/// node count, UTF-8) — the encoder anything outside this crate uses for a
+/// script's value, so deep nesting is an error rather than a stack
+/// overflow.
+///
+/// # Errors
+///
+/// A value past the bounds, or one JSON cannot represent.
+pub fn json_encode(value: &mlua::Value) -> mlua::Result<Vec<u8>> {
+    bounded::to_json_vec(value).map_err(mlua::Error::external)
+}
 
 /// Resets the per-request outbound budget. A no-op without the `fetch`
 /// feature, so the server can call it unconditionally.

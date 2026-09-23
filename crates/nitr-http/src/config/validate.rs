@@ -680,6 +680,41 @@ impl Config {
             anchor(dir);
         }
         anchor(&mut self.testing.dir);
+        if let Some(path) = &mut self.testing.seed {
+            anchor(path);
+        }
+    }
+
+    /// What `nitr test` checks on top of the boot validation: its tests
+    /// directory becomes a second `require` root in test states, so it
+    /// gets the rule the handler's directory has — an upload root inside
+    /// it would make an uploaded `.lua` file a loadable module.
+    pub fn validate_testing(&self) -> Result {
+        // `nitr test` truncates, seeds and restores its database; pointed
+        // at the live one, one `t.db.truncate()` empties production data.
+        if let (Some(db), Some(test_db)) = (&self.database, &self.testing.database)
+            && resolved_file(&db.path) == resolved_file(test_db)
+        {
+            return Err(Error::Config(format!(
+                "[testing] database {} is [database] path: tests reset, truncate and seed \
+                 their database. Name a separate file, or leave [testing] database unset for \
+                 a private one per run.",
+                test_db.display()
+            )));
+        }
+        if let Some(dir) = &self.multipart.upload_dir
+            && let (Ok(upload), Ok(tests)) = (dir.canonicalize(), self.testing.dir.canonicalize())
+            && upload.starts_with(&tests)
+        {
+            return Err(Error::Config(format!(
+                "[multipart] upload_dir {} is inside [testing] dir {}: `nitr test` lets test \
+                 files `require` from there, so an uploaded file would be a loadable Lua \
+                 module. Put the upload root outside it.",
+                upload.display(),
+                tests.display()
+            )));
+        }
+        Ok(())
     }
 
     /// The effective configuration after file, environment, and flag
@@ -693,6 +728,28 @@ impl Config {
         let json = strip_nulls(json);
         toml::to_string_pretty(&json)
             .map_err(|err| Error::Config(format!("cannot render the configuration: {err}")))
+    }
+}
+
+/// A file's path with its directory canonicalized, so two spellings of one
+/// file compare equal even before the file exists.
+fn resolved_file(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            parent
+                .canonicalize()
+                .map(|dir| dir.join(name))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+        _ => path.to_path_buf(),
     }
 }
 

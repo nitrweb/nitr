@@ -249,6 +249,7 @@ mod tests {
             dev_mode: false,
             exec_timeout: None,
             package_dir: None,
+            extra_package_dirs: Vec::new(),
         })
         .expect("runtime")
     }

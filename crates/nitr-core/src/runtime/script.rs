@@ -16,21 +16,8 @@ use crate::{Error, Result};
 use super::Runtime;
 
 impl Runtime {
-    /// Loads and runs a chunk the way `eval` does — expression form first,
-    /// statement block second — but with precise diagnostics: when *both*
-    /// parses fail, the
-    /// error that got further into the file wins. mlua's own `eval` reports
-    /// only the block fallback, which for an expression-form script always
-    /// blames the top-level `function(` line instead of the actual typo.
-    ///
-    /// The chunk is named after the file (`@` marks a real path) so errors
-    /// report `config.lua:12` instead of an anonymous chunk.
-    pub(super) fn eval_chunk(&self, data: Vec<u8>, path: &Path) -> mlua::Result<Value> {
-        self.load_chunk(data, path)?.call(())
-    }
-
-    /// The compile half of [`eval_chunk`](Self::eval_chunk): the dual parse
-    /// without the call, for callers that pass the chunk arguments (a
+    /// The compile half of [`eval_script`](Self::eval_script): the dual
+    /// parse without the call, for callers that pass the chunk arguments (a
     /// loaded chunk is itself a vararg function) or must call it async.
     ///
     /// The expression parse is skipped when the chunk's first token can only
@@ -39,52 +26,7 @@ impl Runtime {
     /// result nor the diagnostic, and a handler script — which always starts
     /// that way — is parsed once instead of twice on every pooled state.
     pub(super) fn load_chunk(&self, data: Vec<u8>, path: &Path) -> mlua::Result<Function> {
-        let name = format!("@{}", path.display());
-        // Text only, like every other chunk the runtime compiles: a script
-        // file that is precompiled bytecode is refused rather than trusted
-        // (see `PRELUDE` in the parent module for why bytecode is unsafe).
-        let expr_err = if starts_as_statement(&data) {
-            None
-        } else {
-            // `return ` on the same line keeps every line number intact.
-            let mut wrapped = Vec::with_capacity(data.len() + 7);
-            wrapped.extend_from_slice(b"return ");
-            wrapped.extend_from_slice(&data);
-            match self
-                .lua
-                .load(wrapped)
-                .set_name(&name)
-                .set_mode(mlua::chunk::ChunkMode::Text)
-                .into_function()
-            {
-                Ok(f) => return Ok(f),
-                Err(err) => Some(err),
-            }
-        };
-        match self
-            .lua
-            .load(data)
-            .set_name(&name)
-            .set_mode(mlua::chunk::ChunkMode::Text)
-            .into_function()
-        {
-            Ok(f) => Ok(f),
-            Err(block_err) => {
-                let Some(expr_err) = expr_err else {
-                    return Err(block_err);
-                };
-                let line = |err: &mlua::Error| {
-                    crate::error::ErrorInfo::from_error(&Error::Lua(err.clone()))
-                        .line
-                        .unwrap_or(0)
-                };
-                if line(&expr_err) > line(&block_err) {
-                    Err(expr_err)
-                } else {
-                    Err(block_err)
-                }
-            }
-        }
+        load_chunk_in(&self.lua, data, path)
     }
 
     /// Loads and evaluates a Lua script file, returning the resulting value.
@@ -92,15 +34,24 @@ impl Runtime {
     /// This does not interpret the result; callers decide what the script is
     /// expected to return (e.g. a handler function or an application object).
     pub fn eval_script(&self, path: &Path) -> Result<Value> {
-        let data = std::fs::read(path).map_err(|err| {
-            Error::Script(format!(
-                "failed to read the Lua script {}: {err}",
-                path.display()
-            ))
-        })?;
-        self.eval_chunk(data, path)
-            .map_err(|err| load_error(path, err))
+        eval_script(&self.lua, path)
     }
+}
+
+/// [`Runtime::eval_script`] on a bare state — for code that holds only
+/// the `Lua` handle, such as a builtin that loads the application into
+/// the state it runs in (`nitr test`'s `t.app()`). The same text-only
+/// compile and the same in-context error rendering.
+pub fn eval_script(lua: &mlua::Lua, path: &Path) -> Result<Value> {
+    let data = std::fs::read(path).map_err(|err| {
+        Error::Script(format!(
+            "failed to read the Lua script {}: {err}",
+            path.display()
+        ))
+    })?;
+    load_chunk_in(lua, data, path)
+        .and_then(|chunk| chunk.call(()))
+        .map_err(|err| load_error(path, err))
 }
 
 /// Converts a load-time Lua failure into a [`Error::Script`] that points at
@@ -209,6 +160,62 @@ fn long_bracket_level(s: &[u8]) -> Option<usize> {
     let after_open = s.strip_prefix(b"[")?;
     let level = after_open.iter().take_while(|b| **b == b'=').count();
     (after_open.get(level) == Some(&b'[')).then_some(level)
+}
+
+/// Compiles a chunk the way `eval` does — expression form first, statement
+/// block second, text only — but with precise diagnostics: when *both*
+/// parses fail, the error that got further into the file wins. mlua's own
+/// `eval` reports only the block fallback, which for an expression-form
+/// script always blames the top-level `function(` line instead of the
+/// actual typo.
+///
+/// The chunk is named after the file (`@` marks a real path) so errors
+/// report `config.lua:12` instead of an anonymous chunk.
+fn load_chunk_in(lua: &mlua::Lua, data: Vec<u8>, path: &Path) -> mlua::Result<Function> {
+    let name = format!("@{}", path.display());
+    // Text only, like every other chunk the runtime compiles: a script
+    // file that is precompiled bytecode is refused rather than trusted
+    // (see `PRELUDE` in the parent module for why bytecode is unsafe).
+    let expr_err = if starts_as_statement(&data) {
+        None
+    } else {
+        // `return ` on the same line keeps every line number intact.
+        let mut wrapped = Vec::with_capacity(data.len() + 7);
+        wrapped.extend_from_slice(b"return ");
+        wrapped.extend_from_slice(&data);
+        match lua
+            .load(wrapped)
+            .set_name(&name)
+            .set_mode(mlua::chunk::ChunkMode::Text)
+            .into_function()
+        {
+            Ok(f) => return Ok(f),
+            Err(err) => Some(err),
+        }
+    };
+    match lua
+        .load(data)
+        .set_name(&name)
+        .set_mode(mlua::chunk::ChunkMode::Text)
+        .into_function()
+    {
+        Ok(f) => Ok(f),
+        Err(block_err) => {
+            let Some(expr_err) = expr_err else {
+                return Err(block_err);
+            };
+            let line = |err: &mlua::Error| {
+                crate::error::ErrorInfo::from_error(&Error::Lua(err.clone()))
+                    .line
+                    .unwrap_or(0)
+            };
+            if line(&expr_err) > line(&block_err) {
+                Err(expr_err)
+            } else {
+                Err(block_err)
+            }
+        }
+    }
 }
 
 #[cfg(test)]

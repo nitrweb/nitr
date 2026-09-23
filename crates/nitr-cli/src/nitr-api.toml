@@ -685,17 +685,182 @@ functions = [
 ]
 
 [[table]]
+name = "nitr.cookie"
+feature = "http"
+desc = "HMAC-SHA256 cookie signing, the same as `res.cookies:set_signed` and `req.cookies:verify` use — for a signed value that travels outside a cookie header, or a test that forges one."
+functions = [
+  { name = "sign", params = [{ name = "name", type = "string" }, { name = "value", type = "string" }, { name = "secret", type = "string" }], returns = [{ type = "string" }], desc = "`b64(value).b64(hmac)`, the cookie name bound into the MAC so a value cannot move between cookies." },
+  { name = "verify", params = [{ name = "name", type = "string" }, { name = "signed", type = "string" }, { name = "secret", type = "string" }], returns = [{ type = "string|nil" }], desc = "The value, or nil when the signature does not match (constant-time comparison)." },
+]
+
+[[table]]
 name = "nitr.test"
 feature = "test"
-desc = "The `nitr test` framework: available in test files only."
+desc = "The `nitr test` framework: available in test files only, never in a state that serves requests. A file registers tests; the runner then runs each with its own budget, timeout, duration, captured logs and fresh doubles. Doubles are per test: set them in the test or in `before_each`."
 functions = [
-  { name = "request", params = [{ name = "method", type = "string" }, { name = "path", type = "string" }, { name = "opts", type = "table?", desc = "`{ headers?, body?, json? }`." }], returns = [{ type = "table", desc = "`{ status, headers, body }` plus `:json()`." }], desc = "Dispatches through the real router/middleware/handler path." },
-  { name = "describe", params = [{ name = "name", type = "string" }, { name = "fn", type = "fun()" }], desc = "Groups tests; names are prefixed." },
-  { name = "it", params = [{ name = "name", type = "string" }, { name = "fn", type = "fun()" }], desc = "One test case." },
-  { name = "expect", params = [{ name = "actual", type = "any" }], returns = [{ type = "table", desc = "Matchers: `to_equal`, `to_not_equal`, `to_be_nil`, `to_be_truthy`, `to_match`, `to_contain`." }], desc = "Starts an assertion." },
-  { name = "before_each", params = [{ name = "fn", type = "fun()" }], desc = "Runs before every test in the file." },
-  { name = "after_each", params = [{ name = "fn", type = "fun()" }], desc = "Runs after every test in the file (even failing ones)." },
+  { name = "request", params = [{ name = "method", type = "string" }, { name = "path", type = "string" }, { name = "opts", type = "table?", desc = "`{ headers?, query?, cookies?, auth?, body? | json? | form? | multipart?, remote_addr?, timeout? }`: `query` is appended (a list repeats the key); `cookies` becomes one `cookie:` header; `auth` is `{ bearer = token }` or `{ basic = { user, password } }`; exactly one body option (two is an error), and `json`/`form`/`multipart` set `content-type` only when the caller did not; `remote_addr` is the peer the server sees (default `127.0.0.1`), which `[rate_limit]` keys by; `timeout` (seconds, default `[lua] exec_timeout_ms`) bounds the whole exchange, so an endless stream fails the test instead of hanging the run." }], returns = [{ type = "nitr.test.Response" }], desc = "Dispatches through the real protection/router/middleware/handler path, as a request from a client would." },
+  { name = "get", params = [{ name = "path", type = "string" }, { name = "opts", type = "table?" }], returns = [{ type = "nitr.test.Response" }], desc = "`t.request(\"GET\", ...)`. Also `post`, `put`, `patch`, `delete`, `head`, `options`." },
+  { name = "post", params = [{ name = "path", type = "string" }, { name = "opts", type = "table?" }], returns = [{ type = "nitr.test.Response" }], desc = "`t.request(\"POST\", ...)`." },
+  { name = "put", params = [{ name = "path", type = "string" }, { name = "opts", type = "table?" }], returns = [{ type = "nitr.test.Response" }], desc = "`t.request(\"PUT\", ...)`." },
+  { name = "patch", params = [{ name = "path", type = "string" }, { name = "opts", type = "table?" }], returns = [{ type = "nitr.test.Response" }], desc = "`t.request(\"PATCH\", ...)`." },
+  { name = "delete", params = [{ name = "path", type = "string" }, { name = "opts", type = "table?" }], returns = [{ type = "nitr.test.Response" }], desc = "`t.request(\"DELETE\", ...)`." },
+  { name = "head", params = [{ name = "path", type = "string" }, { name = "opts", type = "table?" }], returns = [{ type = "nitr.test.Response" }], desc = "`t.request(\"HEAD\", ...)`." },
+  { name = "options", params = [{ name = "path", type = "string" }, { name = "opts", type = "table?" }], returns = [{ type = "nitr.test.Response" }], desc = "`t.request(\"OPTIONS\", ...)`." },
+  { name = "client", params = [{ name = "opts", type = "table?", desc = "`{ base?, headers?, cookies = true?, remote_addr? }`: a path prefix, headers merged under every call's, a cookie jar, the peer address." }], returns = [{ type = "nitr.test.Client" }], desc = "A client with defaults and, with `cookies = true`, a jar: cookies stored by name and path (a `Set-Cookie` without `Path` gets the RFC 6265 default, the request path's directory), `Max-Age=0` and a past `Expires` delete, expiry follows `t.clock`. `Secure` and `Domain` are stored and reported but not enforced (there is no transport and one host)." },
+  { name = "describe", params = [{ name = "name", type = "string" }, { name = "fn", type = "fun()" }], desc = "Groups tests: names are prefixed and hooks registered inside apply to the group. The body runs protected: a throw fails the tests it registered so far plus one `<name> (describe body)` failure, and the file carries on." },
+  { name = "it", params = [{ name = "name", type = "string" }, { name = "fn", type = "fun()" }], desc = "Registers one test." },
+  { name = "skip", params = [{ name = "name", type = "string" }, { name = "fn_or_reason", type = "fun()|string?" }], desc = "Registers a skipped test (reported apart from `--filter`'s filtered-out tests)." },
+  { name = "todo", params = [{ name = "name", type = "string" }], desc = "A test not written yet; `--list` shows it." },
+  { name = "only", params = [{ name = "name", type = "string" }, { name = "fn", type = "fun()" }], desc = "Focuses the file: its other tests are skipped (reason `only`). The run exits 1 while any `only` is left in place." },
+  { name = "each", params = [{ name = "cases", type = "table[]" }], returns = [{ type = "fun(name: string, fn: fun(...))" }], desc = "`t.each(cases)(name, fn)`: one test per case. A positional case (a list) is `string.format`ted into `name` and unpacked into `fn`; a named case (a table with string keys) is passed whole and `name` formats its `name` field." },
+  { name = "fail", params = [{ name = "message", type = "string?" }], desc = "Fails the current test from anywhere." },
+  { name = "expect", params = [{ name = "actual", type = "any" }], returns = [{ type = "table", desc = "Matchers: `to_equal`, `to_not_equal`, `to_be_nil`, `to_not_be_nil`, `to_be_truthy`, `to_be_false`, `to_be_a(type)` (`\"integer\"`/`\"float\"` via `math.type`), `to_have_length`, `to_be_greater_than`, `to_be_greater_than_or_equal`, `to_be_less_than`, `to_be_less_than_or_equal`, `to_have_key`, `to_match_object(subset)` (recursive; extra keys ignored), `to_match(pattern)`, `to_not_match`, `to_contain`, `to_not_contain`, `to_throw(text?)` (plain substring of the message), `to_not_throw`, `to_contain_log(subset)`; on a response (from `t.request`, or a table a handler returned): `to_have_status(n)` (a failure shows a body excerpt and `resp.error`), `to_have_header(name, value_or_pattern?)`, `to_have_json(subset)`. Values render bounded (40 entries, 256 bytes)." }], desc = "Starts an assertion." },
+  { name = "before_each", params = [{ name = "fn", type = "fun()" }], desc = "Runs before every test registered after it in this group (and nested ones), outer groups first." },
+  { name = "after_each", params = [{ name = "fn", type = "fun()" }], desc = "Runs after every test registered after it in this group, inner groups first, even when the test failed; its own failure fails a test that passed." },
+  { name = "before_all", params = [{ name = "fn", type = "fun()" }], desc = "Runs once before the group's first test that runs (inside that test's budget). A group left with no test to run runs neither `before_all` nor `after_all`." },
+  { name = "after_all", params = [{ name = "fn", type = "fun()" }], desc = "Runs once after the group's last test that runs." },
+  { name = "fake_request", params = [{ name = "spec", type = "table?", desc = "`{ method?, path?, params?, valid?, ... }` plus every `t.request` option." }], returns = [{ type = "nitr.Request" }], desc = "A real request object for a unit test: `req.*`, `req:json()`, `nitr.session(req, ...)`, `nitr.csrf.token(req)` and `nitr.auth.*` work on it. It passes no protection layer, no body guard and no route validation (`valid` is what the spec says), and multipart parts cannot `:save()`." },
+  { name = "app", returns = [{ type = "nitr.test.App" }], desc = "The application compiled into this test state (once per file): its handler script's top level and every `app:use` factory run once more here, and nothing it registers is served." },
+  { name = "session_cookie", params = [{ name = "data", type = "table" }, { name = "opts", type = "table", desc = "`{ secret, name?, max_age? }`" }], returns = [{ type = "string" }], desc = "Exactly the value `session:save` would write for `data`, for a client's jar: `api.jar:set(\"session\", t.session_cookie({ user = \"ann\" }, { secret = nitr.cfg.session_secret }))`." },
 ]
+
+[[table]]
+name = "nitr.test.fetch"
+feature = "test"
+desc = "Canned responses for `nitr.fetch` in the handlers under test, answered in Rust before the `[fetch]` policy and the resolver: a matched rule never leaves the process (so a test can mock an internal host without widening `[fetch]`), an unmatched request goes out unchanged, policy included. A mocked call still counts against `max_per_request`; a canned `3xx` is returned as is and `retry` is not exercised. Reset before every test."
+functions = [
+  { name = "mock", params = [{ name = "...", type = "table", desc = "`{ url, method?, status?, headers?, json? | body?, times? }`: `url` exact, or a prefix written with a trailing `*`; `json` sets `content-type`; `times` spends the rule." }], desc = "Adds rules; the first one that matches (method, URL, uses left) answers." },
+  { name = "strict", params = [{ name = "on", type = "boolean?" }], desc = "With strict on (the default argument), a request no rule matches raises `no fetch mock matched ...` instead of going out." },
+  { name = "calls", returns = [{ type = "table[]", desc = "`{ method, url, headers, body?, json?, mocked }` per call, oldest first (at most 10 000)." }], desc = "Every outbound call made since the test started, answered or not." },
+  { name = "reset", desc = "Drops the rules, the recorded calls and the strict flag." },
+]
+
+[[table]]
+name = "nitr.test.clock"
+feature = "test"
+desc = "The standard library's clock — `nitr.time`, session and JWT expiry, the `after`/`before` validation rules, cache TTLs, the rate limiter's window — but never the execution budget or any timeout. Reset after every test."
+functions = [
+  { name = "set", params = [{ name = "ts", type = "number", desc = "Unix seconds." }], desc = "Freezes the wall clock at `ts` (elapsed time keeps flowing)." },
+  { name = "advance", params = [{ name = "secs", type = "number" }], desc = "Moves wall and elapsed time forward together (at most a century in total)." },
+  { name = "reset", desc = "Back to the real clock." },
+  { name = "now", returns = [{ type = "integer" }], desc = "The clock's unix seconds." },
+]
+
+[[table]]
+name = "nitr.test.env"
+feature = "test"
+desc = "Overrides for `nitr.env`, applied after the `[env]` policy: a name the policy hides stays hidden. Reset before every test."
+functions = [
+  { name = "set", params = [{ name = "name", type = "string" }, { name = "value", type = "string" }], desc = "Makes `nitr.env.get(name)` answer `value`." },
+  { name = "unset", params = [{ name = "name", type = "string" }], desc = "Makes the variable read as unset." },
+  { name = "reset", desc = "Drops every override." },
+]
+
+[[fn]]
+name = "nitr.test.logs"
+feature = "test"
+desc = "The current test's captured log entries, `{ level, target, message, fields?, request_id? }` each (`nitr.log` fields decoded), including `debug` from `nitr.log` whatever the console level. Needs `[testing] capture` (the default); a failed test prints its entries."
+returns = [{ type = "table[]" }]
+methods = [
+  { name = "clear", dot = true, desc = "Drops the entries captured so far." },
+]
+
+[[table]]
+name = "nitr.test.db"
+feature = "test"
+desc = "Fixtures over the test database (never `[database] path`: a scratch file, or `[testing] database`). Every Lua state owns its connection, so the transaction-and-rollback trick cannot work here; a snapshot taken after the migrations, the configuration script and `[testing] seed` is restored instead. The file is created fresh for every run."
+functions = [
+  { name = "reset", desc = "Restores the post-migration (+ seed) snapshot. A connection holding a write lock past `[database] busy_timeout` fails it with an error naming the cause." },
+  { name = "truncate", params = [{ name = "tables", type = "string[]?" }], desc = "Empties the named tables (every application table without an argument) in one transaction, foreign keys checked at commit, `AUTOINCREMENT` counters reset." },
+  { name = "seed", params = [{ name = "spec", type = "string|table", desc = "A SQL file under `[testing] dir` (a regular file, no `..`), or `{ table = { { column = value }, ... } }` inserted with bound parameters." }], desc = "Seeds the database in one transaction." },
+  { name = "isolate", desc = "Restores the snapshot after every test of this file." },
+]
+
+[[class]]
+name = "nitr.test.Response"
+desc = "A response from `t.request`."
+fields = [
+  { name = "status", type = "integer", desc = "The status code." },
+  { name = "headers", type = "table<string, string>", desc = "Lowercase name → last value (call it as `resp:headers(name)` for every value)." },
+  { name = "raw_headers", type = "table[]", desc = "`{ name, value }` pairs in order, repeats included." },
+  { name = "body", type = "string", desc = "The whole body (streams are collected)." },
+  { name = "cookies", type = "table<string, table>", desc = "Name → `{ value, path, domain, max_age, expires, secure, http_only, same_site }` from every `Set-Cookie`." },
+  { name = "error", type = "table|nil", desc = "When the handler raised: the table `on_error` receives (`kind`, `message`, `source`, `line`, `traceback`, ...) plus `handled` (true when `on_error` answered). The bytes sent to a client never carry it." },
+]
+
+[[fn]]
+name = "nitr.test.Response:json"
+desc = "The body decoded as JSON; raises when it does not decode."
+returns = [{ type = "any" }]
+
+[[fn]]
+name = "nitr.test.Response:text"
+desc = "The body as a string."
+returns = [{ type = "string" }]
+
+[[fn]]
+name = "nitr.test.Response:header"
+desc = "The first value of a header, or nil."
+params = [{ name = "name", type = "string" }]
+returns = [{ type = "string|nil" }]
+
+[[fn]]
+name = "nitr.test.Response:sse"
+desc = "The body parsed as a `text/event-stream`: `{ event?, data, id?, retry? }` per dispatched event (`id`/`retry` as the event carried them)."
+returns = [{ type = "table[]" }]
+
+[[class]]
+name = "nitr.test.Client"
+desc = "A client from `t.client`: `:request(method, path, opts)` and `:get`/`:post`/`:put`/`:patch`/`:delete`/`:head`/`:options`."
+fields = [
+  { name = "jar", type = "nitr.test.Jar|nil", desc = "The cookie jar, with `cookies = true`." },
+]
+
+[[fn]]
+name = "nitr.test.Client:request"
+desc = "A request with the client's defaults and jar."
+params = [{ name = "method", type = "string" }, { name = "path", type = "string" }, { name = "opts", type = "table?" }]
+returns = [{ type = "nitr.test.Response" }]
+
+[[class]]
+name = "nitr.test.Jar"
+desc = "A client's cookie jar."
+
+[[fn]]
+name = "nitr.test.Jar:get"
+desc = "The stored cookie `{ name, value, path, domain?, secure?, http_only?, same_site?, expires_at? }`, or nil once deleted or expired."
+params = [{ name = "name", type = "string" }]
+returns = [{ type = "table|nil" }]
+
+[[fn]]
+name = "nitr.test.Jar:set"
+desc = "Stores a cookie as if the server had set it (a forged or signed one)."
+params = [{ name = "name", type = "string" }, { name = "value", type = "string" }, { name = "opts", type = "table?", desc = "`{ path? }`" }]
+
+[[fn]]
+name = "nitr.test.Jar:clear"
+desc = "Forgets every cookie."
+
+[[class]]
+name = "nitr.test.App"
+desc = "The application compiled into the test state (`t.app()`), for unit tests. `dispatch` runs the composed middleware chain only: route `input` validation, `on_invalid`, `on_error` and the protection layer are what `t.request` exercises."
+
+[[fn]]
+name = "nitr.test.App:handler"
+desc = "A route's own handler function, without its middleware: by the pattern as registered (`\"/notes/:id\"`) or a path the router matches."
+params = [{ name = "method", type = "string" }, { name = "path", type = "string" }]
+returns = [{ type = "fun(req: nitr.Request): table" }]
+
+[[fn]]
+name = "nitr.test.App:dispatch"
+desc = "The server's router lookup (params filled into `req`, `HEAD` falling back to `GET`) and the composed middleware chain; a `404`/`405`/`OPTIONS` answer for what the router does not match."
+params = [{ name = "method", type = "string" }, { name = "path", type = "string" }, { name = "req", type = "nitr.Request" }]
+returns = [{ type = "table" }]
+
+[[fn]]
+name = "nitr.test.App:routes"
+desc = "`{ method, path, file, line }` per route, in registration order."
+returns = [{ type = "table[]" }]
 
 [[table]]
 name = "nitr.cfg"

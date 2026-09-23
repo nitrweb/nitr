@@ -66,6 +66,7 @@ pub struct ServerBuilder {
     modules: Vec<Module>,
     listener: Option<std::net::TcpListener>,
     health_listener: Option<std::net::TcpListener>,
+    cache: Option<nitr_std::Cache>,
 }
 
 impl ServerBuilder {
@@ -179,6 +180,15 @@ impl ServerBuilder {
         self
     }
 
+    /// The storage behind `nitr.cache`, instead of a fresh one sized by
+    /// `[cache]`. `nitr test` hands its test states the same instance, so
+    /// what a handler caches is observable from a test. Unused when the
+    /// `cache` builtin is not enabled.
+    pub fn cache(mut self, cache: nitr_std::Cache) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
     /// Registers a closure that customizes each pooled Lua state — the
     /// low-level escape hatch behind [`module()`](Self::module). It runs
     /// once per state, before the configuration script and handler are
@@ -219,11 +229,13 @@ impl ServerBuilder {
         // Built once and shared by every state, including states built by
         // a later reload: a cache that empties whenever the handler script
         // changes is a cache that never warms.
+        let supplied = self.cache;
         let cache = builtins
             .contains(nitr_std::Builtins::CACHE)
-            .then(|| nitr_std::Cache::new(cfg.cache_options()));
+            .then(|| supplied.unwrap_or_else(|| nitr_std::Cache::new(cfg.cache_options())));
 
-        let runtimes = build_runtimes(&cfg, builtins, &setup_fns, &modules, cache.as_ref()).await?;
+        let built = build_runtimes(&cfg, builtins, &setup_fns, &modules, cache.as_ref()).await?;
+        let cfg_snapshot = built.snapshot.clone();
         // The document is built from the bootstrap state before the pool
         // exists, so a document over its bound is a build failure like a
         // duplicate route.
@@ -232,21 +244,14 @@ impl ServerBuilder {
         let docs = protection.docs_slot();
         #[cfg(feature = "openapi")]
         {
-            let built = super::pool::build_docs(&cfg, &runtimes)?;
+            let document = super::pool::build_docs(&cfg, &built.runtimes)?;
             match docs.write() {
-                Ok(mut slot) => *slot = Some(built),
+                Ok(mut slot) => *slot = Some(document),
                 // Unreachable in practice: nothing else holds the lock yet.
                 Err(_) => return Err(Error::Config("the docs lock is poisoned".into())),
             }
         }
-        let pool = new_pool(
-            runtimes,
-            &cfg,
-            builtins,
-            &setup_fns,
-            &modules,
-            cache.clone(),
-        );
+        let pool = new_pool(built, &cfg, builtins, &setup_fns, &modules, cache.clone());
 
         // Streaming responses hold a pooled state for their lifetime; by
         // default keep at least one state free for short requests.
@@ -277,6 +282,7 @@ impl ServerBuilder {
             health_listener: self.health_listener,
             ready: Arc::new(AtomicBool::new(true)),
             cache,
+            cfg_snapshot,
             reloading: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             #[cfg(feature = "tls")]
             tls,

@@ -76,6 +76,12 @@ An outbound HTTP request (SSRF-guarded, redirect-checked). Options: `headers`, `
 
 Runs fetch handles (and `db:query_async` handles) concurrently, passed as separate arguments (`nitr.await_all(h1, h2)`), and returns their results as multiple values in the same order. Capped by `[fetch] max_concurrent`.
 
+### `nitr.test.logs() -> table[]` (available in `nitr test` files)
+
+The current test's captured log entries, `{ level, target, message, fields?, request_id? }` each (`nitr.log` fields decoded), including `debug` from `nitr.log` whatever the console level. Needs `[testing] capture` (the default); a failed test prints its entries.
+
+- `nitr.test.logs.clear()` — Drops the entries captured so far.
+
 ### `nitr.template` (std feature: `template`)
 
 The minijinja template engine, loading from `[templating] dir`.
@@ -211,16 +217,76 @@ Read-only environment variable access. Opt-in; reads are filtered by `[env] allo
 - `nitr.env.number(name, default) -> number|nil` — Reads and parses a number; unset or unparseable answers the default.
 - `nitr.env.bool(name, default) -> boolean|nil` — Reads a flag: 1/true/yes/on and 0/false/no/off (any case); empty means false, anything else answers the default.
 
+### `nitr.cookie` (std feature: `http`)
+
+HMAC-SHA256 cookie signing, the same as `res.cookies:set_signed` and `req.cookies:verify` use — for a signed value that travels outside a cookie header, or a test that forges one.
+
+- `nitr.cookie.sign(name, value, secret) -> string` — `b64(value).b64(hmac)`, the cookie name bound into the MAC so a value cannot move between cookies.
+- `nitr.cookie.verify(name, signed, secret) -> string|nil` — The value, or nil when the signature does not match (constant-time comparison).
+
 ### `nitr.test` (available in `nitr test` files)
 
-The `nitr test` framework: available in test files only.
+The `nitr test` framework: available in test files only, never in a state that serves requests. A file registers tests; the runner then runs each with its own budget, timeout, duration, captured logs and fresh doubles. Doubles are per test: set them in the test or in `before_each`.
 
-- `nitr.test.request(method, path, opts) -> table` — Dispatches through the real router/middleware/handler path.
-- `nitr.test.describe(name, fn)` — Groups tests; names are prefixed.
-- `nitr.test.it(name, fn)` — One test case.
+- `nitr.test.request(method, path, opts) -> nitr.test.Response` — Dispatches through the real protection/router/middleware/handler path, as a request from a client would.
+- `nitr.test.get(path, opts) -> nitr.test.Response` — `t.request("GET", ...)`. Also `post`, `put`, `patch`, `delete`, `head`, `options`.
+- `nitr.test.post(path, opts) -> nitr.test.Response` — `t.request("POST", ...)`.
+- `nitr.test.put(path, opts) -> nitr.test.Response` — `t.request("PUT", ...)`.
+- `nitr.test.patch(path, opts) -> nitr.test.Response` — `t.request("PATCH", ...)`.
+- `nitr.test.delete(path, opts) -> nitr.test.Response` — `t.request("DELETE", ...)`.
+- `nitr.test.head(path, opts) -> nitr.test.Response` — `t.request("HEAD", ...)`.
+- `nitr.test.options(path, opts) -> nitr.test.Response` — `t.request("OPTIONS", ...)`.
+- `nitr.test.client(opts) -> nitr.test.Client` — A client with defaults and, with `cookies = true`, a jar: cookies stored by name and path (a `Set-Cookie` without `Path` gets the RFC 6265 default, the request path's directory), `Max-Age=0` and a past `Expires` delete, expiry follows `t.clock`. `Secure` and `Domain` are stored and reported but not enforced (there is no transport and one host).
+- `nitr.test.describe(name, fn)` — Groups tests: names are prefixed and hooks registered inside apply to the group. The body runs protected: a throw fails the tests it registered so far plus one `<name> (describe body)` failure, and the file carries on.
+- `nitr.test.it(name, fn)` — Registers one test.
+- `nitr.test.skip(name, fn_or_reason)` — Registers a skipped test (reported apart from `--filter`'s filtered-out tests).
+- `nitr.test.todo(name)` — A test not written yet; `--list` shows it.
+- `nitr.test.only(name, fn)` — Focuses the file: its other tests are skipped (reason `only`). The run exits 1 while any `only` is left in place.
+- `nitr.test.each(cases) -> fun(name: string, fn: fun(...))` — `t.each(cases)(name, fn)`: one test per case. A positional case (a list) is `string.format`ted into `name` and unpacked into `fn`; a named case (a table with string keys) is passed whole and `name` formats its `name` field.
+- `nitr.test.fail(message)` — Fails the current test from anywhere.
 - `nitr.test.expect(actual) -> table` — Starts an assertion.
-- `nitr.test.before_each(fn)` — Runs before every test in the file.
-- `nitr.test.after_each(fn)` — Runs after every test in the file (even failing ones).
+- `nitr.test.before_each(fn)` — Runs before every test registered after it in this group (and nested ones), outer groups first.
+- `nitr.test.after_each(fn)` — Runs after every test registered after it in this group, inner groups first, even when the test failed; its own failure fails a test that passed.
+- `nitr.test.before_all(fn)` — Runs once before the group's first test that runs (inside that test's budget). A group left with no test to run runs neither `before_all` nor `after_all`.
+- `nitr.test.after_all(fn)` — Runs once after the group's last test that runs.
+- `nitr.test.fake_request(spec) -> nitr.Request` — A real request object for a unit test: `req.*`, `req:json()`, `nitr.session(req, ...)`, `nitr.csrf.token(req)` and `nitr.auth.*` work on it. It passes no protection layer, no body guard and no route validation (`valid` is what the spec says), and multipart parts cannot `:save()`.
+- `nitr.test.app() -> nitr.test.App` — The application compiled into this test state (once per file): its handler script's top level and every `app:use` factory run once more here, and nothing it registers is served.
+- `nitr.test.session_cookie(data, opts) -> string` — Exactly the value `session:save` would write for `data`, for a client's jar: `api.jar:set("session", t.session_cookie({ user = "ann" }, { secret = nitr.cfg.session_secret }))`.
+
+### `nitr.test.fetch` (available in `nitr test` files)
+
+Canned responses for `nitr.fetch` in the handlers under test, answered in Rust before the `[fetch]` policy and the resolver: a matched rule never leaves the process (so a test can mock an internal host without widening `[fetch]`), an unmatched request goes out unchanged, policy included. A mocked call still counts against `max_per_request`; a canned `3xx` is returned as is and `retry` is not exercised. Reset before every test.
+
+- `nitr.test.fetch.mock(...)` — Adds rules; the first one that matches (method, URL, uses left) answers.
+- `nitr.test.fetch.strict(on)` — With strict on (the default argument), a request no rule matches raises `no fetch mock matched ...` instead of going out.
+- `nitr.test.fetch.calls() -> table[]` — Every outbound call made since the test started, answered or not.
+- `nitr.test.fetch.reset()` — Drops the rules, the recorded calls and the strict flag.
+
+### `nitr.test.clock` (available in `nitr test` files)
+
+The standard library's clock — `nitr.time`, session and JWT expiry, the `after`/`before` validation rules, cache TTLs, the rate limiter's window — but never the execution budget or any timeout. Reset after every test.
+
+- `nitr.test.clock.set(ts)` — Freezes the wall clock at `ts` (elapsed time keeps flowing).
+- `nitr.test.clock.advance(secs)` — Moves wall and elapsed time forward together (at most a century in total).
+- `nitr.test.clock.reset()` — Back to the real clock.
+- `nitr.test.clock.now() -> integer` — The clock's unix seconds.
+
+### `nitr.test.env` (available in `nitr test` files)
+
+Overrides for `nitr.env`, applied after the `[env]` policy: a name the policy hides stays hidden. Reset before every test.
+
+- `nitr.test.env.set(name, value)` — Makes `nitr.env.get(name)` answer `value`.
+- `nitr.test.env.unset(name)` — Makes the variable read as unset.
+- `nitr.test.env.reset()` — Drops every override.
+
+### `nitr.test.db` (available in `nitr test` files)
+
+Fixtures over the test database (never `[database] path`: a scratch file, or `[testing] database`). Every Lua state owns its connection, so the transaction-and-rollback trick cannot work here; a snapshot taken after the migrations, the configuration script and `[testing] seed` is restored instead. The file is created fresh for every run.
+
+- `nitr.test.db.reset()` — Restores the post-migration (+ seed) snapshot. A connection holding a write lock past `[database] busy_timeout` fails it with an error naming the cause.
+- `nitr.test.db.truncate(tables)` — Empties the named tables (every application table without an argument) in one transaction, foreign keys checked at commit, `AUTOINCREMENT` counters reset.
+- `nitr.test.db.seed(spec)` — Seeds the database in one transaction.
+- `nitr.test.db.isolate()` — Restores the snapshot after every test of this file.
 
 ### `nitr.cfg` (set when a `config_script` is configured)
 
@@ -361,4 +427,42 @@ A stateless signed-cookie session from `nitr.session`. Assign fields directly (`
 
 A database transaction handle inside `nitr.db:transaction`; same query API as `nitr.db`, plus nesting via savepoints.
 
+
+### `nitr.test.Response`
+
+A response from `t.request`.
+
+- `status: integer` — The status code.
+- `headers: table<string, string>` — Lowercase name → last value (call it as `resp:headers(name)` for every value).
+- `raw_headers: table[]` — `{ name, value }` pairs in order, repeats included.
+- `body: string` — The whole body (streams are collected).
+- `cookies: table<string, table>` — Name → `{ value, path, domain, max_age, expires, secure, http_only, same_site }` from every `Set-Cookie`.
+- `error: table|nil` — When the handler raised: the table `on_error` receives (`kind`, `message`, `source`, `line`, `traceback`, ...) plus `handled` (true when `on_error` answered). The bytes sent to a client never carry it.
+- `:json() -> any` — The body decoded as JSON; raises when it does not decode.
+- `:text() -> string` — The body as a string.
+- `:header(name) -> string|nil` — The first value of a header, or nil.
+- `:sse() -> table[]` — The body parsed as a `text/event-stream`: `{ event?, data, id?, retry? }` per dispatched event (`id`/`retry` as the event carried them).
+
+### `nitr.test.Client`
+
+A client from `t.client`: `:request(method, path, opts)` and `:get`/`:post`/`:put`/`:patch`/`:delete`/`:head`/`:options`.
+
+- `jar: nitr.test.Jar|nil` — The cookie jar, with `cookies = true`.
+- `:request(method, path, opts) -> nitr.test.Response` — A request with the client's defaults and jar.
+
+### `nitr.test.Jar`
+
+A client's cookie jar.
+
+- `:get(name) -> table|nil` — The stored cookie `{ name, value, path, domain?, secure?, http_only?, same_site?, expires_at? }`, or nil once deleted or expired.
+- `:set(name, value, opts)` — Stores a cookie as if the server had set it (a forged or signed one).
+- `:clear()` — Forgets every cookie.
+
+### `nitr.test.App`
+
+The application compiled into the test state (`t.app()`), for unit tests. `dispatch` runs the composed middleware chain only: route `input` validation, `on_invalid`, `on_error` and the protection layer are what `t.request` exercises.
+
+- `:handler(method, path) -> fun(req: nitr.Request): table` — A route's own handler function, without its middleware: by the pattern as registered (`"/notes/:id"`) or a path the router matches.
+- `:dispatch(method, path, req) -> table` — The server's router lookup (params filled into `req`, `HEAD` falling back to `GET`) and the composed middleware chain; a `404`/`405`/`OPTIONS` answer for what the router does not match.
+- `:routes() -> table[]` — `{ method, path, file, line }` per route, in registration order.
 

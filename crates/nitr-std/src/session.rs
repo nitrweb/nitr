@@ -32,10 +32,10 @@ const RESERVED: &[&str] = &["save", "clear"];
 /// advice to the browser, and an attacker's client takes none.
 const EXPIRES_KEY: &str = "_exp";
 
+/// Read through the standard library's clock, so a test can age a
+/// session past its `max_age` with `nitr.test.clock.advance`.
 fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+    crate::clock::now_unix()
 }
 
 /// Cookie attributes for a session cookie: HttpOnly always (a session is
@@ -131,17 +131,38 @@ fn serialize(session: &Table, max_age: Option<i64>, now: i64) -> mlua::Result<St
     Ok(json)
 }
 
+/// The signed cookie value `session:save` writes for `data` under `name`:
+/// the same serialization (reserved keys refused, the expiry inside the
+/// signed payload when `max_age` is set, the size bound) and the same
+/// signature. `nitr test` forges sessions with it (`t.session_cookie`).
+pub(crate) fn signed_value(
+    data: &Table,
+    name: &str,
+    secret: &str,
+    max_age: Option<i64>,
+) -> mlua::Result<String> {
+    check_secret(secret)?;
+    let json = serialize(data, max_age, unix_now())?;
+    Ok(http::sign(name, &json, secret))
+}
+
+/// The secret rule `nitr.session` enforces.
+fn check_secret(secret: &str) -> mlua::Result<()> {
+    if secret.len() < 16 {
+        return Err(mlua::Error::RuntimeError(
+            "nitr.session `secret` must be at least 16 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Builds the `nitr.session` function.
 pub(crate) fn create_session_fn(lua: &Lua) -> mlua::Result<mlua::Function> {
     lua.create_function(|lua, (req, opts): (Value, Table)| {
         let secret: String = opts.get::<Option<String>>("secret")?.ok_or_else(|| {
             mlua::Error::RuntimeError("nitr.session requires a `secret` option".into())
         })?;
-        if secret.len() < 16 {
-            return Err(mlua::Error::RuntimeError(
-                "nitr.session `secret` must be at least 16 bytes".into(),
-            ));
-        }
+        check_secret(&secret)?;
         let name = opts
             .get::<Option<String>>("name")?
             .unwrap_or_else(|| "session".into());

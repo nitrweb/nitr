@@ -23,7 +23,7 @@ use hyper::Method;
 use matchit::Router;
 use mlua::{AnyUserData, Function, Lua, UserData, UserDataMethods, Value, Variadic};
 
-use nitr_core::{Error, Result, Runtime};
+use nitr_core::{Error, Result};
 
 use crate::openapi::AppMeta;
 use crate::validation::{InputEnv, InputSchemas};
@@ -63,7 +63,7 @@ fn lock(def: &Mutex<AppDef>) -> mlua::Result<std::sync::MutexGuard<'_, AppDef>> 
 }
 
 /// Where a script registered something (`source`, `line`).
-type Site = Option<(String, u32)>;
+pub(crate) type Site = Option<(String, u32)>;
 
 /// A route as registered by the script: zero or more middleware followed by
 /// the handler function (always the last element of `fns`).
@@ -233,6 +233,14 @@ pub(crate) struct Dispatch(pub(crate) Box<CompiledApp>);
 /// resolved once at compile time so dispatch pays nothing.
 pub(crate) struct Chain {
     pub(crate) fns: Function,
+    /// The route's own handler, without its middleware: what
+    /// `t.app():handler(...)` returns to a unit test.
+    pub(crate) handler: Function,
+    /// The route as registered (method, path pattern, file:line), for
+    /// `t.app():routes()` and for finding a handler by its pattern.
+    pub(crate) method: Method,
+    pub(crate) path: String,
+    pub(crate) site: Site,
     pub(crate) error_fn: Option<Function>,
     /// The route's compiled `input` declaration, plus the userdata the
     /// budgeted validation function receives it through.
@@ -245,6 +253,52 @@ pub(crate) struct Chain {
 pub(crate) struct CompiledApp {
     pub(crate) router: Router<HashMap<Method, usize>>,
     pub(crate) chains: Vec<Chain>,
+}
+
+/// Where the router sends a method and a path.
+pub(crate) enum Lookup {
+    /// A route: its index into [`CompiledApp::chains`] and the captured
+    /// path parameters.
+    Route {
+        index: usize,
+        params: Vec<(String, String)>,
+    },
+    /// An `OPTIONS` on a known path without an `options` route.
+    Options(Vec<Method>),
+    /// A known path, but no route for this method.
+    MethodNotAllowed(Vec<Method>),
+    /// No route pattern matches the path.
+    NotFound,
+}
+
+impl CompiledApp {
+    /// The one router lookup, shared by the server and `nitr test`'s
+    /// `app:dispatch`: `HEAD` falls back to the `GET` route (it is `GET`
+    /// without the body), while an explicit `head` route still wins.
+    pub(crate) fn lookup(&self, method: &Method, path: &str) -> Lookup {
+        let Ok(matched) = self.router.at(path) else {
+            return Lookup::NotFound;
+        };
+        let route = matched.value.get(method).or_else(|| {
+            (*method == Method::HEAD)
+                .then(|| matched.value.get(&Method::GET))
+                .flatten()
+        });
+        match route {
+            Some(&index) => Lookup::Route {
+                index,
+                params: matched
+                    .params
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            },
+            None if *method == Method::OPTIONS => {
+                Lookup::Options(matched.value.keys().cloned().collect())
+            }
+            None => Lookup::MethodNotAllowed(matched.value.keys().cloned().collect()),
+        }
+    }
 }
 
 /// The handler script path of the compiled app in this state, for
@@ -299,13 +353,13 @@ pub(crate) fn validate_fn(lua: &Lua) -> Result<Function> {
 /// Lua registry. Called at startup for every pooled state and again on
 /// dev-mode reloads. Returns whether any route declares file uploads.
 pub(crate) fn load(
-    rt: &Runtime,
+    lua: &Lua,
     script: &Path,
     base_statics: &[crate::static_files::StaticMount],
     input_env: &InputEnv,
 ) -> Result<bool> {
-    let value = rt.eval_script(script)?;
-    let compiled = compile(rt.lua(), value, script, input_env)?;
+    let value = nitr_core::eval_script(lua, script)?;
+    let compiled = compile(lua, value, script, input_env)?;
     let has_files = compiled
         .dispatch
         .0
@@ -314,20 +368,20 @@ pub(crate) fn load(
         .any(|c| c.input.as_ref().is_some_and(|(i, _)| i.has_file_rules()));
     // The application has compiled: app-wide validation messages are
     // fixed from here, so no request can change another's wording.
-    nitr_std::validation::freeze_messages(rt.lua());
+    nitr_std::validation::freeze_messages(lua);
     let mut statics = compiled.statics;
     statics.extend_from_slice(base_statics);
     // Longest mount prefix first, once: the static path used to collect
     // and sort the candidates on every request. Stable, so mounts of equal
     // length keep their registration order, script mounts before `[static]`.
     statics.sort_by_key(|m| std::cmp::Reverse(m.mount.len()));
-    let state = rt.lua().create_userdata(AppState {
+    let state = lua.create_userdata(AppState {
         dispatch: compiled.dispatch,
         statics: Arc::new(statics),
         meta: Arc::new(compiled.meta),
         script: script.to_path_buf(),
     })?;
-    rt.lua().set_named_registry_value(APP_STATE_KEY, state)?;
+    lua.set_named_registry_value(APP_STATE_KEY, state)?;
     Ok(has_files)
 }
 

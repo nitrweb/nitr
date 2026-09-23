@@ -413,12 +413,13 @@ async fn handle_inner(
             }
             discard_body(&req_ud);
             match handled {
-                Some(resp) => Ok(resp),
+                Some(resp) => Ok(with_failure(resp, info, true)),
                 None => {
                     // The script path backs up the error's own `source` for
                     // the dev snippet: Lua truncates long chunk names.
                     let script = dev_mode.then(|| app::script_path(rt.lua())).flatten();
                     error_page_with_source(&info, dev_mode, wants_html, script.as_deref())
+                        .map(|resp| with_failure(resp, info, false))
                 }
             }
         }
@@ -526,38 +527,22 @@ async fn resolve(
     let (target, statics): (Target, Arc<Vec<StaticMount>>) = {
         let state = ud.borrow::<AppState>()?;
         let app = &state.dispatch.0;
-        let method = req.req.method();
-        let target = match app.router.at(req.req.uri().path()) {
-            Ok(matched) => {
-                // `HEAD` is `GET` without the body, so a `GET` route serves
-                // it; the body is dropped once the response is complete.
-                // An explicit `head` route still wins.
-                let route = matched.value.get(method).or_else(|| {
-                    (*method == Method::HEAD)
-                        .then(|| matched.value.get(&Method::GET))
-                        .flatten()
-                });
-                match route {
-                    Some(&idx) => Target::Chain {
-                        chain: app.chains[idx].fns.clone(),
-                        params: matched
-                            .params
-                            .iter()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect(),
-                        // Resolved at compile time: the route's own handler
-                        // first, the app-wide one as fallback.
-                        error_fn: app.chains[idx].error_fn.clone(),
-                        input: app.chains[idx].input.clone(),
-                        invalid_fn: app.chains[idx].invalid_fn.clone(),
-                    },
-                    None if *method == Method::OPTIONS => {
-                        Target::Options(matched.value.keys().cloned().collect())
-                    }
-                    None => Target::MethodNotAllowed(matched.value.keys().cloned().collect()),
-                }
-            }
-            Err(_) => Target::NotFound,
+        // `HEAD` is `GET` without the body, so a `GET` route serves it
+        // (see `lookup`); the body is dropped once the response is
+        // complete.
+        let target = match app.lookup(req.req.method(), req.req.uri().path()) {
+            app::Lookup::Route { index, params } => Target::Chain {
+                chain: app.chains[index].fns.clone(),
+                params,
+                // Resolved at compile time: the route's own handler first,
+                // the app-wide one as fallback.
+                error_fn: app.chains[index].error_fn.clone(),
+                input: app.chains[index].input.clone(),
+                invalid_fn: app.chains[index].invalid_fn.clone(),
+            },
+            app::Lookup::Options(allowed) => Target::Options(allowed),
+            app::Lookup::MethodNotAllowed(allowed) => Target::MethodNotAllowed(allowed),
+            app::Lookup::NotFound => Target::NotFound,
         };
         (target, state.statics.clone())
     };
@@ -578,6 +563,6 @@ mod respond;
 #[cfg(test)]
 mod tests;
 
-use error_page::{accepts_html, error_page_with_source, error_response};
+use error_page::{accepts_html, error_page_with_source, error_response, with_failure};
 use respond::to_response;
 pub(crate) use respond::{build_response, empty_response, plain_response};

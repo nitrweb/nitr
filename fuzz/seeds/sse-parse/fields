@@ -1,0 +1,6 @@
+event: tick
+id: 7
+retry: 1500
+data: one
+data: two
+

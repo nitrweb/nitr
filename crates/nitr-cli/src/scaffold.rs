@@ -32,10 +32,12 @@ pub fn init(dir: &Path, minimal: bool) -> anyhow::Result<()> {
             ("config.lua", CONFIG_LUA.into()),
             ("app.lua", APP_LUA.into()),
             ("routes/notes.lua", ROUTES_NOTES_LUA.into()),
+            ("lib/notes.lua", LIB_NOTES_LUA.into()),
             ("migrations/001_init.sql", MIGRATION_SQL.into()),
             ("templates/hello.j2", TEMPLATE_J2.into()),
             ("public/index.html", INDEX_HTML.into()),
             ("tests/notes_test.lua", TEST_LUA.into()),
+            ("tests/helpers/notes.lua", TEST_HELPERS_LUA.into()),
             (".gitignore", GITIGNORE.into()),
             ("data/.gitkeep", String::new()),
         ]
@@ -160,22 +162,34 @@ end)
 return app
 "#;
 
+const LIB_NOTES_LUA: &str = r#"-- The notes domain without a request in sight: what the routes validate
+-- with, and nothing that needs a server. Logic that does not take `req`
+-- lives in a module like this one, is `require`d by the routes and by
+-- the tests alike, and is unit-tested without a server.
+local M = {}
+
+M.NoteInput = nitr.validate.schema({
+    text = "string|trim|min_len:1|max_len:500|required",
+}, { title = "NoteInput" })
+
+-- Documentation only: responses are never checked.
+M.Note = nitr.validate.schema({
+    id = "integer|required",
+    text = "string|required",
+    created_at = "integer|required",
+}, { title = "Note" })
+
+return M
+"#;
+
 const ROUTES_NOTES_LUA: &str = r#"-- The notes API: a route module is a plain function taking the app.
 --
 -- A route's `input` is validated in Rust before the handler runs: a bad
 -- body answers a JSON 422 naming every failing field, and the handler
 -- reads the checked, stripped values from `req.valid`. The same `input`
 -- documents the operation in /openapi.json; `doc` adds the prose.
-local NoteInput = nitr.validate.schema({
-    text = "string|trim|min_len:1|max_len:500|required",
-}, { title = "NoteInput" })
-
--- Documentation only: responses are never checked.
-local Note = nitr.validate.schema({
-    id = "integer|required",
-    text = "string|required",
-    created_at = "integer|required",
-}, { title = "Note" })
+local notes = require("lib.notes")
+local NoteInput, Note = notes.NoteInput, notes.Note
 
 return function(app)
     app:get("/api/notes", function(req)
@@ -229,47 +243,85 @@ const INDEX_HTML: &str = r#"<!doctype html>
 <p>Edit <code>public/index.html</code> and <code>app.lua</code>.</p>
 "#;
 
-const TEST_LUA: &str = r#"-- Run with: nitr test (or: nitr test --filter notes)
+const TEST_LUA: &str = r#"-- Run with: nitr test (or: nitr test --filter notes, nitr test --list)
 local t = nitr.test
+local notes = require("lib.notes")
+-- Test helpers live under tests/ in a subdirectory: `require`-able from
+-- a test file, never discovered as a test file themselves.
+local fixtures = require("helpers.notes")
 
-t.before_each(function()
-    nitr.db:execute("DELETE FROM notes")
+-- Unit: a plain module, no server. If a function does not take `req`,
+-- test it here.
+t.describe("lib.notes (unit)", function()
+    t.it("trims the text it accepts", function()
+        local data, err = notes.NoteInput:check({ text = "  hi  " })
+        t.expect(err).to_be_nil()
+        t.expect(data).to_equal({ text = "hi" })
+    end)
+
+    t.each({
+        { name = "an empty note", input = { text = "   " }, rule = "min_len" },
+        { name = "a missing note", input = {}, rule = "required" },
+        { name = "a long note", input = { text = ("x"):rep(501) }, rule = "max_len" },
+    })("rejects %s", function(case)
+        local data, err = notes.NoteInput:check(case.input)
+        t.expect(data).to_be_nil()
+        t.expect(err.errors[1].rule).to_equal(case.rule)
+    end)
 end)
 
+-- Integration: through the real router, validation and handler.
 t.describe("notes API", function()
+    local api = t.client({ base = "/api" })
+    -- The database as the migrations left it, before every test.
+    t.before_each(t.db.reset)
+
     t.it("starts empty", function()
-        local resp = t.request("GET", "/api/notes")
-        t.expect(resp.status).to_equal(200)
-        t.expect(resp:json()).to_equal({})
+        t.expect(api:get("/notes"):json()).to_equal({})
     end)
 
     t.it("creates a note", function()
-        local resp = t.request("POST", "/api/notes", { json = { text = "hi" } })
-        t.expect(resp.status).to_equal(201)
-        t.expect(resp:json().text).to_equal("hi")
+        t.clock.set(1735689600) -- 2025-01-01T00:00:00Z
+        local resp = api:post("/notes", { json = fixtures.note })
+        t.expect(resp).to_have_status(201)
+        t.expect(resp).to_have_json({ text = "hi", created_at = 1735689600 })
+    end)
+
+    t.it("lists what the fixtures seeded", function()
+        t.db.seed({ notes = fixtures.rows })
+        t.expect(#api:get("/notes"):json()).to_equal(#fixtures.rows)
     end)
 
     t.it("rejects an empty note before the handler runs", function()
-        local resp = t.request("POST", "/api/notes", { json = {} })
-        t.expect(resp.status).to_equal(422)
+        local resp = api:post("/notes", { json = {} })
+        t.expect(resp).to_have_status(422)
         t.expect(resp:json().fields["body.text"]).to_equal("is required")
         t.expect(resp:json().errors[1].rule).to_equal("required")
     end)
 
     t.it("bounds the page size", function()
-        local resp = t.request("GET", "/api/notes?limit=500")
-        t.expect(resp.status).to_equal(422)
+        local resp = api:get("/notes", { query = { limit = 500 } })
+        t.expect(resp).to_have_status(422)
         t.expect(resp:json().fields["query.limit"]).to_equal("must be at most 100")
     end)
 
     t.it("publishes what it enforces", function()
-        local spec = t.request("GET", "/openapi.json"):json()
+        local spec = t.get("/openapi.json"):json()
         local limit = spec.paths["/api/notes"].get.parameters[1]
-        t.expect(limit.name).to_equal("limit")
-        t.expect(limit.schema.maximum).to_equal(100)
+        t.expect(limit).to_match_object({ name = "limit", schema = { maximum = 100 } })
         t.expect(spec.components.schemas.NoteInput.required[1]).to_equal("text")
     end)
 end)
+"#;
+
+const TEST_HELPERS_LUA: &str = r#"-- Shared test data: `require("helpers.notes")` from any test file.
+return {
+    note = { text = "  hi  " },
+    rows = {
+        { text = "first", created_at = 1 },
+        { text = "second", created_at = 2 },
+    },
+}
 "#;
 
 const GITIGNORE: &str = r#"data/*.db*

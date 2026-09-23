@@ -99,6 +99,32 @@ impl Default for FormLimits {
 }
 
 impl LuaRequest {
+    /// A request as the dispatch path receives it, before routing: every
+    /// other field starts at its pre-dispatch default (the handler fills
+    /// in the configured limits and the router's parameters). The one
+    /// constructor the live service, [`TestClient`](crate::testing::TestClient)
+    /// and `nitr test`'s fake request share, so they cannot drift apart.
+    pub(crate) fn synthetic(
+        req: Request<IncomingBody>,
+        peer_addr: SocketAddr,
+        id: Arc<str>,
+    ) -> Self {
+        Self {
+            peer_addr,
+            req,
+            params: Vec::new(),
+            id,
+            // Replaced with the configured bounds by the handler.
+            limits: Default::default(),
+            cached_form: None,
+            body_limit: u64::MAX,
+            cached_body: None,
+            body_consumed: false,
+            valid: None,
+            spool_dir: None,
+        }
+    }
+
     /// Caps this request's body at `limit` bytes *as it arrives*.
     ///
     /// The `Content-Length` check in

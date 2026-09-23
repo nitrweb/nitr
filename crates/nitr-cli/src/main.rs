@@ -62,6 +62,28 @@ enum Command {
         /// Run only tests whose name (or file name) contains this string.
         #[arg(long, value_name = "SUBSTRING")]
         filter: Option<String>,
+        /// Stop at the first failing test (the verdict still prints).
+        #[arg(long)]
+        bail: bool,
+        /// Print every test with its file:line and skip/todo markers,
+        /// without running any.
+        #[arg(long)]
+        list: bool,
+        /// Run again whenever a Lua source, a template, or a test file
+        /// changes, until Ctrl-C.
+        #[arg(long)]
+        watch: bool,
+        /// Report format: pretty lines, one JSON document, or JUnit XML.
+        #[arg(long, value_enum, default_value = "pretty")]
+        reporter: cmd::test::Reporter,
+        /// Write the JSON/JUnit report to this file (the pretty lines still
+        /// go to standard output).
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Stream log lines as they happen instead of capturing them per
+        /// test and printing them under a failure.
+        #[arg(long)]
+        nocapture: bool,
     },
     /// Generate the OpenAPI document from the application's routes.
     Openapi {
@@ -144,12 +166,40 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
 /// `RUST_LOG` wins over the configured level; without either the default
 /// is `info` (`debug` in dev mode).
 /// Whether a command's standard output is a document rather than a log:
-/// `nitr openapi` prints the JSON there, so its log lines go to stderr.
+/// `nitr openapi` prints the JSON there, and so does `nitr test` with a
+/// JSON or JUnit reporter and no `--output`, so their log lines go to
+/// stderr.
 fn logs_to_stderr(command: &Option<Command>) -> bool {
-    matches!(command, Some(Command::Openapi { .. }))
+    match command {
+        Some(Command::Openapi { .. }) => true,
+        Some(Command::Test {
+            reporter, output, ..
+        }) => *reporter != cmd::test::Reporter::Pretty && output.is_none(),
+        _ => false,
+    }
 }
 
-fn init_logging(cfg: Option<&Config>, dev: bool, to_stderr: bool) {
+/// How `nitr test` wants its logs: captured per test (the default,
+/// `[testing] capture`), and streamed to the console only with
+/// `--nocapture`.
+#[derive(Clone, Copy)]
+struct TestLogs {
+    capture: bool,
+    console: bool,
+}
+
+/// The `nitr test` log setup for a command, when it is one.
+fn test_logs(command: &Option<Command>, cfg: &Config) -> Option<TestLogs> {
+    match command {
+        Some(Command::Test { nocapture, .. }) if cfg.testing.capture => Some(TestLogs {
+            capture: true,
+            console: *nocapture,
+        }),
+        _ => None,
+    }
+}
+
+fn init_logging(cfg: Option<&Config>, dev: bool, to_stderr: bool, test: Option<TestLogs>) {
     let fallback = || {
         let configured = cfg.and_then(|c| c.log.level.clone());
         tracing_subscriber::EnvFilter::new(configured.unwrap_or_else(|| {
@@ -162,14 +212,6 @@ fn init_logging(cfg: Option<&Config>, dev: bool, to_stderr: bool) {
     };
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| fallback());
-    // Span close events are what make the span timings visible: the
-    // `request` span's close line is an access-log entry (id, method,
-    // path, status), and at debug level the inner spans (`pool_checkout`,
-    // `lua_handler`, `db_query`, `fetch`) decompose where the time went.
-    // See docs/logging.md for the schema.
-    let builder = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
     let json = matches!(cfg.map(|c| c.log.format), Some(nitr::LogFormat::Json));
     // One color decision drives everything: the log format (JSON must
     // never carry ANSI), the stream the subscriber writes to (stdout),
@@ -189,6 +231,18 @@ fn init_logging(cfg: Option<&Config>, dev: bool, to_stderr: bool) {
     let colors =
         !json && stream_is_terminal && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     nitr::diag::set_console_colors(colors);
+    if let Some(test) = test {
+        init_test_logging(filter, test, json, colors, to_stderr);
+        return;
+    }
+    // Span close events are what make the span timings visible: the
+    // `request` span's close line is an access-log entry (id, method,
+    // path, status), and at debug level the inner spans (`pool_checkout`,
+    // `lua_handler`, `db_query`, `fetch`) decompose where the time went.
+    // See docs/logging.md for the schema.
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
     if to_stderr {
         finish_logging(builder.with_writer(std::io::stderr), json, colors);
     } else {
@@ -221,6 +275,64 @@ fn finish_logging<W>(
     } else {
         builder.with_ansi(false).init();
     }
+}
+
+/// The `nitr test` subscriber: the console layer (the same formats as
+/// every other command, filtered as configured, present only under
+/// `--nocapture`) beside the capture layer that records each test's
+/// entries.
+///
+/// The capture layer accepts the `lua` target at `debug` whatever the
+/// console level: `nitr.log` gates on `tracing::enabled!`, so without
+/// this a `log.debug` in a handler would be invisible to `t.logs()`
+/// unless the console were at debug too.
+fn init_test_logging(
+    console_filter: tracing_subscriber::EnvFilter,
+    test: TestLogs,
+    json: bool,
+    colors: bool,
+    to_stderr: bool,
+) {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let capture_filter = tracing_subscriber::EnvFilter::new(console_filter.to_string())
+        .add_directive(
+            "lua=debug"
+                .parse()
+                .unwrap_or_else(|_| tracing::Level::DEBUG.into()),
+        );
+    let console = test.console.then(|| {
+        let base = tracing_subscriber::fmt::layer()
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
+        let layer: Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync> =
+            match (json, colors, to_stderr) {
+                (true, _, false) => base.json().boxed(),
+                (true, _, true) => base.json().with_writer(std::io::stderr).boxed(),
+                (false, true, false) => base
+                    .event_format(diag::PaintedFormat(
+                        tracing_subscriber::fmt::format().with_ansi(true),
+                    ))
+                    .boxed(),
+                (false, true, true) => base
+                    .event_format(diag::PaintedFormat(
+                        tracing_subscriber::fmt::format().with_ansi(true),
+                    ))
+                    .with_writer(std::io::stderr)
+                    .boxed(),
+                (false, false, false) => base.with_ansi(false).boxed(),
+                (false, false, true) => base.with_ansi(false).with_writer(std::io::stderr).boxed(),
+            };
+        layer.with_filter(console_filter)
+    });
+    let capture = test
+        .capture
+        .then(|| cmd::test::capture::CaptureLayer.with_filter(capture_filter));
+    tracing_subscriber::registry()
+        .with(console)
+        .with(capture)
+        .init();
 }
 
 /// Writes the pidfile on creation, removes it on drop — including the
@@ -424,24 +536,29 @@ async fn run_main() -> anyhow::Result<()> {
     // `init` runs before any configuration exists; everything else loads
     // the configuration first so `[log]` can shape the subscriber.
     if let Some(Command::Init { dir, minimal }) = &cli.command {
-        init_logging(None, cli.dev, logs_to_stderr(&cli.command));
+        init_logging(None, cli.dev, logs_to_stderr(&cli.command), None);
         return scaffold::init(dir.as_deref().unwrap_or(Path::new(".")), *minimal);
     }
     // `hash-password` needs no application at all: it is the one command
     // an operator runs *before* there is a working nitr.toml, and a
     // broken one must not stand between them and a credential.
     if let Some(Command::HashPassword) = &cli.command {
-        init_logging(None, cli.dev, logs_to_stderr(&cli.command));
+        init_logging(None, cli.dev, logs_to_stderr(&cli.command), None);
         return cmd::hash_password::hash_password().await;
     }
 
     let cfg = match load_config(&cli) {
         Ok(cfg) => {
-            init_logging(Some(&cfg), cli.dev, logs_to_stderr(&cli.command));
+            init_logging(
+                Some(&cfg),
+                cli.dev,
+                logs_to_stderr(&cli.command),
+                test_logs(&cli.command, &cfg),
+            );
             cfg
         }
         Err(err) => {
-            init_logging(None, cli.dev, logs_to_stderr(&cli.command));
+            init_logging(None, cli.dev, logs_to_stderr(&cli.command), None);
             return Err(err);
         }
     };
@@ -470,9 +587,29 @@ async fn run_main() -> anyhow::Result<()> {
             }
             cmd::check::check(cfg).await?;
         }
-        Command::Test { filter } => {
-            let failures = cmd::test::run_tests(cfg, filter.as_deref()).await?;
-            if failures > 0 {
+        Command::Test {
+            filter,
+            bail,
+            list,
+            watch,
+            reporter,
+            output,
+            nocapture,
+        } => {
+            let args = cmd::test::TestArgs {
+                filter,
+                bail,
+                list,
+                watch,
+                reporter,
+                output,
+                nocapture,
+            };
+            if args.watch {
+                return cmd::test::watch(cfg, &args).await;
+            }
+            // Exit 1 on any failure, or on a `t.only` left in place.
+            if cmd::test::run(cfg, &args).await?.failed() {
                 std::process::exit(1);
             }
         }

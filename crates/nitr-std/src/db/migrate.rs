@@ -23,7 +23,7 @@ use rusqlite::Connection;
 use nitr_core::{Error, Result};
 
 /// Table recording what has been applied.
-const TABLE: &str = "_nitr_migrations";
+pub(crate) const TABLE: &str = "_nitr_migrations";
 
 /// One migration file on disk.
 #[derive(Debug, Clone)]

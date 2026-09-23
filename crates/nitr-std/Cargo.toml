@@ -39,8 +39,10 @@ db = ["dep:rusqlite"]
 # The outbound HTTP client. By far the heaviest: reqwest pulls in over
 # half of the whole dependency graph.
 # `rustls` rides along only to install the `ring` crypto provider reqwest's
-# `rustls-no-provider` feature expects (see the workspace manifest).
-fetch = ["dep:futures-util", "dep:reqwest", "dep:rustls", "dep:url"]
+# `rustls-no-provider` feature expects (see the workspace manifest); `http`
+# (already reqwest's own dependency) builds the canned responses a
+# `nitr test` fetch double answers with.
+fetch = ["dep:futures-util", "dep:http", "dep:reqwest", "dep:rustls", "dep:url"]
 # The minijinja template engine.
 template = ["dep:minijinja"]
 
@@ -77,6 +79,7 @@ tracing = { workspace = true }
 argon2 = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
 minijinja = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }

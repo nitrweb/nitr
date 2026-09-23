@@ -46,10 +46,10 @@ fn jwt_mac(alg: &str, key: &[u8], data: &[u8]) -> mlua::Result<Vec<u8>> {
     }
 }
 
+/// Read through the standard library's clock, so `exp`/`nbf` checks
+/// follow `nitr.test.clock` in tests.
 fn unix_now() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f64())
+    crate::clock::now_unix_f64()
 }
 
 /// `verify`'s failure path: `nil` plus a reason, so callers can

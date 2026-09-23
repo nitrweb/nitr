@@ -55,6 +55,9 @@ pub struct Server {
     /// The shared `nitr.cache`, held here so a reload hands the new pool
     /// the same storage rather than starting cold.
     cache: Option<nitr_std::Cache>,
+    /// The configuration script's result as built, for states outside the
+    /// pool (`nitr test` mounts it as `nitr.cfg` in its test states).
+    cfg_snapshot: Option<serde_json::Value>,
     /// The pool rebuild's state: [`RELOAD_IDLE`], [`RELOAD_RUNNING`], or
     /// [`RELOAD_PENDING`] (running, and another was asked for meanwhile —
     /// the task runs once more when it finishes, so a save or a `SIGHUP`
@@ -80,8 +83,8 @@ mod pool;
 mod serve;
 
 pub use builder::ServerBuilder;
-pub(crate) use pool::current_pool;
 use pool::{build_runtimes, new_pool};
+pub(crate) use pool::{current_pool, input_env};
 pub(crate) use serve::accept_error_backoff;
 
 impl Server {
@@ -120,6 +123,12 @@ impl Server {
     pub fn openapi_site(&self) -> Option<Vec<(String, bytes::Bytes)>> {
         let docs = self.docs.read().ok()?.clone()?;
         docs.static_site(&self.cfg.swagger).ok()
+    }
+
+    /// The configuration script's snapshot (`nitr.cfg`) as of the build;
+    /// `None` without a configuration script.
+    pub fn cfg_snapshot(&self) -> Option<&serde_json::Value> {
+        self.cfg_snapshot.as_ref()
     }
 
     /// An in-process client that dispatches requests through the full
@@ -294,12 +303,12 @@ async fn rebuild_pool(
     #[cfg(feature = "openapi")] docs: &crate::openapi::docs::DocsSlot,
 ) {
     match build_runtimes(cfg, builtins, setup_fns, modules, cache.as_ref()).await {
-        Ok(runtimes) => {
+        Ok(built) => {
             // The document comes from the new bootstrap state; a document
             // that fails its bound keeps the old pool *and* the old
             // document, so the two never disagree.
             #[cfg(feature = "openapi")]
-            let fresh_docs = match pool::build_docs(cfg, &runtimes) {
+            let fresh_docs = match pool::build_docs(cfg, &built.runtimes) {
                 Ok(docs) => docs,
                 Err(err) => {
                     tracing::error!("reload failed, keeping the current pool: {err}");
@@ -307,7 +316,7 @@ async fn rebuild_pool(
                 }
             };
             let fresh = Arc::new(new_pool(
-                runtimes,
+                built,
                 cfg,
                 builtins,
                 setup_fns,
