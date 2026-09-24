@@ -14,7 +14,7 @@ failure. A step you skipped is reported as skipped, never as passed.
 | 2 | Lint | `make lint` | always |
 | 3 | Test | `make test` | always |
 | 4 | API docs | `NITR_API_REGEN=1 cargo test -p nitr-cli --test api` | `nitr-api.toml` changed |
-| 5 | Fuzz seams | `cd fuzz && RUSTFLAGS="--cfg fuzzing" cargo +nightly check` | `pub mod fuzzing` or `fuzz/` changed |
+| 5 | Fuzz | `make fuzz FUZZ_TIME=30` | `pub mod fuzzing`, `fuzz/`, or behaviour a target asserts changed |
 | 6 | Dependencies | `cargo deny check` | `Cargo.toml` or a `Cargo.lock` changed |
 | 7 | Live smoke | build it and run it | always, for what you touched |
 
@@ -33,8 +33,10 @@ What each step covers:
 4. **API docs.** Regenerates `resources/nitr-types.lua` and
    `resources/nitr-api.md`. They travel in the same commit as the TOML.
    Without the variable, the same test fails on drift.
-5. **Fuzz seams.** For a target you touched, also run it for 60 s against
-   a scratch corpus. Never run it against `fuzz/seeds/`.
+5. **Fuzz.** Every target, seeded like CI, into the untracked
+   `fuzz/corpus/`. It catches a stale oracle before CI does: grep
+   `fuzz/fuzz_targets/` for any function whose output you changed. Never
+   run a target against `fuzz/seeds/`.
 6. **Dependencies.** Licences, advisories and sources (`deny.toml`). An
    advisory in a crate you did not touch is still reported. Fix it in its
    own change.

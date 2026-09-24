@@ -41,6 +41,26 @@ build it, run it, and exercise its routes.
 - **Have a sentence for a name**: what must hold, not which function it
   pokes.
 
+## Flaky tests
+
+A test that passes here and fails on a slower machine is a wrong test.
+CI runs on macOS, Windows and emulated targets, several times slower than
+a dev box.
+
+- **Never race two limits.** A test that needs limit A to fire makes it
+  fire far inside every other limit that could fire first. A memory hog
+  takes 1 MiB a step, not 64 bytes a step against a 500 ms budget.
+- **Measure the margin, then keep it at 10× or more.** Time the work on
+  your machine; a 2× margin is a macOS failure waiting to happen.
+- **Reproduce a speed-dependent failure by shrinking the budget** until
+  the slow path wins, then check the fix holds at that budget.
+- **Assert the contract, not a schedule.** "At most N in flight", not
+  "exactly N". An elapsed-time check sits below the least time the wrong
+  behaviour must take (the sum of the backoff floors), with room to spare.
+- **Effects on another thread are polled to a deadline.** A cleanup in
+  `spawn_blocking` or a `Drop` elsewhere lands after the response; assert
+  it inside a bounded poll, never right after the call.
+
 ## Hygiene
 
 - **Own every file you write.** Use a per-test `TestDir` or `Scratch`
@@ -74,6 +94,17 @@ build it, run it, and exercise its routes.
   `fuzz/dicts/<target>.dict`.
 - **Assertions state properties** a wrong-but-crash-free parser would
   break (round trip, containment, fixpoint), not only "no panic".
+- **Oracles pin behaviour, so a behaviour change updates them.** Before
+  changing what a function returns or refuses, grep `fuzz/fuzz_targets/`
+  for it. Pinned outputs, allowed-error lists and "asserted as it
+  behaves" rows move with the fix in the same change; CI finds them
+  otherwise.
+- **Read Lua strings as bytes** (`LuaString`) in an oracle unless the
+  contract promises UTF-8; a `String` conversion panics on the first
+  non-UTF-8 input the fuzzer makes.
+- **Replay a CI crash** from its base64 line: decode it into a file under
+  `target/`, then `cargo +nightly fuzz run --target
+  x86_64-unknown-linux-gnu <target> <file>`.
 - **Run one** with
   `cd fuzz && cargo +nightly fuzz run --target x86_64-unknown-linux-gnu <target> <scratch-corpus>`.
   Never point it at `fuzz/seeds/<target>`: libFuzzer writes into the

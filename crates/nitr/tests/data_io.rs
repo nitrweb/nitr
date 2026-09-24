@@ -607,7 +607,9 @@ async fn await_all_caps_concurrency_instead_of_refusing() {
         serde_json::Value::from(vec![200; 9]),
         "{body}"
     );
-    assert_eq!(upstream.peak.load(Ordering::SeqCst), 2);
+    // The cap, not a schedule: a slow runner may never have two in flight.
+    let peak = upstream.peak.load(Ordering::SeqCst);
+    assert!((1..=2).contains(&peak), "peak concurrency {peak}");
     srv.stop().await;
 }
 
@@ -646,7 +648,7 @@ async fn a_refused_fetch_is_not_retried() {
     );
     // Four exponential retries sleep at least 50 + 100 + 200 + 400 ms.
     assert!(
-        started.elapsed() < std::time::Duration::from_millis(500),
+        started.elapsed() < std::time::Duration::from_millis(700),
         "took {:?}",
         started.elapsed()
     );

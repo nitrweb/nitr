@@ -579,7 +579,7 @@ end)
 
 app:get("/hog", function(req)
     local t = {}
-    for i = 1, 1e8 do t[i] = ("x"):rep(64) .. i end
+    for i = 1, 1e8 do t[i] = ("x"):rep(1024 * 1024) end
     return nitr.text("unreachable")
 end)
 
@@ -1050,7 +1050,10 @@ end)
 
 /// A bare-assert file shows the logs of the request that failed it, a
 /// file whose top level exhausts the memory limit fails alone, and the
-/// files after it still run.
+/// files after it still run. The hog takes 1 MiB a step so the 8 MiB limit
+/// trips in a few steps, far inside the 500 ms budget: with 64-byte steps
+/// it took about 200 ms here, and a slower machine timed out first, which
+/// is a different failure (the file's registered test then runs).
 #[test]
 fn a_broken_file_fails_alone_and_shows_its_logs() {
     require_runnable_binary!();
@@ -1065,7 +1068,7 @@ fn a_broken_file_fails_alone_and_shows_its_logs() {
             ),
             (
                 "tests/b_hog_test.lua",
-                "nitr.test.it(\"never registered in time\", function() end)\nhog = {}\nfor i = 1, 1e8 do hog[i] = (\"x\"):rep(64) .. i end\n",
+                "nitr.test.it(\"never registered in time\", function() end)\nhog = {}\nfor i = 1, 1e8 do hog[i] = (\"x\"):rep(1024 * 1024) end\n",
             ),
             (
                 "tests/c_after_test.lua",
