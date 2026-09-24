@@ -239,13 +239,7 @@ async fn negotiate(lua: &Lua, req: Value, offers: Table) -> mlua::Result<Value> 
         .and_then(|h| h.get::<Option<String>>("accept").ok().flatten())
         .unwrap_or_else(|| "*/*".to_string());
 
-    let mut offered = Vec::new();
-    let mut values = Vec::new();
-    for pair in offers.pairs::<String, Value>() {
-        let (media_type, value) = pair?;
-        offered.push(media_type);
-        values.push(value);
-    }
+    let (offered, mut values) = offer_list(&offers)?;
 
     let offered_refs: Vec<&str> = offered.iter().map(String::as_str).collect();
     match best_match(&accept, &offered_refs) {
@@ -260,6 +254,26 @@ async fn negotiate(lua: &Lua, req: Value, offers: Table) -> mlua::Result<Value> 
             Ok(Value::Table(table))
         }
     }
+}
+
+/// The offers in tie-breaking order, from either shape: a list
+/// `{ { type, value }, ... }` keeps its order; a map `{ [type] = value }`
+/// is sorted by type, because Lua seeds its string hashes per state and a
+/// map's own order would differ between pooled states.
+fn offer_list(offers: &Table) -> mlua::Result<(Vec<String>, Vec<Value>)> {
+    let mut pairs = Vec::new();
+    if offers.raw_len() > 0 {
+        for offer in offers.sequence_values::<Table>() {
+            let offer = offer?;
+            pairs.push((offer.raw_get::<String>(1)?, offer.raw_get::<Value>(2)?));
+        }
+    } else {
+        for pair in offers.pairs::<String, Value>() {
+            pairs.push(pair?);
+        }
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    Ok(pairs.into_iter().unzip())
 }
 
 /// Picks the best of `offered` media types for an `Accept` header value,
@@ -330,6 +344,33 @@ mod tests {
         );
         assert!(format_event("x\nretry: 1", data("d")).is_err());
         assert!(format_event("x\r", data("d")).is_err());
+    }
+
+    /// Lua seeds its string hashes per state, so a map's key order differs
+    /// between pooled states: a tie must not depend on it. Offers given as
+    /// a list keep their order, and ties go to the earlier one.
+    #[tokio::test]
+    async fn negotiation_ties_are_the_same_in_every_state() {
+        for _ in 0..32 {
+            let lua = Lua::new();
+            let req: Value = lua
+                .load("{ headers = { accept = '*/*' } }")
+                .eval()
+                .expect("req");
+            let map: Table = lua
+                .load("{ ['text/html'] = 'html', ['application/json'] = 'json', ['text/plain'] = 'text' }")
+                .eval()
+                .expect("offers");
+            let picked = negotiate(&lua, req.clone(), map).await.expect("negotiate");
+            assert_eq!(picked.as_string().expect("string"), "json");
+
+            let list: Table = lua
+                .load("{ { 'text/html', 'html' }, { 'application/json', 'json' } }")
+                .eval()
+                .expect("offers");
+            let picked = negotiate(&lua, req, list).await.expect("negotiate");
+            assert_eq!(picked.as_string().expect("string"), "html");
+        }
     }
 
     #[test]

@@ -37,6 +37,9 @@ pub struct RuntimePool {
     /// How a poisoned state is replaced. Without one, a damaged state is
     /// returned to the pool rather than shrinking capacity.
     rebuild: Option<Arc<RebuildFn>>,
+    /// Data the embedder keeps with this pool and swaps with it: a request
+    /// that reads it and then checks a state out sees one build of both.
+    companion: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl std::fmt::Debug for RuntimePool {
@@ -71,7 +74,26 @@ impl RuntimePool {
             // Cannot fail: the channel capacity equals the number of runtimes.
             let _ = tx.try_send(rt);
         }
-        Self { tx, rx, rebuild }
+        Self {
+            tx,
+            rx,
+            rebuild,
+            companion: None,
+        }
+    }
+
+    /// Keeps `companion` with this pool, readable with
+    /// [`companion()`](Self::companion).
+    #[must_use]
+    pub fn with_companion<T: std::any::Any + Send + Sync>(mut self, companion: T) -> Self {
+        self.companion = Some(Arc::new(companion));
+        self
+    }
+
+    /// The companion set with [`with_companion()`](Self::with_companion),
+    /// when it is a `T`.
+    pub fn companion<T: std::any::Any + Send + Sync>(&self) -> Option<&T> {
+        self.companion.as_deref()?.downcast_ref()
     }
 
     /// Number of runtimes owned by the pool.
@@ -263,6 +285,14 @@ mod tests {
             assert_eq!(pool.available(), 0);
         }
         assert_eq!(pool.available(), 1);
+    }
+
+    #[test]
+    fn a_companion_travels_with_the_pool_and_its_clones() {
+        let pool = RuntimePool::new(vec![runtime()]).with_companion(7u32);
+        assert_eq!(pool.clone().companion::<u32>(), Some(&7));
+        assert_eq!(pool.companion::<String>(), None);
+        assert_eq!(RuntimePool::new(vec![runtime()]).companion::<u32>(), None);
     }
 
     #[tokio::test]

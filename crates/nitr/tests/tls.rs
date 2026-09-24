@@ -71,7 +71,7 @@ impl TlsServer {
                 return {
                     status = 200,
                     headers = { ["Content-Type"] = "text/plain" },
-                    body = "over tls: " .. req.path,
+                    body = "over tls: " .. req.path .. " " .. req.uri.scheme .. "://" .. req.uri.authority,
                 }
             end)
             return app
@@ -183,7 +183,12 @@ async fn serves_a_real_request_over_tls() {
     // only connection type the server builds. A negotiated `h2` would
     // have failed after a successful handshake.
     assert_eq!(resp.version(), reqwest::Version::HTTP_11);
-    assert_eq!(resp.text().await.expect("body"), "over tls: /hello");
+    // HTTP/1.1 sends the path alone: the authority is the Host header,
+    // the scheme is the listener's.
+    assert_eq!(
+        resp.text().await.expect("body"),
+        format!("over tls: /hello {}", server.url(""))
+    );
 
     // Keep-alive over the same TLS connection: the second request proves
     // the stream survives past the first response rather than the
@@ -199,6 +204,49 @@ async fn serves_a_real_request_over_tls() {
     }
 
     server.stop().await;
+}
+
+/// The in-process client (`nitr test`, `Server::test_client`) reports the
+/// scheme the served requests would carry: `https` under `[tls]`, with no
+/// socket involved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_in_process_client_reports_the_tls_scheme() {
+    let dir = TestDir::new("tls-test-client");
+    let identity = mint(&dir);
+    let handler = dir.write(
+        "app.lua",
+        r#"
+        local app = nitr.app()
+        app:get("/scheme", function(req) return nitr.text(req.uri.scheme) end)
+        return app
+        "#,
+    );
+    let (_listener, addr) = reserve_addr();
+    let cfg = nitr::Config {
+        listen: addr,
+        handler_script: handler,
+        workers: 1,
+        tls: nitr::TlsConfig {
+            enabled: true,
+            cert: Some(identity.cert_path.clone()),
+            key: Some(identity.key_path.clone()),
+            min_version: None,
+            handshake_ms: None,
+        },
+        ..nitr::Config::default()
+    };
+    let server = nitr::Server::builder()
+        .config(cfg)
+        .build()
+        .await
+        .expect("build a TLS server");
+    let resp = server
+        .test_client()
+        .request("GET", "/scheme", &[], None)
+        .await
+        .expect("request");
+    assert_eq!(resp.status, 200);
+    assert_eq!(String::from_utf8_lossy(&resp.body), "https");
 }
 
 /// A plaintext HTTP request to a TLS port must be *refused*, not

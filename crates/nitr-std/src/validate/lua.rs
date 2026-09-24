@@ -43,7 +43,8 @@ impl UserData for LuaSchema {
             }
         });
 
-        // schema:partial() — every top-level field optional.
+        // schema:partial() — every top-level field optional, and none
+        // defaulted: a PATCH body omits what it leaves as stored.
         methods.add_method("partial", |_, this, ()| {
             let fields = this
                 .0
@@ -52,6 +53,7 @@ impl UserData for LuaSchema {
                 .map(|(name, rule)| {
                     let mut rule = (**rule).clone();
                     rule.required = false;
+                    rule.default = None;
                     (name.clone(), Arc::new(rule))
                 })
                 .collect();

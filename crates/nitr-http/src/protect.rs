@@ -408,6 +408,7 @@ mod tests {
             valid: None,
             spool_dir: None,
             peer_addr: format!("{peer}:1234").parse().expect("addr"),
+            tls: false,
             req,
             params: Vec::new(),
             id: "test".into(),

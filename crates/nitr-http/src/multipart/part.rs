@@ -6,13 +6,14 @@
 //! [`LuaPart`]: the one-shot part handle handed to the Lua callback —
 //! `text`, `save` (streaming socket → disk), and `discard`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use hyper::body::Bytes;
 use mlua::{ExternalResult as _, UserData, UserDataFields, UserDataMethods};
 
 use super::upload::{resolve_upload_path, safe_filename};
+use crate::validation::spool::SPOOL_DIR;
 
 /// A `multipart/form-data` part handed to the Lua callback.
 ///
@@ -59,14 +60,20 @@ impl LuaPart {
     /// part unconsumed: the handler can catch the error and still
     /// `discard()` it or retry with `safe_filename`.
     async fn resolve_target(&self, rel: &str) -> mlua::Result<PathBuf> {
-        let Some(root) = &self.upload_root else {
-            return Err(mlua::Error::RuntimeError(
-                "part:save() requires an upload directory: set [multipart] upload_dir in \
+        resolve_upload_path(self.upload_root()?, rel).await
+    }
+
+    fn upload_root(&self) -> mlua::Result<&Path> {
+        self.upload_root
+            .as_deref()
+            .map(PathBuf::as_path)
+            .ok_or_else(|| {
+                mlua::Error::RuntimeError(
+                    "part:save() requires an upload directory: set [multipart] upload_dir in \
                  nitr.toml to the root every saved file must land inside"
-                    .into(),
-            ));
-        };
-        resolve_upload_path(root, rel).await
+                        .into(),
+                )
+            })
     }
 }
 
@@ -135,12 +142,16 @@ impl UserData for LuaPart {
             let path = target.display().to_string();
             let mut field = part.take()?;
             let limit = part.max_file_bytes;
-            let mut file = tokio::fs::File::create(&target).await.map_err(|err| {
+            // Streaming into `target` itself would truncate an existing
+            // file before the upload is known to succeed; a failed upload
+            // then destroys what it was meant to replace.
+            let spool = part.upload_root()?.join(SPOOL_DIR);
+            let (pending, mut file) = PendingFile::create(&spool).await.map_err(|err| {
                 mlua::Error::RuntimeError(format!("failed to create `{rel}`: {err}"))
             })?;
 
             let mut written: u64 = 0;
-            let result = async {
+            let streamed = async {
                 while let Some(chunk) = field.chunk().await.into_lua_err()? {
                     written += chunk.len() as u64;
                     if written > limit {
@@ -151,16 +162,14 @@ impl UserData for LuaPart {
                 flush(&mut file, &path).await
             }
             .await;
-
-            if let Err(err) = result {
-                // A failed upload must not leave a truncated file behind
-                // for the application to trip over later. This runs only
-                // for a path that already passed containment, so the
-                // unlink cannot reach outside the upload root.
-                drop(file);
-                let _ = tokio::fs::remove_file(&target).await;
+            drop(file);
+            if let Err(err) = streamed {
+                pending.discard().await;
                 return Err(err);
             }
+            pending.persist(&target).await.map_err(|err| {
+                mlua::Error::RuntimeError(format!("failed to save `{rel}`: {err}"))
+            })?;
             Ok(written)
         });
 
@@ -177,11 +186,90 @@ impl UserData for LuaPart {
     }
 }
 
-pub(crate) fn too_large(name: &str, kind: &str, limit: u64) -> mlua::Error {
-    mlua::Error::RuntimeError(format!(
-        "multipart {kind} `{name}` exceeds the {limit} byte limit"
-    ))
+/// A part staged in the upload root's spool and renamed into place.
+/// Settled by `persist` or `discard`, which finish before they return;
+/// dropped unsettled, because the budget dropped the whole save, it
+/// removes itself. A process killed mid-save leaves it to the spool sweep
+/// at the next boot.
+struct PendingFile {
+    path: PathBuf,
+    settled: bool,
 }
+
+impl PendingFile {
+    /// The spool is inside the upload root, like the target, so the rename
+    /// stays on one filesystem (as `File:save`'s does).
+    async fn create(spool: &Path) -> std::io::Result<(Self, tokio::fs::File)> {
+        tokio::fs::create_dir_all(spool).await?;
+        let path = spool.join(format!("save-{}", uuid::Uuid::now_v7().simple()));
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await?;
+        let pending = Self {
+            path,
+            settled: false,
+        };
+        Ok((pending, file))
+    }
+
+    async fn persist(mut self, target: &Path) -> std::io::Result<()> {
+        let renamed = tokio::fs::rename(&self.path, target).await;
+        if renamed.is_err() {
+            let _ = tokio::fs::remove_file(&self.path).await;
+        }
+        self.settled = true;
+        renamed
+    }
+
+    async fn discard(mut self) {
+        let _ = tokio::fs::remove_file(&self.path).await;
+        self.settled = true;
+    }
+}
+
+impl Drop for PendingFile {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let path = std::mem::take(&mut self.path);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || std::fs::remove_file(path));
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+pub(crate) fn too_large(name: &str, kind: &str, limit: u64) -> mlua::Error {
+    mlua::Error::external(LimitExceeded(format!(
+        "multipart {kind} `{name}` exceeds the {limit} byte limit"
+    )))
+}
+
+pub(crate) fn too_many_parts(max_parts: usize) -> mlua::Error {
+    mlua::Error::external(LimitExceeded(format!(
+        "multipart body has more than {max_parts} parts"
+    )))
+}
+
+/// A multipart limit the request crossed. The client's doing: uncaught, it
+/// answers 413 like `[limits] max_body_bytes`, not as a handler failure.
+#[derive(Debug)]
+pub(crate) struct LimitExceeded(String);
+
+impl std::fmt::Display for LimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LimitExceeded {}
 
 async fn write_all(file: &mut tokio::fs::File, chunk: &Bytes, path: &str) -> mlua::Result<()> {
     use tokio::io::AsyncWriteExt as _;

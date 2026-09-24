@@ -44,39 +44,28 @@ impl UserData for LuaResponse {
     fn add_fields<'lua, F: UserDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_get("status", |_, resp| Ok(resp.resp.status().as_u16()));
 
-        fields.add_field_method_get("url", |lua, resp| {
+        fields.add_field_method_get("url", |_, resp| Ok(resp.resp.url().to_string()));
+
+        // One value per name, the last of a repeated one; `raw_headers`
+        // has them all. Values are the bytes the upstream sent: a header
+        // that is not visible ASCII is still a header.
+        fields.add_field_method_get("headers", |lua, resp| {
             let table = lua.create_table()?;
-            let url = resp.resp.url();
-
-            table
-                .set("scheme", url.scheme().to_string())
-                .into_lua_err()?;
-            table
-                .set("host", url.host_str().unwrap_or_default())
-                .into_lua_err()?;
-            table
-                .set("port", url.port().unwrap_or_default())
-                .into_lua_err()?;
-            table.set("path", url.path()).into_lua_err()?;
-            table
-                .set("authority", url.authority().to_string())
-                .into_lua_err()?;
-            table
-                .set("query", url.query().unwrap_or_default())
-                .into_lua_err()?;
-
+            for (name, value) in resp.resp.headers() {
+                table.set(name.as_str(), lua.create_string(value.as_bytes())?)?;
+            }
             Ok(table)
         });
 
-        fields.add_field_method_get("headers", |lua, resp| {
-            let headers = resp.resp.headers();
-            let table = lua.create_table().into_lua_err()?;
-            for (k, v) in headers.iter() {
-                table
-                    .set(k.as_str(), v.to_str().unwrap_or_default())
-                    .into_lua_err()?;
+        fields.add_field_method_get("raw_headers", |lua, resp| {
+            let list = lua.create_table()?;
+            for (name, value) in resp.resp.headers() {
+                let entry = lua.create_table()?;
+                entry.set("name", name.as_str())?;
+                entry.set("value", lua.create_string(value.as_bytes())?)?;
+                list.push(entry)?;
             }
-            Ok(table)
+            Ok(list)
         });
 
         fields.add_field_method_get("content_length", |_, resp| Ok(resp.resp.content_length()));

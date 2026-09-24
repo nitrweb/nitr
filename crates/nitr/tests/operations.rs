@@ -60,6 +60,35 @@ async fn health_endpoints_answer_on_the_main_listener() {
     h.stop().await;
 }
 
+/// On a shutdown signal readiness answers 503 on the main listener while
+/// it keeps serving for `[shutdown] readiness_delay`, so a balancer
+/// probing that port sees "draining" instead of a refused connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readiness_reports_draining_on_the_main_listener() {
+    let mut h = start(|cfg| cfg.shutdown.readiness_delay = Some(2)).await;
+    assert_eq!(h.get("/readyz").await.status(), 200);
+
+    h.begin_shutdown();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut status = 200;
+    while status == 200 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        status = h
+            .client()
+            .get(h.url("/readyz"))
+            .send()
+            .await
+            .expect("the listener stays open during the readiness delay")
+            .status()
+            .as_u16();
+    }
+    assert_eq!(status, 503, "readiness must report draining");
+    // The application is still served during the window.
+    assert_eq!(h.get("/hello").await.status(), 200);
+
+    h.stop().await;
+}
+
 /// `[health] enabled = false` removes the endpoints entirely.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disabled_health_passes_through_to_the_app() {

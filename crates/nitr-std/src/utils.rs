@@ -198,17 +198,20 @@ pub(crate) fn dag_table(lua: &Lua, levels: usize) -> Value {
 /// diagnose is worse than one that says it could not render.
 pub(crate) fn create_debug_fn(lua: &Lua) -> mlua::Result<Function> {
     lua.create_function(|_, value: Value| {
-        // Nothing is walked or rendered unless the level is on.
-        if !tracing::enabled!(tracing::Level::DEBUG) {
-            return Ok(());
-        }
-        if let Err(err) = check_value_bounds(&value) {
-            tracing::debug!("[lua] <value not rendered: {err}>");
-            return Ok(());
-        }
-        tracing::debug!("[lua] {value:#?}");
-        Ok(())
+        log_debug_value(&value);
+        Ok(value)
     })
+}
+
+fn log_debug_value(value: &Value) {
+    // Nothing is walked or rendered unless the level is on.
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    match check_value_bounds(value) {
+        Ok(()) => tracing::debug!("[lua] {value:#?}"),
+        Err(err) => tracing::debug!("[lua] <value not rendered: {err}>"),
+    }
 }
 
 /// Builds the structured error value the error model hands to Lua: the
@@ -440,15 +443,28 @@ mod tests {
     /// SIGABRT that takes the whole test binary with it, which is exactly
     /// the failure being prevented.
     #[test]
+    fn dbg_returns_its_value() {
+        let lua = Lua::new();
+        lua.globals()
+            .set("dbg", create_debug_fn(&lua).expect("dbg"))
+            .expect("set");
+        let same: bool = lua
+            .load("local t = {} return dbg(t) == t and dbg(7) == 7")
+            .eval()
+            .expect("eval");
+        assert!(same);
+    }
+
+    #[test]
     fn dbg_does_not_abort_on_a_deep_value() {
         let lua = Lua::new();
         let dbg = create_debug_fn(&lua).expect("dbg");
         // Far past anything the guard admits, and past what the Rust
         // stack survives being formatted.
-        dbg.call::<()>(deep_table(&lua, 30_000))
+        dbg.call::<Value>(deep_table(&lua, 30_000))
             .expect("dbg must degrade, not abort and not raise");
         // A value within the bound still prints normally.
-        dbg.call::<()>(deep_table(&lua, 8))
+        dbg.call::<Value>(deep_table(&lua, 8))
             .expect("an ordinary value still prints");
     }
 

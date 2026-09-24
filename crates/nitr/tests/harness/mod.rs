@@ -182,6 +182,7 @@ impl TestServer {
         // fails the test, not the CI job, and no stream grace.
         cfg.shutdown.grace = SHUTDOWN_GRACE_SECS;
         cfg.shutdown.stream_grace = 0;
+        cfg.shutdown.readiness_delay = Some(0);
         Builder {
             dir: TestDir::new(label),
             cfg,
@@ -533,8 +534,16 @@ impl TestServer {
     /// Like [`stop`](Self::stop), but hands back the serve result instead
     /// of asserting on it — for tests whose subject is the shutdown
     /// outcome itself (an expired drain deadline reports an error).
-    pub async fn shutdown(&mut self) -> nitr::Result {
+    /// Sends the shutdown signal without waiting for the drain, for tests
+    /// that observe the server while it drains; `stop` then waits.
+    pub fn begin_shutdown(&mut self) {
         let _ = self.stop.take().expect("not stopped").send(());
+    }
+
+    pub async fn shutdown(&mut self) -> nitr::Result {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
         let served = self.served.take().expect("not stopped");
         match tokio::time::timeout(JOIN_DEADLINE, served).await {
             Ok(task) => task.expect("server task"),

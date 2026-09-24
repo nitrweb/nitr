@@ -102,12 +102,24 @@ fn no_address(host: &str) -> BoxError {
 }
 
 fn forbidden(host: &str) -> BoxError {
-    format!(
+    Box::new(Refused(format!(
         "fetch host `{host}` resolves to a private or local address \
          (set fetch.allow_private_networks to permit this)"
-    )
-    .into()
+    )))
 }
+
+/// The resolver refused every address a host resolved to: the policy's
+/// answer, which a retry would only repeat.
+#[derive(Debug)]
+pub(crate) struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 /// Validates one request URL against the policy. Called for the initial
 /// URL and again for every redirect hop, so redirects cannot cross the

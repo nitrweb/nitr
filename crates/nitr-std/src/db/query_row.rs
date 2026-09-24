@@ -3,9 +3,9 @@
 // See https://nitrweb.com/ for more information
 // Copyright (C) 2024-present Jose Quintana <joseluisq.net>
 
-use rusqlite::{Connection, OptionalExtension as _, params_from_iter};
+use rusqlite::{Connection, OptionalExtension as _};
 
-use crate::db::types::{SqlRow, SqlValue, column_names, read_row};
+use crate::db::types::{SqlRow, SqlValue, bind, column_names, read_row};
 
 /// Runs a query and returns its first row, or `None` when it produced no
 /// rows — the documented `query_row` contract (`nil`, not an error, for an
@@ -17,8 +17,9 @@ pub(crate) fn call(
     _max_rows: usize,
 ) -> Result<Option<SqlRow>, rusqlite::Error> {
     let mut stmt = conn.prepare_cached(sql)?;
-    let columns = column_names(&stmt);
+    let bound = bind(&stmt, params);
+    let columns = column_names(&stmt)?;
 
-    stmt.query_row(params_from_iter(params), |row| read_row(&columns, row))
+    stmt.query_row(bound, |row| read_row(&columns, row))
         .optional()
 }

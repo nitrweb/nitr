@@ -312,10 +312,16 @@ impl UserData for Cache {
 
         // cache:set(key, value, opts?) — opts is { ttl = seconds }.
         // The value is serialized here, which is what keeps states isolated
-        // and is also why a function or userdata cannot be cached.
+        // and is also why a function or userdata cannot be cached. Setting
+        // nil removes the key: a stored `null` would read back as a truthy
+        // light userdata, not as the nil that was set.
         methods.add_method(
             "set",
             |_, cache, (key, value, opts): (String, Value, Option<Table>)| {
+                if value.is_nil() || value.is_null() {
+                    cache.lock()?.remove(&key);
+                    return Ok(());
+                }
                 let ttl = match &opts {
                     Some(opts) => opts.get::<Option<u64>>("ttl")?,
                     None => None,
@@ -444,6 +450,27 @@ mod tests {
             .eval()
             .expect("eval");
         assert!(err.contains("nested deeper than 128 levels"), "got: {err}");
+    }
+
+    /// Storing nil is removing: a stored JSON `null` read back as a
+    /// truthy light userdata, so `if cache:get(k)` took the wrong branch.
+    #[test]
+    fn setting_nil_removes_the_key() {
+        let lua = Lua::new();
+        let ud = lua
+            .create_userdata(cache(CacheOptions::default()))
+            .expect("ud");
+        lua.globals().set("cache", ud).expect("global");
+        let (gone, entries): (bool, i64) = lua
+            .load(
+                r#"cache:set("k", 1)
+                   cache:set("k", nil)
+                   return cache:get("k") == nil, cache:stats().entries"#,
+            )
+            .eval()
+            .expect("eval");
+        assert!(gone);
+        assert_eq!(entries, 0);
     }
 
     #[test]

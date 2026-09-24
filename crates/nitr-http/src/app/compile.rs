@@ -145,7 +145,10 @@ pub(super) fn compile(
     let meta = super::meta::collect(lua, &def, &inputs, input_env)?;
 
     Ok(Compiled {
-        dispatch: Dispatch(Box::new(CompiledApp { router, chains })),
+        dispatch: Dispatch(Box::new(CompiledApp {
+            router: Arc::new(router),
+            chains,
+        })),
         statics: def.statics.clone(),
         meta,
     })

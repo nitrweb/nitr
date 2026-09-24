@@ -451,6 +451,28 @@ fn build_produces_a_self_contained_artifact() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("ok:"), "got: {stdout}");
 
+    // Dev mode sends error details to clients: a production artifact
+    // stays out of it whichever layer asks.
+    for (env, args) in [
+        (
+            Some(("NITR_DEV_MODE", "true")),
+            &["check", "--print-config"][..],
+        ),
+        (None, &["--dev", "check", "--print-config"][..]),
+    ] {
+        let mut cmd = Command::new(&artifact);
+        cmd.current_dir(&empty).args(args);
+        if let Some((key, value)) = env {
+            cmd.env(key, value);
+        }
+        let out = cmd.output().expect("run the artifact");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("dev_mode = false"),
+            "{args:?} {env:?}: {stdout}"
+        );
+    }
+
     // Building from a bundle is refused: bundles are built from the plain
     // binary, not stacked.
     let out = Command::new(&artifact)
@@ -712,13 +734,9 @@ fn openapi_without_the_feature_names_the_rebuild() {
 #[test]
 fn openapi_generates_checks_drift_and_writes_a_site() {
     require_runnable_binary!();
+    // No `nitr migrate` first: the document is the routes, not the data,
+    // so a fresh CI checkout builds it and no database file appears.
     let dir = scaffold("openapi", false);
-    let migrate = nitr()
-        .current_dir(&dir)
-        .arg("migrate")
-        .output()
-        .expect("run migrate");
-    assert!(migrate.status.success());
 
     // Printed: the scaffold's routes, documented.
     let out = nitr()
@@ -730,6 +748,10 @@ fn openapi_generates_checks_drift_and_writes_a_site() {
         out.status.success(),
         "openapi failed: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dir.path.join("data/app.db").exists(),
+        "openapi must not create the application database"
     );
     let spec: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json on stdout");
     assert_eq!(spec["info"]["title"], "My App");

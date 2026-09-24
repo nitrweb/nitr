@@ -113,6 +113,9 @@ impl Server {
             bound,
             current_pool(&self.pool).size()
         );
+        if let Some(warning) = self.cfg.streams_warning() {
+            tracing::warn!("{warning}");
+        }
 
         // hyper enforces a floor of 8 KiB on its read buffer.
         let max_buf_size = self.cfg.limits.max_header_bytes.max(8 * 1024);
@@ -239,6 +242,9 @@ impl Server {
             builder
         };
 
+        // Set by the shutdown signal: the listener keeps serving until it
+        // fires, with readiness already answering 503.
+        let mut draining: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
         loop {
             tokio::select! {
                 accepted = async {
@@ -273,6 +279,7 @@ impl Server {
                         self.protection.clone(),
                         main_health.clone(),
                         peer_addr,
+                        tls_enabled,
                     );
                     let http = http.clone();
                     // Subscribed here rather than inside the task:
@@ -328,19 +335,33 @@ impl Server {
                     });
                 }
                 Some(()) = reload_rx.recv() => self.reload(),
-                _ = &mut shutdown => break,
+                () = &mut shutdown, if draining.is_none() => {
+                    // Step 1: stop advertising readiness *before* requests
+                    // can fail, so a load balancer drains us on its own
+                    // terms. On the main listener that is only observable
+                    // while it still accepts, hence the delay.
+                    self.ready.store(false, Ordering::Relaxed);
+                    let delay = self.cfg.readiness_delay();
+                    if delay.is_zero() {
+                        break;
+                    }
+                    tracing::info!("draining: readiness answers 503, still serving for {delay:?}");
+                    draining = Some(Box::pin(tokio::time::sleep(delay)));
+                }
+                () = async {
+                    match draining.as_mut() {
+                        Some(delay) => delay.await,
+                        None => std::future::pending().await,
+                    }
+                }, if draining.is_some() => break,
             }
         }
 
-        // Step 1 happened by leaving the accept loop: the listener is
-        // dropped below and no new connection is taken. The probe listener
-        // stays up through the drain — readiness must be observable as
-        // "draining" while it happens — and dies with the process.
+        // Step 2: the listener is dropped and no new connection is taken.
+        // A separate probe listener stays up through the drain, readiness
+        // observable as "draining" while it happens, and dies with the
+        // process. Responses issued from here on carry `Connection: close`.
         drop(listener);
-        // Step 2: stop advertising readiness *before* requests can fail, so
-        // a load balancer drains us on its own terms. Responses issued from
-        // here on also carry `Connection: close`.
-        self.ready.store(false, Ordering::Relaxed);
 
         let grace = self.cfg.shutdown.grace();
         let total = self.cfg.shutdown.total_grace();

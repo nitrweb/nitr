@@ -10,4 +10,5 @@ pub(crate) mod check;
 pub(crate) mod hash_password;
 pub(crate) mod migrate;
 pub(crate) mod openapi;
+pub(crate) mod scratch_db;
 pub(crate) mod test;

@@ -139,6 +139,7 @@ impl Server {
             self.pool.clone(),
             self.streams.clone(),
             self.protection.clone(),
+            self.cfg.tls.enabled,
         )
     }
 

@@ -23,8 +23,9 @@ fn fields_json(fields: Option<Table>) -> Option<String> {
     if crate::utils::check_value_bounds(&fields).is_err() {
         return Some("\"<unserializable fields>\"".to_string());
     }
+    let path = crate::bounded::TablePath::default();
     Some(
-        serde_json::to_string(&fields)
+        serde_json::to_string(&crate::bounded::LuaData::new(&fields, &path))
             .unwrap_or_else(|_| "\"<unserializable fields>\"".to_string()),
     )
 }
@@ -119,6 +120,22 @@ pub(crate) fn create_log_table(lua: &Lua) -> mlua::Result<Table> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fields are serialized like every other script value: a table
+    /// mixing list items and named keys is not silently cut to its list.
+    #[test]
+    fn mixed_fields_are_not_logged_as_their_list_part() {
+        let lua = mlua::Lua::new();
+        let fields = |src: &str| -> Option<String> {
+            fields_json(Some(lua.load(src).eval().expect("fields")))
+        };
+        assert_eq!(fields("{ a = 1 }").as_deref(), Some(r#"{"a":1}"#));
+        assert_eq!(fields("{ 1, 2 }").as_deref(), Some("[1,2]"));
+        assert_eq!(
+            fields("{ 'a', total = 1 }").as_deref(),
+            Some("\"<unserializable fields>\"")
+        );
+    }
 
     #[test]
     fn messages_cannot_forge_log_lines() {

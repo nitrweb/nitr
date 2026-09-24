@@ -133,7 +133,9 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
     // dir, but its env file is external state like the database, so it
     // resolves against the working directory instead.
     let mut env_base = PathBuf::from(".");
-    let mut cfg = match bundle::load()? {
+    let bundled = bundle::load()?;
+    let is_bundle = bundled.is_some();
+    let mut cfg = match bundled {
         Some(cfg) => cfg,
         None => match &cli.config {
             Some(path) => {
@@ -158,6 +160,9 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
     cfg.apply_env()?;
     if cli.dev || matches!(cli.command, Some(Command::Dev)) {
         cfg.dev_mode = true;
+    }
+    if is_bundle {
+        bundle::seal(&mut cfg);
     }
     Ok(cfg)
 }

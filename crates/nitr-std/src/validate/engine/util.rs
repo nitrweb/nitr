@@ -7,7 +7,7 @@
 //! counting, the type a replacement must have, and the contract a custom
 //! check's return values follow.
 
-use mlua::{Lua, LuaSerdeExt, Value};
+use mlua::Value;
 
 use super::super::Kind;
 
@@ -23,21 +23,37 @@ pub(super) fn fraction_digits(n: f64) -> u32 {
 
 /// A canonical string for equality (`unique`, `equal_fields`): scalars by
 /// type and value, tables by their JSON, anything else by identity.
-pub(super) fn canonical(lua: &Lua, value: &Value) -> mlua::Result<String> {
+pub(super) fn canonical(value: &Value) -> mlua::Result<String> {
     Ok(match value {
         Value::String(s) => format!("s:{}", s.to_string_lossy()),
-        Value::Integer(i) => format!("n:{}", *i as f64),
+        // The float form where it is exact, so `1` equals `1.0`; above
+        // 2^53 it is not, and distinct integers would collide.
+        Value::Integer(i) if *i as f64 as i128 == *i as i128 => format!("n:{}", *i as f64),
+        Value::Integer(i) => format!("n:{i}"),
         Value::Number(n) => format!("n:{n}"),
         Value::Boolean(b) => format!("b:{b}"),
         Value::Table(_) => {
             crate::utils::check_json_bounds(value)?;
-            match lua.from_value::<serde_json::Value>(value.clone()) {
+            match crate::bounded::to_json_string(value) {
                 Ok(json) => format!("t:{json}"),
                 Err(_) => format!("p:{:?}", value.to_pointer()),
             }
         }
         other => format!("p:{:?}", other.to_pointer()),
     })
+}
+
+/// Whether `t` is a list: its keys are exactly `1..=#t`. A JSON object
+/// arrives as a Lua table too, and has no array part.
+pub(super) fn is_sequence(t: &mlua::Table) -> mlua::Result<bool> {
+    let len = t.raw_len() as i64;
+    for pair in t.pairs::<Value, Value>() {
+        match pair?.0 {
+            Value::Integer(key) if (1..=len).contains(&key) => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 /// Whether a replacement a check returned has the type its rule demands.
@@ -77,6 +93,7 @@ pub(super) fn verdict(results: mlua::MultiValue, what: &str) -> mlua::Result<Ver
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlua::Lua;
 
     #[test]
     fn decimals_count_the_shortest_form() {
@@ -89,7 +106,7 @@ mod tests {
     #[test]
     fn canonical_forms_separate_types_and_unify_numbers() {
         let lua = Lua::new();
-        let s = |v: Value| canonical(&lua, &v).unwrap();
+        let s = |v: Value| canonical(&v).unwrap();
         assert_ne!(
             s(Value::Integer(1)),
             s(Value::String(lua.create_string("1").unwrap()))
@@ -98,6 +115,11 @@ mod tests {
         let t: Value = lua.load("{ a = 1 }").eval().unwrap();
         let u: Value = lua.load("{ a = 1 }").eval().unwrap();
         assert_eq!(s(t), s(u));
+        // A mixed table is not its list part: two that differ only in a
+        // named key are two values.
+        let t: Value = lua.load("{ 'a', x = 1 }").eval().unwrap();
+        let u: Value = lua.load("{ 'a', x = 2 }").eval().unwrap();
+        assert_ne!(s(t), s(u));
     }
 
     #[test]

@@ -63,6 +63,20 @@ pub(crate) fn read_appended(exe: &Path) -> anyhow::Result<Option<Vec<u8>>> {
     Ok(Some(tar))
 }
 
+/// Forces `dev_mode` off in a bundled build, once every layer (env file,
+/// environment, `--dev`, `nitr dev`) has had its say: a production artifact
+/// never sends error details to clients, and a bundle has no sources to
+/// watch.
+pub fn seal(cfg: &mut Config) {
+    if cfg.dev_mode {
+        // stderr, not tracing: this runs while the configuration is being
+        // loaded, before the subscriber can exist (its format comes from
+        // this very configuration).
+        eprintln!("warning: dev_mode is forced off in a bundled build (no sources to watch)");
+    }
+    cfg.dev_mode = false;
+}
+
 /// If this executable carries a bundle, extracts it (once — the directory
 /// is content-addressed and reused) and returns the loaded configuration,
 /// re-anchored to the extraction directory.
@@ -137,17 +151,10 @@ pub fn load() -> anyhow::Result<Option<Config>> {
     {
         db.migrations_dir = Some(root.join("migrations"));
     }
-    if cfg.dev_mode {
-        // stderr, not tracing: this runs while the configuration is being
-        // loaded, before the subscriber can exist (its format comes from
-        // this very configuration).
-        eprintln!("warning: dev_mode is forced off in a bundled build (no sources to watch)");
-    }
-    cfg.dev_mode = false;
     // The dev-mode writer needs sources to follow; a bundle has none, and
     // its extraction directory is not a place to leave files. Dev mode is
-    // off here anyway, so the setting could never fire; saying so beats
-    // a silent no-op.
+    // forced off (`seal`), so the setting could never fire; saying so
+    // beats a silent no-op.
     if let Some(output) = cfg.openapi.output.take() {
         eprintln!(
             "warning: [openapi] output = \"{}\" is ignored in a bundled build (no sources \

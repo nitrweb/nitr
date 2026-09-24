@@ -3,9 +3,9 @@
 // See https://nitrweb.com/ for more information
 // Copyright (C) 2024-present Jose Quintana <joseluisq.net>
 
-use rusqlite::{Connection, params_from_iter};
+use rusqlite::Connection;
 
-use crate::db::types::{SqlRow, SqlValue, column_names, read_row};
+use crate::db::types::{SqlRow, SqlValue, bind, column_names, read_row};
 
 /// Runs a query and returns all result rows — at most `max_rows` of
 /// them. One more is an error rather than a silent truncation: a handler
@@ -18,9 +18,10 @@ pub(crate) fn call(
     max_rows: usize,
 ) -> Result<Vec<SqlRow>, rusqlite::Error> {
     let mut stmt = conn.prepare_cached(sql)?;
-    let columns = column_names(&stmt);
+    let bound = bind(&stmt, params);
+    let columns = column_names(&stmt)?;
 
-    let mut rows = stmt.query(params_from_iter(params))?;
+    let mut rows = stmt.query(bound)?;
     let mut out = vec![];
     while let Some(row) = rows.next()? {
         if out.len() >= max_rows {

@@ -253,6 +253,10 @@ async fn the_execution_budget_cannot_be_caught_and_ignored() {
         "while true do pcall(function() while true do end end) end",
         "while true do xpcall(function() while true do end end, function(e) return e end) end",
         "while true do coroutine.resume(coroutine.create(function() while true do end end)) end",
+        // `load` runs a reader function inside its own protected parser
+        // and returns the reader's error as `nil, msg` (lbaselib.c
+        // `generic_reader`, `luaB_load`).
+        "while true do load(function() while true do end end) end",
         // The honest variant: a retry loop that can never succeed once
         // the budget is gone.
         "repeat local ok = pcall(function() while true do end end) until ok",
@@ -291,6 +295,47 @@ async fn the_execution_budget_cannot_be_caught_and_ignored() {
             .expect("eval");
         assert_eq!(caught, "false:plain");
     }
+}
+
+/// Lua runs `__gc` finalizers with hooks off (lgc.c `GCTM` sets
+/// `allowhook = 0`), so no budget reaches a spinning finalizer and the
+/// state never returns. A metatable carrying `__gc` is refused instead.
+#[tokio::test]
+async fn a_finalizer_cannot_escape_the_execution_budget() {
+    for body in [
+        "setmetatable({}, {__gc = function() while true do end end})",
+        // Lua registers a finalizer when `__gc` is present at
+        // `setmetatable` time and calls whatever the field holds later.
+        "local mt = {__gc = true} setmetatable({}, mt) mt.__gc = function() while true do end end",
+    ] {
+        let mut rt = test_runtime(Some(Duration::from_millis(100)));
+        let src = format!(
+            "return function() {body} local t = {{}} while true do t[#t % 64 + 1] = {{}} end end"
+        );
+        let looping = eval_function(&rt, &src);
+        let started = Instant::now();
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            rt.call_function::<Value>(looping, Value::Nil),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("`{body}` escaped the budget and never returned"))
+        .expect_err("must fail");
+        assert!(err.to_string().contains("__gc"), "`{body}`: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "`{body}` took {:?}",
+            started.elapsed()
+        );
+    }
+
+    let rt = test_runtime(None);
+    let plain: bool = rt
+        .lua()
+        .load("local t = setmetatable({}, {__index = {x = true}}) return t.x")
+        .eval()
+        .expect("a metatable without __gc is still accepted");
+    assert!(plain);
 }
 
 /// A handler that stalls in an async builtin past the budget: the outer

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use mlua::{LuaSerdeExt, Value};
 
 use super::path::FieldPath;
-use super::util::{canonical, fraction_digits};
+use super::util::{canonical, fraction_digits, is_sequence};
 use super::{Ctx, Pending, PendingCheck, Slot};
 use crate::validate::file::LuaFile;
 use crate::validate::format::{Format, FormatRule, parse_time};
@@ -232,6 +232,9 @@ impl Ctx<'_> {
                 let Value::Table(t) = &value else {
                     fail!("type", type_params());
                 };
+                if !is_sequence(t)? {
+                    fail!("type", type_params());
+                }
                 let len = t.raw_len();
                 if let Some(min) = rule.min_items
                     && len < min
@@ -254,7 +257,7 @@ impl Ctx<'_> {
                 for i in 1..=len {
                     let item: Value = t.raw_get(i)?;
                     if rule.unique {
-                        let canon = canonical(self.lua, &item)?;
+                        let canon = canonical(&item)?;
                         if seen.contains(&canon) {
                             fail!("unique", Vec::new());
                         }
@@ -317,6 +320,9 @@ impl Ctx<'_> {
                 let Value::Table(t) = &value else {
                     fail!("type", type_params());
                 };
+                if t.raw_len() > 0 {
+                    fail!("type", type_params());
+                }
                 // Invariant: schema compilation only builds a table rule
                 // with its `fields` present.
                 #[allow(clippy::expect_used)]

@@ -120,11 +120,13 @@ pub(crate) fn base_mounts(cfg: &crate::config::Config) -> Vec<StaticMount> {
 /// Tries to serve the request from the given mounts (first match on the
 /// longest mount prefix wins — the mounts are sorted that way once, at
 /// load time). `None` means "not a static asset" and the caller continues
-/// its normal dispatch.
+/// its normal dispatch. `spa_fallback` lets an SPA mount answer a path it
+/// has no file for: a router miss, never a path a route knows.
 pub(crate) async fn try_serve(
     mounts: &Arc<Vec<StaticMount>>,
     req: &LuaRequest,
     compression: &Compression,
+    spa_fallback: bool,
 ) -> Option<Result<HttpResponse>> {
     if mounts.is_empty() || !matches!(*req.req.method(), Method::GET | Method::HEAD) {
         return None;
@@ -141,7 +143,14 @@ pub(crate) async fn try_serve(
         let Some(rel) = mount.relative(&decoded) else {
             continue;
         };
-        let Some(located) = locate_for(mounts.clone(), index, rel.to_string(), encoding).await
+        let Some(located) = locate_for(
+            mounts.clone(),
+            index,
+            rel.to_string(),
+            encoding,
+            spa_fallback,
+        )
+        .await
         else {
             continue;
         };
@@ -171,13 +180,14 @@ async fn locate_for(
     index: usize,
     rel: String,
     encoding: Option<Encoding>,
+    spa_fallback: bool,
 ) -> Option<Located> {
     tokio::task::spawn_blocking(move || {
         let mount = &mounts[index];
         let (file, meta) = match locate_in(mount, &rel) {
             Some(found) => found,
             // Unknown path inside an SPA mount falls back to its index.
-            None if mount.spa => locate(&mount.dir, "index.html")?,
+            None if mount.spa && spa_fallback => locate(&mount.dir, "index.html")?,
             None => return None,
         };
         Some(

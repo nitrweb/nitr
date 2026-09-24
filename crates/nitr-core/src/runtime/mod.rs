@@ -67,25 +67,42 @@ const EXEC_TIMEOUT_GRACE: Duration = Duration::from_millis(100);
 /// end` catches every trip inside the inner function and never lets the
 /// outer loop accumulate enough instructions to trip on its own — one
 /// request then holds a pooled state and a worker thread forever, past
-/// every timeout, because nothing ever yields. `pcall`, `xpcall` and
-/// `coroutine.resume` are the three doors a caught error can come back
-/// through; each is wrapped so a failure caught *after* the deadline is
-/// re-raised as the budget error. The wrappers are Lua functions rather
-/// than Rust callbacks so a body that yields (an async builtin inside
-/// `pcall`) keeps working. Startup runs with the deadline unset, so the
+/// every timeout, because nothing ever yields. `pcall`, `xpcall`,
+/// `coroutine.resume` and a `load` reader function are the doors a caught
+/// error can come back through; each is wrapped so a failure caught
+/// *after* the deadline is re-raised as the budget error. The wrappers
+/// are Lua functions rather than Rust callbacks so a body that yields (an
+/// async builtin inside `pcall`) keeps working. Startup runs with the deadline unset, so the
 /// wrappers are inert until a budgeted call begins.
+///
+/// **No finalizers.** Lua runs `__gc` metamethods with hooks disabled, so
+/// a finalizer is out of the budget's reach and a spinning one never
+/// returns. `setmetatable` refuses a metatable carrying `__gc`; Lua only
+/// registers a finalizer when the field is present at that call.
 const PRELUDE: &str = r##"
 local tripped, budget_msg = ...
 local raw_load, raw_pcall, raw_xpcall = load, pcall, xpcall
+local raw_setmetatable, rawget, type = setmetatable, rawget, type
 local select, error = select, error
 
+local function checked_load(chunk, ...)
+    if chunk == nil and tripped() then error(budget_msg, 0) end
+    return chunk, ...
+end
 load = function(chunk, name, _, ...)
     if select("#", ...) > 0 then
-        return raw_load(chunk, name, "t", (...))
+        return checked_load(raw_load(chunk, name, "t", (...)))
     end
-    return raw_load(chunk, name, "t")
+    return checked_load(raw_load(chunk, name, "t"))
 end
 if string then string.dump = nil end
+
+setmetatable = function(t, mt)
+    if type(mt) == "table" and rawget(mt, "__gc") ~= nil then
+        error("setmetatable: __gc finalizers are not allowed", 2)
+    end
+    return raw_setmetatable(t, mt)
+end
 
 -- Cost, measured with the `pcall` group in crates/nitr/benches/runtime.rs
 -- (2026-09-03): the two extra frames and vararg round trips make a

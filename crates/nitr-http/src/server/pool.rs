@@ -43,10 +43,13 @@ pub(super) fn new_pool(
     // A rebuilt state gets the snapshot every other state got: the
     // configuration script's result, before any handler touched it.
     let Built { runtimes, snapshot } = built;
+    // Without it every request is routed by the state it checked out,
+    // which is correct, only not before the checkout.
+    let routing = runtimes.first().and_then(|rt| app::routing(rt.lua()).ok());
     let cfg = cfg.clone();
     let setup_fns = setup_fns.clone();
     let modules = modules.clone();
-    RuntimePool::with_rebuild(runtimes, move || {
+    let pool = RuntimePool::with_rebuild(runtimes, move || {
         let base_statics = crate::static_files::base_mounts(&cfg);
         let mut rt = new_runtime(&cfg, builtins, &setup_fns, &modules, cache.as_ref())?;
         if let Some(snapshot) = &snapshot {
@@ -60,7 +63,11 @@ pub(super) fn new_pool(
             &input_env(&cfg),
         )?;
         Ok(rt)
-    })
+    });
+    match routing {
+        Some(routing) => pool.with_companion(routing),
+        None => pool,
+    }
 }
 
 /// What route `input` declarations may rely on in this deployment.

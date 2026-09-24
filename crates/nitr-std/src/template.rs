@@ -32,10 +32,11 @@ impl UserData for LuaTemplate {
                 Some(data) => crate::utils::check_json_bounds(&Value::Table(data.clone())),
                 None => Ok(()),
             };
-            let context = bounded
-                .as_ref()
-                .ok()
-                .map(|()| minijinja::Value::from_serialize(&data));
+            let context = bounded.as_ref().ok().map(|()| {
+                let data = data.map_or(Value::Nil, Value::Table);
+                let path = crate::bounded::TablePath::default();
+                minijinja::Value::from_serialize(crate::bounded::LuaData::new(&data, &path))
+            });
             async move {
                 bounded?;
                 let context = context.unwrap_or_default();
@@ -128,6 +129,26 @@ mod tests {
             .expect_err("a context past the bound must be refused");
         assert!(
             err.to_string().contains("nested deeper than 128 levels"),
+            "got: {err}"
+        );
+    }
+
+    /// A table holding both list items and named keys would reach the
+    /// template as its list part alone; it is refused, as at every JSON
+    /// site.
+    #[tokio::test]
+    async fn render_refuses_a_table_mixing_list_items_and_named_keys() {
+        use mlua::ObjectLike as _;
+
+        let lua = Lua::new();
+        let templ = template_userdata(&lua);
+        let data: Table = lua.load("{ x = { 'a', total = 1 } }").eval().expect("data");
+        let err = templ
+            .call_async_method::<String>("render", ("t.html", data))
+            .await
+            .expect_err("mixed");
+        assert!(
+            err.to_string().contains("mixes list items and named keys"),
             "got: {err}"
         );
     }

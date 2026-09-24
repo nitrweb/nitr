@@ -26,18 +26,20 @@ an assumption (see `investigate`).
     does not verify bytecode).
 - **CPU budget.**
   - An instruction-count hook checks a wall-clock deadline.
-  - `pcall`, `xpcall` and `coroutine.resume` are wrapped to re-raise once
-    the deadline has passed.
+  - `pcall`, `xpcall`, `coroutine.resume` and `load` (whose reader
+    function runs in protected mode) are wrapped to re-raise once the
+    deadline has passed.
+  - `setmetatable` refuses a `__gc` field: Lua runs finalizers with hooks
+    off, out of the budget's reach.
   - An outer tokio timeout covers time spent suspended in I/O.
   - On a timeout, the coroutine is reset and a garbage collection runs, so
     pending futures are dropped at once.
-  - Any other way Lua runs code in protected mode, or with hooks off (a
-    `load` reader function, `__gc` finalizers), escapes the budget unless
-    you have proven otherwise.
+  - Any other way Lua runs code in protected mode, or with hooks off,
+    escapes the budget unless you have proven otherwise.
   - Startup (`config.lua` and the handler's top level) runs with no
     deadline.
-- **Memory:** the allocator limit set by `[lua] memory_limit`. A limit of
-  `0` means no limit (mlua).
+- **Memory:** the allocator limit set by `[lua] memory_limit`. mlua
+  treats `0` as no limit, so startup refuses it.
 - **Serialization:** every Lua value that reaches a serializer passes
   `check_json_bounds` or `json_encode` (`crates/nitr-std/src/utils.rs`,
   `bounded.rs`). Deep nesting is a stack overflow, and a stack overflow

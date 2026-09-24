@@ -26,7 +26,9 @@ pub(super) async fn read(
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let boundary = crate::multipart::boundary(content_type.as_deref())?;
+    let Ok(boundary) = crate::multipart::boundary(content_type.as_deref()) else {
+        return Ok(Err(malformed()));
+    };
     let limits = req.limits.clone();
     let Some(root) = limits.upload_root.clone() else {
         return Err(mlua::Error::RuntimeError(
@@ -53,19 +55,11 @@ pub(super) async fn read(
         }
         // Anything else is a malformed body: a rule failure on the body
         // itself, like invalid JSON, never a handler error.
-        Err(_) => {
-            return Ok(Err(ValidationError::single(
-                "multipart",
-                "must be a well-formed multipart body",
-            )));
-        }
+        Err(_) => return Ok(Err(malformed())),
     } {
         count += 1;
         if count > limits.max_parts {
-            return Err(mlua::Error::RuntimeError(format!(
-                "multipart body has more than {} parts",
-                limits.max_parts
-            )));
+            return Err(crate::multipart::too_many_parts(limits.max_parts));
         }
         let name = field.name().unwrap_or_default().to_string();
         let filename = field.file_name().map(str::to_string);
@@ -123,4 +117,8 @@ pub(super) async fn read(
         out.push((name, TextValue::File(lua.create_userdata(file)?)));
     }
     Ok(Ok(out))
+}
+
+fn malformed() -> ValidationError {
+    ValidationError::single("multipart", "must be a well-formed multipart body")
 }

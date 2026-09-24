@@ -38,6 +38,7 @@ pub struct Svc {
     /// are disabled or bound to their own address.
     health: Option<Arc<crate::health::HealthState>>,
     peer_addr: SocketAddr,
+    tls: bool,
 }
 
 impl Svc {
@@ -47,6 +48,7 @@ impl Svc {
         protection: Arc<Protection>,
         health: Option<Arc<crate::health::HealthState>>,
         peer_addr: SocketAddr,
+        tls: bool,
     ) -> Self {
         Self {
             pool,
@@ -54,6 +56,7 @@ impl Svc {
             protection,
             health,
             peer_addr,
+            tls,
         }
     }
 }
@@ -88,7 +91,7 @@ impl Service<Request<Incoming>> for Svc {
             path = %req.uri().path(),
             status = tracing::field::Empty,
         );
-        let req = LuaRequest::synthetic(
+        let mut req = LuaRequest::synthetic(
             req.map(|body| {
                 use http_body_util::BodyExt as _;
                 body.map_err(|err| Box::new(err) as _).boxed()
@@ -96,6 +99,7 @@ impl Service<Request<Incoming>> for Svc {
             self.peer_addr,
             id.into(),
         );
+        req.tls = self.tls;
 
         Box::pin(
             async move { handler::handle(&pool, req, streams, protection).await }.instrument(span),

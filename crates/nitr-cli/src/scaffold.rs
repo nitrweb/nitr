@@ -106,8 +106,8 @@ enabled = true
 try_it_out = true
 "#;
 
-const CONFIG_LUA: &str = r#"-- Runs once at startup; the returned table is snapshotted into every
--- state and exposed to handlers as `nitr.cfg`.
+const CONFIG_LUA: &str = r#"-- Runs at startup and again on every reload; the returned table is
+-- snapshotted into every state and exposed to handlers as `nitr.cfg`.
 return {
     app_name = "my-app",
     started_at = nitr.time.iso8601(nitr.time.now()),

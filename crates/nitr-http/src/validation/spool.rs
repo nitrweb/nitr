@@ -18,7 +18,8 @@ use nitr_std::validation::{
 
 use crate::multipart::{resolve_upload_path, safe_filename};
 
-/// The directory under the upload root that holds per-request spools.
+/// The directory under the upload root that holds per-request spools and
+/// `part:save` files in flight; swept at boot.
 pub(crate) const SPOOL_DIR: &str = ".nitr-tmp";
 
 /// Removes leftovers of a crashed process at startup.
@@ -41,16 +42,14 @@ pub(crate) struct SpoolDir {
 impl SpoolDir {
     /// The spool for one request under `upload_root`. Nothing is created
     /// yet.
-    pub(crate) fn new(upload_root: &Path, request_id: &str) -> Self {
-        // The id is a UUID (or a header the protection layer already
-        // reduced to 64 safe ASCII chars); no separator can be in it.
-        let safe: String = request_id
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-            .take(64)
-            .collect();
+    ///
+    /// The name is always generated, never the request id: a trusted
+    /// `X-Request-ID` is client-chosen, and two requests sharing a spool
+    /// remove each other's files when the first one ends.
+    pub(crate) fn new(upload_root: &Path) -> Self {
+        let name = uuid::Uuid::now_v7().simple().to_string();
         Self {
-            path: upload_root.join(SPOOL_DIR).join(safe),
+            path: upload_root.join(SPOOL_DIR).join(name),
         }
     }
 
@@ -190,6 +189,7 @@ impl Spooler {
             detected,
             text_subtype_ok,
             size: self.size,
+            cap: self.cap,
             width,
             height,
             utf8: Some(self.utf8.finish()),
@@ -232,12 +232,12 @@ mod tests {
     }
 
     #[test]
-    fn spool_paths_are_under_the_root_and_safe() {
+    fn spool_paths_are_distinct_children_of_the_spool_root() {
         let root = Path::new("/srv/uploads");
-        let spool = SpoolDir::new(root, "0198c5b6-1f6a-7abc-9def-0123456789ab");
-        assert!(spool.path().starts_with(root.join(SPOOL_DIR)));
-        let hostile = SpoolDir::new(root, "../../etc");
-        assert_eq!(hostile.path(), root.join(SPOOL_DIR).join("etc"));
-        // Dropping removes a directory that was never created: a no-op.
+        let (a, b) = (SpoolDir::new(root), SpoolDir::new(root));
+        for spool in [&a, &b] {
+            assert_eq!(spool.path().parent(), Some(root.join(SPOOL_DIR).as_path()));
+        }
+        assert_ne!(a.path(), b.path());
     }
 }

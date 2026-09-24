@@ -32,20 +32,27 @@ use nitr::{Builtins, Server};
 struct Kv(Arc<Mutex<HashMap<String, i64>>>);
 
 impl Kv {
-    fn get(&self, key: &str) -> i64 {
+    /// The map, even after a panic elsewhere poisoned the lock: every
+    /// write below leaves it consistent, so the data is still good.
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, i64>> {
         self.0
             .lock()
-            .map(|m| *m.get(key).unwrap_or(&0))
-            .unwrap_or(0)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn add(&self, key: &str, delta: i64) -> i64 {
-        let Ok(mut map) = self.0.lock() else {
-            return 0;
-        };
+    fn get(&self, key: &str) -> i64 {
+        *self.map().get(key).unwrap_or(&0)
+    }
+
+    /// `delta` comes from a request: an overflow is the caller's error,
+    /// never a panic.
+    fn add(&self, key: &str, delta: i64) -> mlua::Result<i64> {
+        let mut map = self.map();
         let entry = map.entry(key.to_string()).or_insert(0);
-        *entry += delta;
-        *entry
+        *entry = entry
+            .checked_add(delta)
+            .ok_or_else(|| mlua::Error::RuntimeError(format!("counter `{key}` would overflow")))?;
+        Ok(*entry)
     }
 }
 
@@ -63,7 +70,7 @@ fn kv_module(kv: Kv) -> impl Fn(&Lua) -> mlua::Result<Table> + Send + Sync + 'st
         table.set(
             "add",
             lua.create_function(move |_, (key, delta): (String, Option<i64>)| {
-                Ok(store.add(&key, delta.unwrap_or(1)))
+                store.add(&key, delta.unwrap_or(1))
             })?,
         )?;
         Ok(table)

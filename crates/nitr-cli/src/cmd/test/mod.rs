@@ -24,6 +24,8 @@ use anyhow::{Context as _, bail};
 use nitr::stdlib::testing::Doubles;
 use nitr::{BuiltinsEnv, Config, Runtime, Server};
 
+use crate::cmd::scratch_db::{ScratchDb, remove_database_files};
+
 pub(crate) mod capture;
 mod lua;
 mod report;
@@ -87,25 +89,6 @@ impl TestArgs {
     }
 }
 
-/// A per-run test database, removed (with its WAL sidecars) when the run
-/// ends.
-struct ScratchDb(PathBuf);
-
-impl Drop for ScratchDb {
-    fn drop(&mut self) {
-        remove_database_files(&self.0);
-    }
-}
-
-/// Removes a SQLite file and its WAL sidecars; a missing file is fine.
-fn remove_database_files(path: &Path) {
-    for suffix in ["", "-wal", "-shm"] {
-        let mut name = path.as_os_str().to_os_string();
-        name.push(suffix);
-        let _ = std::fs::remove_file(name);
-    }
-}
-
 /// Prints to stdout unless the run's stdout is a machine report.
 struct Out {
     enabled: bool,
@@ -161,14 +144,8 @@ pub(crate) async fn run(mut cfg: Config, args: &TestArgs) -> anyhow::Result<Repo
                     (path.clone(), None)
                 }
                 None => {
-                    let path = std::env::temp_dir().join(format!(
-                        "nitr-test-{}-{:x}.db",
-                        std::process::id(),
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_nanos())
-                    ));
-                    (path.clone(), Some(ScratchDb(path)))
+                    let scratch = ScratchDb::new("test");
+                    (scratch.path().to_path_buf(), Some(scratch))
                 }
             };
             db.path = path;
@@ -182,7 +159,7 @@ pub(crate) async fn run(mut cfg: Config, args: &TestArgs) -> anyhow::Result<Repo
         }
     };
     #[cfg(feature = "db")]
-    migrate_database(&cfg).await?;
+    crate::cmd::scratch_db::migrate(&cfg).await?;
 
     let mut files: Vec<PathBuf> = std::fs::read_dir(&tests_dir)
         .with_context(|| format!("cannot read the tests directory {}", tests_dir.display()))?
@@ -292,29 +269,6 @@ pub(crate) async fn run(mut cfg: Config, args: &TestArgs) -> anyhow::Result<Repo
         emit_machine_report(&report, args)?;
     }
     Ok(report)
-}
-
-/// Gives the private test database the migrations the live one would
-/// have, so a test sees the schema and not an empty file — and so the
-/// server's pending-migration check passes.
-#[cfg(feature = "db")]
-async fn migrate_database(cfg: &Config) -> anyhow::Result<()> {
-    let Some(db) = &cfg.database else {
-        return Ok(());
-    };
-    let Some(dir) = db.migrations().filter(|dir| dir.is_dir()) else {
-        return Ok(());
-    };
-    let path = db.path.clone();
-    let pragmas = db.pragmas();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let conn = nitr::stdlib::db_open(&path, &pragmas)?;
-        nitr::stdlib::migrate::run(&conn, &dir)
-            .with_context(|| format!("cannot migrate the test database {}", path.display()))?;
-        Ok(())
-    })
-    .await
-    .context("the test database migration task failed")?
 }
 
 /// Applies `[testing] seed` and takes the snapshot `t.db.reset()`

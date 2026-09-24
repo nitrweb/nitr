@@ -11,8 +11,9 @@ listen = "127.0.0.1:3000"
 # Lua script executed once per request. Default: "scripts/handler.lua"
 handler_script = "scripts/handler.lua"
 
-# Lua script executed once at startup. Its returned table (plain data) is
-# snapshotted into every state and exposed to handlers as `nitr.cfg`.
+# Lua script executed once per build of the Lua pool: at startup and on
+# every reload. Its returned table (plain data) is snapshotted into every
+# state and exposed to handlers as `nitr.cfg`.
 # Optional: when absent, `nitr.cfg` is nil.
 config_script = "scripts/config.lua"
 
@@ -25,8 +26,9 @@ dev_mode = true
 #workers = 4
 
 # Maximum concurrent streaming responses (each holds a pooled Lua state for
-# its whole lifetime). Default: workers - 1, at least 1, so idle streams
-# cannot pin the entire pool.
+# its whole lifetime). Default: workers - 1, so idle streams cannot pin the
+# entire pool. With one worker the default is still 1, and startup warns
+# that one open stream then holds the only state. 0 is refused.
 #max_streams = 3
 
 # Trust an inbound X-Request-ID header (well-formed, <= 64 ASCII chars)
@@ -62,7 +64,9 @@ dev_mode = true
 #max_file_bytes = 10485760   # per uploaded file; files stream to disk in
                              # Rust and never enter the Lua heap. Raise
                              # `max_body_bytes` too — it bounds the whole
-                             # request, uploads included.
+                             # request, uploads included. A validated file
+                             # above it fails `max_bytes`, whatever its
+                             # rule allows.
 
 # Filesystem policy for multipart uploads. The byte caps above stay in
 # [limits] with every other byte cap; a directory belongs here, beside
@@ -192,6 +196,11 @@ path = "scripts/file.db"
 #grace = 30                  # seconds for ordinary in-flight requests
 #stream_grace = 5            # extra seconds for streaming/SSE bodies, spent
                              # only if one is still live
+#readiness_delay = 5         # seconds the main listener keeps serving after
+                             # the signal, /readyz already answering 503, so a
+                             # balancer sees "draining" before the port closes;
+                             # default 5 with the probes on the main listener,
+                             # 0 with [health] bind or in dev mode
 
 # Per-client-IP fixed-window rate limiting (429 + Retry-After beyond the
 # budget). Disabled by default.
@@ -212,7 +221,8 @@ path = "scripts/file.db"
 #allowed_hosts = ["api.example.com"] # exact-host allow-list (all hops)
 #allow_private_networks = false      # permit loopback/RFC1918 targets
 #max_response_bytes = 8388608        # cap on resp:text()/resp:json() bodies
-#max_concurrent = 8                  # max requests per nitr.await_all(...)
+#max_concurrent = 8                  # max requests of one nitr.await_all(...)
+                                     # in flight at a time
 #max_per_request = 32                # total outbound calls one inbound
                                      # request may make; 0 removes the cap
 #connect_timeout = 10.0              # seconds to establish a connection
@@ -220,8 +230,9 @@ path = "scripts/file.db"
                                      # `timeout` option overrides it
 #pool_max_idle_per_host = 8
 #max_retries = 5                     # ceiling on retry.attempts; retries are
-                                     # opt-in per call and only ever applied
-                                     # to idempotent methods
+                                     # opt-in per call, only ever applied
+                                     # to idempotent methods, and never
+                                     # after a refusal by this policy
 #proxy = "http://proxy.internal:3128" # unset reads HTTPS_PROXY/HTTP_PROXY
                             # A proxy resolves targets itself, so the SSRF
                             # resolver guard cannot apply: with `fetch` enabled
@@ -232,7 +243,9 @@ path = "scripts/file.db"
                                      # from the inbound request id
 
 # Static file serving (Rust-side: ETag/Last-Modified/304, content types,
-# traversal protection). Scripts can add mounts with app:static(...).
+# traversal protection), without a Lua state. Routes win: a mount answers a
+# GET or HEAD for a path no route serves with that method. Scripts can add
+# mounts with app:static(...).
 #[static]
 #dir = "public"              # directory to serve; unset disables
 #mount = "/"                 # URL prefix
@@ -363,10 +376,13 @@ features = [
 # stops CPU-bound loops.
 stdlib = ["math", "table", "string", "utf8", "coroutine", "package"]
 
-# Per-state Lua memory limit in bytes. Default: 8388608 (8 MiB)
+# Per-state Lua memory limit in bytes; 0 is refused (it would lift the
+# cap). Default: 8388608 (8 MiB)
 #memory_limit = 8388608
 
 # Wall-clock budget per handler invocation in milliseconds; 0 disables it.
 # Enforced by an instruction-count hook (stops CPU-bound loops) plus an
-# async timeout (stops slow I/O). Default: 30000
+# async timeout (stops slow I/O). Lua runs `__gc` finalizers with the hook
+# off, so `setmetatable` refuses a metatable carrying `__gc`.
+# Default: 30000
 #exec_timeout_ms = 30000

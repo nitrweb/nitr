@@ -1002,6 +1002,152 @@ return app
         server.stop().await;
     }
 
+    /// A request past a multipart limit is the client's doing: 413, like
+    /// `[limits] max_body_bytes`; a missing boundary is a malformed body,
+    /// 422. Neither is a handler failure (500).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multipart_limits_answer_413_and_a_missing_boundary_422() {
+        let mut server = TestServer::builder("validation-upload")
+            .upload_dir()
+            .handler(UPLOAD_APP)
+            .config(|cfg| {
+                cfg.limits.max_form_parts = 2;
+                cfg.limits.max_field_bytes = 8;
+            })
+            .spawn()
+            .await;
+        let (status, json) = post_multipart(
+            &server,
+            "/profile",
+            &[
+                ("name", None, None, b"Ada"),
+                ("x", None, None, b"1"),
+                ("y", None, None, b"2"),
+            ],
+        )
+        .await;
+        assert_eq!(status, 413, "{json}");
+        let (status, json) =
+            post_multipart(&server, "/profile", &[("name", None, None, b"0123456789")]).await;
+        assert_eq!(status, 413, "{json}");
+
+        let resp = server
+            .client()
+            .post(server.url("/profile"))
+            .header("content-type", "multipart/form-data")
+            .body("--x\r\n")
+            .send()
+            .await
+            .expect("post");
+        assert_eq!(resp.status(), 422);
+        server.stop().await;
+    }
+
+    /// A rule's `max_bytes` above `[limits] max_file_bytes` is capped by
+    /// the limit: the spool stops storing at the limit, so a file between
+    /// the two would reach the handler cut short.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_above_max_file_bytes_fails_its_rule_even_below_the_rule_max() {
+        let mut server = TestServer::builder("validation-upload")
+            .upload_dir()
+            .handler(UPLOAD_APP)
+            .config(|cfg| cfg.limits.max_file_bytes = 16)
+            .spawn()
+            .await;
+        let csv = "id,name\n".repeat(4);
+        let (status, json) = post_multipart(
+            &server,
+            "/profile",
+            &[
+                ("name", None, None, b"Ada"),
+                ("data", Some("d.csv"), Some("text/csv"), csv.as_bytes()),
+            ],
+        )
+        .await;
+        assert_eq!(status, 422, "{json}");
+        assert_eq!(json["errors"][0]["path"], "body.data", "{json}");
+        assert_eq!(json["errors"][0]["rule"], "max_bytes", "{json}");
+        assert_eq!(
+            json["fields"]["body.data"], "must be at most 16 B",
+            "{json}"
+        );
+
+        let resp = server
+            .client()
+            .put(server.url("/blob"))
+            .body(b"\x1F\x8B\x08\0\0\0\0\0\0\x03hello, world".to_vec())
+            .send()
+            .await
+            .expect("put");
+        assert_eq!(resp.status(), 422);
+        let json: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(json["errors"][0]["path"], "body", "{json}");
+        assert_eq!(json["errors"][0]["rule"], "max_bytes", "{json}");
+
+        // At the limit, the file is whole.
+        let (status, json) = post_multipart(
+            &server,
+            "/profile",
+            &[
+                ("name", None, None, b"Ada"),
+                (
+                    "data",
+                    Some("d.csv"),
+                    Some("text/csv"),
+                    &csv.as_bytes()[..16],
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(status, 200, "{json}");
+        assert_eq!(json["csv"], "id,name\nid,name\n");
+        server.stop().await;
+    }
+
+    /// A trusted `X-Request-ID` is client-chosen: one naming another
+    /// request's spool, or sanitizing to nothing (the spool root itself),
+    /// must not let this request's cleanup remove someone else's files.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_trusted_request_id_never_names_the_spool() {
+        let mut server = TestServer::builder("validation-upload")
+            .upload_dir()
+            .handler(UPLOAD_APP)
+            .config(|cfg| cfg.trust_request_id = true)
+            .spawn()
+            .await;
+        let other = server.dir().join("uploads/.nitr-tmp/other");
+        std::fs::create_dir_all(&other).expect("mkdir");
+        std::fs::write(other.join("in-flight"), b"x").expect("write");
+        let csv = b"id,name\n1,ada\n";
+        let (content_type, body) = multipart(&[
+            ("name", None, None, b"Ada"),
+            ("data", Some("d.csv"), Some("text/csv"), csv),
+        ]);
+        for id in ["other", "!!!"] {
+            let resp = server
+                .client()
+                .post(server.url("/profile"))
+                .header("content-type", &content_type)
+                .header("x-request-id", id)
+                .body(body.clone())
+                .send()
+                .await
+                .expect("post");
+            assert_eq!(resp.status(), 200, "{id}");
+            let expected = vec![other.join("in-flight")];
+            let mut left = walk(&server.dir().join("uploads/.nitr-tmp"));
+            for _ in 0..100 {
+                if left == expected || !other.join("in-flight").exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                left = walk(&server.dir().join("uploads/.nitr-tmp"));
+            }
+            assert_eq!(left, expected, "request id {id:?} reached another spool");
+        }
+        server.stop().await;
+    }
+
     /// An SVG is active content (F24): `image/*` never matches it, only a
     /// rule naming `image/svg+xml` takes it, and the `image` preset does
     /// not.

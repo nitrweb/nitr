@@ -9,7 +9,7 @@ with a *std feature* need that name in `[std] features`.
 
 ### `nitr.json(value, status) -> nitr.Response` (std feature: `json`)
 
-As a function: a JSON response (`nitr.json({ ok = true })`). Also the codec: `nitr.json:encode(v)` / `nitr.json:decode(s)`.
+As a function: a JSON response (`nitr.json({ ok = true })`). Also the codec: `nitr.json:encode(v)` / `nitr.json:decode(s)`. A table whose keys are `1..n` (holes as `null`) is an array; one mixing list items and named keys has no JSON shape and raises, here and wherever a value is serialized (cache, session, JWT, templates).
 
 - `nitr.json:encode(value) -> string` — Encodes a value as JSON.
 - `nitr.json:decode(s) -> any` — Decodes JSON; errors on invalid input.
@@ -32,7 +32,7 @@ An empty response with the given status.
 
 ### `nitr.negotiate(req, offers) -> any` (std feature: `http`)
 
-Picks the offer whose media type best matches the `Accept` header; function values are called with the request. No match answers 406.
+Picks the offer whose media type best matches the `Accept` header; function values are called with the request. No match answers 406. Offers are a list `{ { type, value }, ... }`, where a tie goes to the earlier entry, or a map `{ [type] = value }`, where it goes to the type that sorts first.
 
 ### `nitr.sse(fn) -> nitr.Response` (std feature: `http`)
 
@@ -70,11 +70,11 @@ Debug-prints a value (structure included) to the log; returns it unchanged.
 
 ### `nitr.fetch(method, url, opts) -> nitr.FetchHandle` (std feature: `fetch`)
 
-An outbound HTTP request (SSRF-guarded, redirect-checked). Options: `headers`, `query`, `json`, `body`, `timeout`, `retry`. Returns an unsent handle.
+An outbound HTTP request (SSRF-guarded, redirect-checked). Options: `headers`, `query`, `json`, `body`, `timeout`, `retry`. Returns an unsent handle. `retry = { attempts, backoff }` repeats an idempotent request after a network failure or a retryable status, never after a refusal by the `[fetch]` policy.
 
 ### `nitr.await_all(...) -> ...` (std feature: `fetch`)
 
-Runs fetch handles (and `db:query_async` handles) concurrently, passed as separate arguments (`nitr.await_all(h1, h2)`), and returns their results as multiple values in the same order. Capped by `[fetch] max_concurrent`.
+Runs fetch handles (and `db:query_async` handles) concurrently, passed as separate arguments (`nitr.await_all(h1, h2)`), and returns their results as multiple values in the same order. At most `[fetch] max_concurrent` run at a time; the rest wait their turn.
 
 ### `nitr.test.logs() -> table[]` (available in `nitr test` files)
 
@@ -90,7 +90,7 @@ The minijinja template engine, loading from `[templating] dir`.
 
 ### `nitr.db` (std feature: `db`)
 
-The SQLite database (`database` in nitr.toml): WAL, busy timeout, foreign keys on.
+The SQLite database (`database` in nitr.toml): WAL, busy timeout, foreign keys on. A row is a column→value table, so a query whose result columns share a name raises (alias one with `AS`).
 
 - `nitr.db:execute(sql, params) -> integer` — Runs a statement.
 - `nitr.db:query(sql, params) -> table[]` — All rows, each a column→value table. A result larger than `[database] max_rows` (default 10000) raises rather than truncating.
@@ -142,7 +142,7 @@ HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list
 The bounded TTL+LRU cache shared by every state. Entries are plain data; per-process, so not a session store.
 
 - `nitr.cache:get(key) -> any` — The cached value, or nil.
-- `nitr.cache:set(key, value, opts)` — Stores a value; `opts` is `{ ttl = seconds }`.
+- `nitr.cache:set(key, value, opts)` — Stores a value; `opts` is `{ ttl = seconds }` (`0` never expires, as `[cache] default_ttl`). Setting `nil` removes the key.
 - `nitr.cache:delete(key) -> boolean` — Removes a key; whether it was there.
 - `nitr.cache:clear()` — Empties the cache.
 - `nitr.cache:remember(key, opts, fn) -> any` — The cached value, or `fn()`'s result, stored and returned. Call as `remember(key, fn)` or `remember(key, { ttl = seconds }, fn)`.
@@ -176,7 +176,7 @@ Declarative validation, compiled once and checked in Rust. Rules are tables (`{ 
 - `nitr.validate.text_file(opts) -> table` — A `file` rule preset: txt, csv, md, json, xml, yaml; UTF-8 required; `max_bytes = "1mb"`.
 - `nitr.validate.archive(opts) -> table` — A `file` rule preset: zip, gzip, tar, bz2, xz, zstd, 7z; `max_bytes = "50mb"`.
 - `nitr.validate.audio(opts) -> table` — A `file` rule preset: mp3, wav, ogg, flac, m4a; `max_bytes = "50mb"`.
-- `nitr.validate.video(opts) -> table` — A `file` rule preset: mp4, mov, webm, mkv; `max_bytes = "500mb"` (above the default `[limits] max_file_bytes`).
+- `nitr.validate.video(opts) -> table` — A `file` rule preset: mp4, mov, webm, mkv; `max_bytes = "500mb"` (above the default `[limits] max_file_bytes`, which still caps it).
 - `nitr.validate.font(opts) -> table` — A `file` rule preset: woff, woff2, ttf, otf; `max_bytes = "5mb"`.
 - `nitr.validate.any_file(opts) -> table` — A `file` rule accepting any type; executables are still refused.
 
@@ -309,13 +309,13 @@ The incoming request, passed to every handler and middleware.
 - `headers: table<string, string>` — Request headers, lowercase names.
 - `id: string` — The request id (UUIDv7, echoed as `X-Request-ID`).
 - `remote_addr: string` — Peer address (`"ip:port"`).
-- `uri: table` — URI components: `scheme`, `host`, `port`, `path`, `authority`, `query`.
+- `uri: table` — URI components: `scheme`, `host`, `port`, `path`, `authority`, `query`. An HTTP/1.1 request carries only the path, so `authority`, `host` and `port` come from the client-sent `Host` header (`port` is the scheme's default when it names none) and `scheme` from the listener (`https` under `[tls]`).
 - `cookies: nitr.RequestCookies` — Parsed request cookies.
 - `valid: table|nil` — The route's validated input — `{ body, query, params, headers }` as its `input` declaration coerced, stripped and normalized them; nil on routes without `input`.
 - `:json() -> table` — Reads and decodes the body as JSON. Errors on an empty or invalid body.
 - `:text() -> string` — Reads the whole body as a string.
 - `:form() -> table<string, string>` — Reads an `application/x-www-form-urlencoded` body as a table. The parse is cached, so middleware and handler can both call it.
-- `:multipart(fn) -> integer` — Invokes `fn(part)` once per part of a `multipart/form-data` body, in arrival order; returns the part count. (Needs the `multipart` Cargo feature.)
+- `:multipart(fn) -> integer` — Invokes `fn(part)` once per part of a `multipart/form-data` body, in arrival order; returns the part count. A `[limits]` bound a part crosses (`max_form_parts`, `max_field_bytes`, `max_file_bytes`) raises; uncaught, it answers 413. (Needs the `multipart` Cargo feature.)
 - `:read(n) -> string|nil` — Streams the body: the next chunk as it arrives, or at least `n` bytes. `nil` marks the end.
 - `:accepts(...) -> string|nil` — The best match among the given media types for the `Accept` header, or nil.
 - `:fresh(etag, last_modified) -> boolean` — Whether the client's cached copy is current, per `If-None-Match`/`If-Modified-Since`.
@@ -357,7 +357,7 @@ The application: routes, middleware, error handling, static mounts. Return it fr
 - `:on_invalid(fn)` — The app-wide answer to a request that failed its route's `input` declaration: `function(err, req)` returning a response, where `err = { code, message, fields, errors }` (`fields` maps each path such as `body.email` to its message; `errors` lists `{ path, part, field, rule, message, params?, label? }`). A route-level `on_invalid` option wins over it.
 - `:use(mw)` — Adds app-wide middleware: a factory `fn(next) -> fn(req)`. Must be called before any route.
 - `:on_error(handler)` — Sets the app-wide error handler: `fn(err, req)` where `err` is the structured error (`kind`, `message`, `source`, `line`, `traceback`, ...).
-- `:static(mount, dir, opts)` — Mounts a static directory, served in Rust. Options: `{ spa = boolean, cache_control = string, dotfiles = boolean }` — dotfiles are hidden unless `dotfiles = true` (`.well-known/` is always served).
+- `:static(mount, dir, opts)` — Mounts a static directory, served in Rust without a Lua state. Routes win: the mount answers a GET or HEAD for a path no route serves with that method. Options: `{ spa = boolean, cache_control = string, dotfiles = boolean }` — dotfiles are hidden unless `dotfiles = true` (`.well-known/` is always served).
 
 ### `nitr.Part`
 
@@ -368,7 +368,7 @@ One part of a multipart upload, delivered to the `req:multipart` callback.
 - `safe_filename: string|nil` — `filename` reduced to a single safe path segment; nil exactly when `filename` is.
 - `content_type: string|nil` — Part content type.
 - `:text() -> string` — Reads a non-file field as a string (bounded by `[limits] max_field_bytes`).
-- `:save(path) -> integer` — Streams a file part to `path` without entering the Lua heap; returns the bytes written.
+- `:save(path) -> integer` — Streams a file part to `path` without entering the Lua heap; returns the bytes written. An existing file at `path` is replaced only once the whole part is written.
 - `:discard() -> integer` — Drains and drops the part; returns the bytes skipped.
 
 ### `nitr.FetchHandle`
@@ -382,7 +382,8 @@ An unsent outbound request from `nitr.fetch`; send it, or hand it to `nitr.await
 An outbound response.
 
 - `status: integer` — HTTP status code.
-- `headers: table<string, string>` — Response headers.
+- `headers: table<string, string>` — Response headers, lowercase names: the last value of a repeated one, as the bytes the upstream sent.
+- `raw_headers: table[]` — `{ name, value }` pairs in order, repeats included (every `Set-Cookie`).
 - `url: string` — Final URL after redirects.
 - `:text() -> string` — The body as a string (bounded by `[fetch] max_response_bytes`).
 - `:json() -> table` — The body decoded as JSON.
@@ -393,7 +394,7 @@ An outbound response.
 A compiled validation schema from `nitr.validate.schema`.
 
 - `:check(value) -> table|nil, table|nil` — Validates a value. Returns the data (declared fields only, transformed) or nil plus `{ code, message, fields, errors }`: `fields` maps each failing path (`email`, `home.city`, `tags[2]`) to its message, `errors` lists `{ path, field, rule, message, params?, label? }`. Custom `check`s run in the caller's coroutine.
-- `:partial() -> nitr.Schema` — A copy with every top-level field optional — the PATCH body of a POST schema.
+- `:partial() -> nitr.Schema` — A copy with every top-level field optional and no defaults filled in — the PATCH body of a POST schema, which must not reset what it omits.
 - `:pick(names) -> nitr.Schema` — A copy keeping only the named fields.
 - `:omit(names) -> nitr.Schema` — A copy without the named fields. A cross-field rule naming a dropped field fails at load.
 - `:extend(fields) -> nitr.Schema` — A copy with fields added or replaced; `false` removes one.

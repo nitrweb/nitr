@@ -251,7 +251,7 @@ pub(crate) struct Chain {
 
 /// The Rust-side router plus the per-route composed Lua chains.
 pub(crate) struct CompiledApp {
-    pub(crate) router: Router<HashMap<Method, usize>>,
+    pub(crate) router: Arc<Router<HashMap<Method, usize>>>,
     pub(crate) chains: Vec<Chain>,
 }
 
@@ -272,32 +272,95 @@ pub(crate) enum Lookup {
 }
 
 impl CompiledApp {
-    /// The one router lookup, shared by the server and `nitr test`'s
-    /// `app:dispatch`: `HEAD` falls back to the `GET` route (it is `GET`
-    /// without the body), while an explicit `head` route still wins.
     pub(crate) fn lookup(&self, method: &Method, path: &str) -> Lookup {
-        let Ok(matched) = self.router.at(path) else {
-            return Lookup::NotFound;
-        };
-        let route = matched.value.get(method).or_else(|| {
-            (*method == Method::HEAD)
-                .then(|| matched.value.get(&Method::GET))
-                .flatten()
-        });
-        match route {
-            Some(&index) => Lookup::Route {
-                index,
-                params: matched
-                    .params
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
-            },
-            None if *method == Method::OPTIONS => {
-                Lookup::Options(matched.value.keys().cloned().collect())
-            }
-            None => Lookup::MethodNotAllowed(matched.value.keys().cloned().collect()),
+        lookup(&self.router, method, path)
+    }
+}
+
+/// The Lua-free half of a compiled application: its router and static
+/// mounts. Every state of a pool compiles the same script, so one copy,
+/// kept with the pool, routes a request before any state is checked out:
+/// a static file, a 404, a 405 or an `OPTIONS` answer never needs one.
+pub(crate) struct Routing {
+    router: Arc<Router<HashMap<Method, usize>>>,
+    /// The route set the router was built from: a state whose set differs
+    /// routes itself.
+    fingerprint: u64,
+    pub(crate) statics: Arc<Vec<crate::static_files::StaticMount>>,
+}
+
+impl Routing {
+    pub(crate) fn lookup(&self, method: &Method, path: &str) -> Lookup {
+        lookup(&self.router, method, path)
+    }
+}
+
+/// The Lua-free routing of the application compiled in this state.
+pub(crate) fn routing(lua: &Lua) -> Result<Routing> {
+    let ud = state(lua)?;
+    let state = ud.borrow::<AppState>()?;
+    let app = &state.dispatch.0;
+    Ok(Routing {
+        router: app.router.clone(),
+        fingerprint: state.fingerprint,
+        statics: state.statics.clone(),
+    })
+}
+
+/// The chain `routing` resolved to `index`, from this state, when the state
+/// compiled the same route set. A state rebuilt from a script edited on
+/// disk since the pool was built can differ; the caller routes it with the
+/// state's own table instead.
+pub(crate) fn routed_chain<R>(
+    lua: &Lua,
+    routing: &Routing,
+    index: usize,
+    take: impl FnOnce(&Chain) -> R,
+) -> Result<Option<R>> {
+    let ud = state(lua)?;
+    let state = ud.borrow::<AppState>()?;
+    if state.fingerprint != routing.fingerprint {
+        return Ok(None);
+    }
+    Ok(state.dispatch.0.chains.get(index).map(take))
+}
+
+/// One number for a route set: every `(method, pattern)` in order.
+fn route_fingerprint(chains: &[Chain]) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::hash::DefaultHasher::new();
+    for chain in chains {
+        chain.method.as_str().hash(&mut hasher);
+        chain.path.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// The one router lookup, shared by the server and `nitr test`'s
+/// `app:dispatch`: `HEAD` falls back to the `GET` route (it is `GET`
+/// without the body), while an explicit `head` route still wins.
+fn lookup(router: &Router<HashMap<Method, usize>>, method: &Method, path: &str) -> Lookup {
+    let Ok(matched) = router.at(path) else {
+        return Lookup::NotFound;
+    };
+    let route = matched.value.get(method).or_else(|| {
+        (*method == Method::HEAD)
+            .then(|| matched.value.get(&Method::GET))
+            .flatten()
+    });
+    match route {
+        Some(&index) => Lookup::Route {
+            index,
+            params: matched
+                .params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        },
+        None if *method == Method::OPTIONS => {
+            Lookup::Options(matched.value.keys().cloned().collect())
         }
+        None => Lookup::MethodNotAllowed(matched.value.keys().cloned().collect()),
     }
 }
 
@@ -322,6 +385,8 @@ pub(crate) struct AppState {
     /// generator.
     #[cfg_attr(not(feature = "openapi"), allow(dead_code))]
     pub(crate) meta: Arc<AppMeta>,
+    /// See [`route_fingerprint`].
+    fingerprint: u64,
     script: PathBuf,
 }
 
@@ -375,10 +440,12 @@ pub(crate) fn load(
     // and sort the candidates on every request. Stable, so mounts of equal
     // length keep their registration order, script mounts before `[static]`.
     statics.sort_by_key(|m| std::cmp::Reverse(m.mount.len()));
+    let fingerprint = route_fingerprint(&compiled.dispatch.0.chains);
     let state = lua.create_userdata(AppState {
         dispatch: compiled.dispatch,
         statics: Arc::new(statics),
         meta: Arc::new(compiled.meta),
+        fingerprint,
         script: script.to_path_buf(),
     })?;
     lua.set_named_registry_value(APP_STATE_KEY, state)?;
@@ -389,4 +456,77 @@ pub(crate) fn load(
 pub(crate) fn state(lua: &Lua) -> Result<AnyUserData> {
     lua.named_registry_value::<AnyUserData>(APP_STATE_KEY)
         .map_err(|_| Error::Script("no HTTP handler has been loaded".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loaded(script: &str) -> (Lua, tempfile_path::Guard) {
+        let lua = Lua::new();
+        let path = tempfile_path::write("routing", script);
+        register_nitr_app(&lua).expect("nitr.app");
+        let env = InputEnv {
+            upload_root: None,
+            reserved: Vec::new(),
+        };
+        load(&lua, &path.0, &[], &env).expect("load");
+        (lua, path)
+    }
+
+    /// Only a state that compiled the same route set is routed by the
+    /// pool's shared table: a rebuilt state whose script gained a route
+    /// may resolve the same request elsewhere, even when the shared index
+    /// still names a chain with the same method and pattern.
+    #[test]
+    fn shared_routing_only_applies_to_a_state_with_the_same_route_set() {
+        let (a, _ka) = loaded(
+            "local app = nitr.app()
+             app:get('/a/:id', function() end)
+             return app",
+        );
+        let (b, _kb) = loaded(
+            "local app = nitr.app()
+             app:get('/a/:id', function() end)
+             app:get('/a/special', function() end)
+             return app",
+        );
+        let routing_a = routing(&a).expect("routing");
+        let Lookup::Route { index, .. } = routing_a.lookup(&Method::GET, "/a/special") else {
+            panic!("a routes /a/special to its :id route");
+        };
+        assert!(
+            routed_chain(&a, &routing_a, index, |chain| chain.path.clone())
+                .expect("same state")
+                .is_some()
+        );
+        assert!(
+            routed_chain(&b, &routing_a, index, |chain| chain.path.clone())
+                .expect("other state")
+                .is_none(),
+            "a state with another route set routes itself"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tempfile_path {
+    use std::path::PathBuf;
+
+    pub(super) struct Guard(pub(super) PathBuf);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    pub(super) fn write(label: &str, content: &str) -> Guard {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("nitr-app-{label}-{}-{id}.lua", std::process::id()));
+        std::fs::write(&path, content).expect("write script");
+        Guard(path)
+    }
 }

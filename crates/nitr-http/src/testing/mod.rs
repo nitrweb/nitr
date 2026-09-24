@@ -48,6 +48,9 @@ pub struct TestClient {
     pool: Arc<RwLock<Arc<RuntimePool>>>,
     streams: Arc<Semaphore>,
     protection: Arc<Protection>,
+    /// What `req.uri.scheme` reports: the server's `[tls]` setting, as a
+    /// real connection would carry it.
+    tls: bool,
 }
 
 /// Why a request answered with the error path: the classified failure the
@@ -85,11 +88,13 @@ impl TestClient {
         pool: Arc<RwLock<Arc<RuntimePool>>>,
         streams: Arc<Semaphore>,
         protection: Arc<Protection>,
+        tls: bool,
     ) -> Self {
         Self {
             pool,
             streams,
             protection,
+            tls,
         }
     }
 
@@ -151,7 +156,8 @@ impl TestClient {
             status = tracing::field::Empty,
         );
         let peer = spec.remote_addr.unwrap_or_else(|| DEFAULT_PEER.into());
-        let req = LuaRequest::synthetic(req, peer, id.into());
+        let mut req = LuaRequest::synthetic(req, peer, id.into());
+        req.tls = self.tls;
 
         let pool = current_pool(&self.pool);
         let streams = self.streams.clone();

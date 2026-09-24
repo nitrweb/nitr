@@ -103,7 +103,12 @@ fn serialize(session: &Table, max_age: Option<i64>, now: i64) -> mlua::Result<St
     }
     let session = Value::Table(session.clone());
     let bounds = crate::bounded::Bounds::new(true);
-    let mut json = serde_json::to_value(crate::bounded::Guarded::new(&session, &bounds)).map_err(|err| {
+    let path = crate::bounded::TablePath::default();
+    let mut json = serde_json::to_value(crate::bounded::Guarded::new(
+        &crate::bounded::LuaData::new(&session, &path),
+        &bounds,
+    ))
+    .map_err(|err| {
         mlua::Error::RuntimeError(format!(
             "session values must be JSON-serializable (strings, numbers, booleans, tables): {err}"
         ))
@@ -265,6 +270,23 @@ mod tests {
         let err = save.call::<Value>((session, resp)).expect_err("too deep");
         assert!(
             err.to_string().contains("nested deeper than 128 levels"),
+            "got: {err}"
+        );
+    }
+
+    /// A positional entry would serialize the session as a list, which the
+    /// next load discards whole: the save must refuse it instead.
+    #[test]
+    fn save_rejects_a_session_mixing_list_items_and_named_keys() {
+        let lua = Lua::new();
+        let session = make_session(&lua, r#"{ secret = "0123456789abcdef" }"#);
+        session.set("user", "ann").expect("set");
+        session.set(1, "positional").expect("set");
+        let save: mlua::Function = session.get("save").expect("method");
+        let resp = lua.create_table().expect("resp");
+        let err = save.call::<Value>((session, resp)).expect_err("mixed");
+        assert!(
+            err.to_string().contains("mixes list items and named keys"),
             "got: {err}"
         );
     }

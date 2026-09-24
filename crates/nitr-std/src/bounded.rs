@@ -31,9 +31,10 @@
 //! pin that against the walking guard, shape by shape and at the exact
 //! depth boundary).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::ffi::c_void;
 
-use mlua::Value;
+use mlua::{Table, Value};
 use serde::ser::{
     self, Serialize, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant,
     SerializeTuple, SerializeTupleStruct, SerializeTupleVariant, Serializer,
@@ -111,13 +112,129 @@ impl<T: ?Sized + Serialize> Serialize for Guarded<'_, T> {
 /// `serde_json::to_string` under the JSON bounds, strict about UTF-8.
 pub(crate) fn to_json_string(value: &Value) -> serde_json::Result<String> {
     let bounds = Bounds::new(true);
-    serde_json::to_string(&Guarded::new(value, &bounds))
+    let path = TablePath::default();
+    serde_json::to_string(&Guarded::new(&LuaData::new(value, &path), &bounds))
 }
 
 /// `serde_json::to_vec` under the JSON bounds, strict about UTF-8.
 pub(crate) fn to_json_vec(value: &Value) -> serde_json::Result<Vec<u8>> {
     let bounds = Bounds::new(true);
-    serde_json::to_vec(&Guarded::new(value, &bounds))
+    let path = TablePath::default();
+    serde_json::to_vec(&Guarded::new(&LuaData::new(value, &path), &bounds))
+}
+
+/// The tables being serialized, outermost first.
+#[derive(Default)]
+pub(crate) struct TablePath(RefCell<Vec<*const c_void>>);
+
+/// A script's value as the standard library serializes it.
+///
+/// mlua encodes any table with a list part as a list and drops its other
+/// keys, so a table holding both (`{ "a", total = 1 }`) lost data with no
+/// error. Tables are decided here instead (see [`list`](Self::list)), and
+/// one mixing list items and named keys is refused. Every other value, and
+/// an empty table (`[]` or `{}` by mlua's array metatable), is mlua's
+/// encoding.
+pub(crate) struct LuaData<'a> {
+    value: &'a Value,
+    path: &'a TablePath,
+}
+
+impl<'a> LuaData<'a> {
+    pub(crate) fn new(value: &'a Value, path: &'a TablePath) -> Self {
+        Self { value, path }
+    }
+
+    fn table<S: Serializer>(&self, table: &Table, serializer: S) -> Result<S::Ok, S::Error> {
+        let ptr = table.to_pointer();
+        if self.path.0.borrow().contains(&ptr) {
+            return Err(ser::Error::custom("recursive table detected"));
+        }
+        self.path.0.borrow_mut().push(ptr);
+        let result = match table.raw_len() {
+            0 if table.is_empty() => self.value.to_serializable().serialize(serializer),
+            0 => self.map(table, serializer),
+            _ => self.list(table, serializer),
+        };
+        self.path.0.borrow_mut().pop();
+        result
+    }
+
+    /// A table with a list part: its keys must all be positive integers.
+    /// Dense ones (the highest at most twice the count) are a list with
+    /// holes as `null`; sparse ones stay a map, as with no list part, so a
+    /// lone high index cannot expand into a million `null`s.
+    fn list<S: Serializer>(&self, table: &Table, serializer: S) -> Result<S::Ok, S::Error> {
+        let (mut count, mut highest, mut mixed) = (0usize, 0usize, false);
+        // `bool` reads the value without taking a registry reference: only
+        // the keys matter here.
+        let walked = table.for_each(|key: Value, _: bool| match key {
+            Value::Integer(key) if key >= 1 => {
+                count += 1;
+                highest = highest.max(usize::try_from(key).unwrap_or(usize::MAX));
+                Ok(())
+            }
+            _ => {
+                mixed = true;
+                Err(mlua::Error::runtime(""))
+            }
+        });
+        if mixed {
+            return Err(ser::Error::custom(mixed_message()));
+        }
+        walked.map_err(ser::Error::custom)?;
+        if highest > count.saturating_mul(2) {
+            return self.map(table, serializer);
+        }
+        let mut seq = serializer.serialize_seq(Some(highest))?;
+        if count == highest {
+            for item in table.sequence_values::<Value>() {
+                let item = item.map_err(ser::Error::custom)?;
+                seq.serialize_element(&LuaData::new(&item, self.path))?;
+            }
+        } else {
+            for index in 1..=highest {
+                let item: Value = table.raw_get(index).map_err(ser::Error::custom)?;
+                seq.serialize_element(&LuaData::new(&item, self.path))?;
+            }
+        }
+        seq.end()
+    }
+
+    fn map<S: Serializer>(&self, table: &Table, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        let mut failed = None;
+        let walked = table.for_each(|key: Value, item: Value| {
+            map.serialize_entry(
+                &LuaData::new(&key, self.path),
+                &LuaData::new(&item, self.path),
+            )
+            .map_err(|err| {
+                failed = Some(err);
+                mlua::Error::runtime("")
+            })
+        });
+        if let Some(err) = failed {
+            return Err(err);
+        }
+        walked.map_err(ser::Error::custom)?;
+        map.end()
+    }
+}
+
+impl Serialize for LuaData<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.value {
+            Value::Table(table) => self.table(table, serializer),
+            other => other.to_serializable().serialize(serializer),
+        }
+    }
+}
+
+fn mixed_message() -> String {
+    "json value has a table that mixes list items and named keys, which JSON cannot \
+     represent: keep the list under a key of its own"
+        .into()
 }
 
 /// The serializer adapter: checks, then forwards.
@@ -546,6 +663,27 @@ mod tests {
                 Err(_) => None,
             };
             assert_eq!(to_json_string(&v).ok(), expected, "{src}");
+        }
+    }
+
+    /// JSON has no shape for a table with both list items and named keys:
+    /// serialized as a list, the named keys would vanish.
+    #[test]
+    fn a_table_mixing_list_items_and_named_keys_is_refused() {
+        let lua = Lua::new();
+        for src in ["{ 'a', total = 1 }", "{ items = { 1, 2, x = 3 } }"] {
+            let err = to_json_string(&value(&lua, src)).expect_err(src);
+            assert!(
+                err.to_string().contains("mixes list items and named keys"),
+                "{src}: {err}"
+            );
+        }
+        for (src, json) in [
+            ("{ 1, nil, 3 }", "[1,null,3]"),
+            ("{ total = 1 }", r#"{"total":1}"#),
+            ("{ [5] = 'x' }", r#"{"5":"x"}"#),
+        ] {
+            assert_eq!(to_json_string(&value(&lua, src)).expect(src), json, "{src}");
         }
     }
 

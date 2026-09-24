@@ -15,7 +15,7 @@ nitr = {}
 ---@field headers table<string, string> Request headers, lowercase names.
 ---@field id string The request id (UUIDv7, echoed as `X-Request-ID`).
 ---@field remote_addr string Peer address (`"ip:port"`).
----@field uri table URI components: `scheme`, `host`, `port`, `path`, `authority`, `query`.
+---@field uri table URI components: `scheme`, `host`, `port`, `path`, `authority`, `query`. An HTTP/1.1 request carries only the path, so `authority`, `host` and `port` come from the client-sent `Host` header (`port` is the scheme's default when it names none) and `scheme` from the listener (`https` under `[tls]`).
 ---@field cookies nitr.RequestCookies Parsed request cookies.
 ---@field valid table|nil The route's validated input — `{ body, query, params, headers }` as its `input` declaration coerced, stripped and normalized them; nil on routes without `input`.
 local Request = {}
@@ -32,7 +32,7 @@ function Request:text() end
 ---@return table<string, string>
 function Request:form() end
 
----Invokes `fn(part)` once per part of a `multipart/form-data` body, in arrival order; returns the part count. (Needs the `multipart` Cargo feature.)
+---Invokes `fn(part)` once per part of a `multipart/form-data` body, in arrival order; returns the part count. A `[limits]` bound a part crosses (`max_form_parts`, `max_field_bytes`, `max_file_bytes`) raises; uncaught, it answers 413. (Needs the `multipart` Cargo feature.)
 ---@param fn fun(part: nitr.Part)
 ---@return integer _ Number of parts seen.
 function Request:multipart(fn) end
@@ -143,7 +143,7 @@ function App:use(mw) end
 ---@param handler fun(err: table, req: nitr.Request): nitr.Response|table
 function App:on_error(handler) end
 
----Mounts a static directory, served in Rust. Options: `{ spa = boolean, cache_control = string, dotfiles = boolean }` — dotfiles are hidden unless `dotfiles = true` (`.well-known/` is always served).
+---Mounts a static directory, served in Rust without a Lua state. Routes win: the mount answers a GET or HEAD for a path no route serves with that method. Options: `{ spa = boolean, cache_control = string, dotfiles = boolean }` — dotfiles are hidden unless `dotfiles = true` (`.well-known/` is always served).
 ---@param mount string
 ---@param dir string
 ---@param opts? table
@@ -161,7 +161,7 @@ local Part = {}
 ---@return string
 function Part:text() end
 
----Streams a file part to `path` without entering the Lua heap; returns the bytes written.
+---Streams a file part to `path` without entering the Lua heap; returns the bytes written. An existing file at `path` is replaced only once the whole part is written.
 ---@param path string
 ---@return integer
 function Part:save(path) end
@@ -181,7 +181,8 @@ function FetchHandle:send() end
 ---An outbound response.
 ---@class nitr.FetchResponse
 ---@field status integer HTTP status code.
----@field headers table<string, string> Response headers.
+---@field headers table<string, string> Response headers, lowercase names: the last value of a repeated one, as the bytes the upstream sent.
+---@field raw_headers table[] `{ name, value }` pairs in order, repeats included (every `Set-Cookie`).
 ---@field url string Final URL after redirects.
 local FetchResponse = {}
 
@@ -207,7 +208,7 @@ local Schema = {}
 ---@return table|nil _ The error, when validation failed.
 function Schema:check(value) end
 
----A copy with every top-level field optional — the PATCH body of a POST schema.
+---A copy with every top-level field optional and no defaults filled in — the PATCH body of a POST schema, which must not reset what it omits.
 ---@return nitr.Schema
 function Schema:partial() end
 
@@ -356,7 +357,7 @@ function App:dispatch(method, path, req) end
 ---@return table[]
 function App:routes() end
 
----As a function: a JSON response (`nitr.json({ ok = true })`). Also the codec: `nitr.json:encode(v)` / `nitr.json:decode(s)`. (std feature: `json`)
+---As a function: a JSON response (`nitr.json({ ok = true })`). Also the codec: `nitr.json:encode(v)` / `nitr.json:decode(s)`. A table whose keys are `1..n` (holes as `null`) is an array; one mixing list items and named keys has no JSON shape and raises, here and wherever a value is serialized (cache, session, JWT, templates). (std feature: `json`)
 ---@class nitr.json
 ---@overload fun(value: any, status: integer?): nitr.Response
 nitr.json = {}
@@ -394,9 +395,9 @@ function nitr.redirect(location, status) end
 ---@return nitr.Response
 function nitr.status(code) end
 
----Picks the offer whose media type best matches the `Accept` header; function values are called with the request. No match answers 406. (std feature: `http`)
+---Picks the offer whose media type best matches the `Accept` header; function values are called with the request. No match answers 406. Offers are a list `{ { type, value }, ... }`, where a tie goes to the earlier entry, or a map `{ [type] = value }`, where it goes to the type that sorts first. (std feature: `http`)
 ---@param req nitr.Request
----@param offers table<string, any>
+---@param offers table
 ---@return any
 function nitr.negotiate(req, offers) end
 
@@ -447,14 +448,14 @@ function nitr.errinfo(caught) end
 ---@return any
 function nitr.dbg(value) end
 
----An outbound HTTP request (SSRF-guarded, redirect-checked). Options: `headers`, `query`, `json`, `body`, `timeout`, `retry`. Returns an unsent handle. (std feature: `fetch`)
+---An outbound HTTP request (SSRF-guarded, redirect-checked). Options: `headers`, `query`, `json`, `body`, `timeout`, `retry`. Returns an unsent handle. `retry = { attempts, backoff }` repeats an idempotent request after a network failure or a retryable status, never after a refusal by the `[fetch]` policy. (std feature: `fetch`)
 ---@param method string
 ---@param url string
 ---@param opts? table
 ---@return nitr.FetchHandle
 function nitr.fetch(method, url, opts) end
 
----Runs fetch handles (and `db:query_async` handles) concurrently, passed as separate arguments (`nitr.await_all(h1, h2)`), and returns their results as multiple values in the same order. Capped by `[fetch] max_concurrent`. (std feature: `fetch`)
+---Runs fetch handles (and `db:query_async` handles) concurrently, passed as separate arguments (`nitr.await_all(h1, h2)`), and returns their results as multiple values in the same order. At most `[fetch] max_concurrent` run at a time; the rest wait their turn. (std feature: `fetch`)
 ---@param ... nitr.FetchHandle|table
 ---@return ...
 function nitr.await_all(...) end
@@ -476,12 +477,12 @@ nitr.template = {}
 ---@return string
 function nitr.template:render(name, data) end
 
----The SQLite database (`database` in nitr.toml): WAL, busy timeout, foreign keys on. (std feature: `db`)
+---The SQLite database (`database` in nitr.toml): WAL, busy timeout, foreign keys on. A row is a column→value table, so a query whose result columns share a name raises (alias one with `AS`). (std feature: `db`)
 nitr.db = {}
 
 ---Runs a statement.
 ---@param sql string
----@param params? table
+---@param params? table Positional values; `nil` (anywhere, trailing included) and JSON `null` bind NULL. A table from `table.pack` counts to its `n`, which is also how a lone NULL is passed (`{ n = 1 }`): an empty list is not padded, so a statement called without its parameters fails.
 ---@return integer _ Affected row count.
 function nitr.db:execute(sql, params) end
 
@@ -638,7 +639,7 @@ nitr.cache = {}
 ---@return any
 function nitr.cache:get(key) end
 
----Stores a value; `opts` is `{ ttl = seconds }`.
+---Stores a value; `opts` is `{ ttl = seconds }` (`0` never expires, as `[cache] default_ttl`). Setting `nil` removes the key.
 ---@param key string
 ---@param value any
 ---@param opts? table
@@ -763,7 +764,7 @@ function nitr.validate.archive(opts) end
 ---@return table
 function nitr.validate.audio(opts) end
 
----A `file` rule preset: mp4, mov, webm, mkv; `max_bytes = "500mb"` (above the default `[limits] max_file_bytes`).
+---A `file` rule preset: mp4, mov, webm, mkv; `max_bytes = "500mb"` (above the default `[limits] max_file_bytes`, which still caps it).
 ---@param opts? table
 ---@return table
 function nitr.validate.video(opts) end

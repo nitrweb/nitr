@@ -711,6 +711,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A trailing nil is padded because a Lua list cannot hold it; a
+    /// statement called with no parameters at all keeps failing, or a
+    /// forgotten list would run `WHERE id = NULL` and match nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_nil_parameter_inserts_null_but_a_missing_list_does_not() {
+        let (lua, dir) = db_state("null").await;
+        let (trailing, packed): (bool, bool) = lua
+            .load(
+                "nitr.db:execute('CREATE TABLE p (a INTEGER, b TEXT)')
+                 nitr.db:execute('INSERT INTO p (a, b) VALUES (?, ?)', { 1, nil })
+                 nitr.db:execute('INSERT INTO p (a, b) VALUES (?, ?)', table.pack(nil, 'x'))
+                 return nitr.db:query_one('SELECT b IS NULL AS missing FROM p WHERE a = 1').missing == 1,
+                        nitr.db:query_one('SELECT a IS NULL AS missing FROM p WHERE b = ?', { 'x' }).missing == 1",
+            )
+            .eval_async()
+            .await
+            .expect("insert");
+        assert!(trailing && packed);
+        for params in ["", ", {}"] {
+            let err = lua
+                .load(format!(
+                    "return nitr.db:query('SELECT * FROM p WHERE a = ?'{params})"
+                ))
+                .eval_async::<Value>()
+                .await
+                .expect_err("no parameters")
+                .to_string();
+            assert!(err.contains("parameters"), "`{params}`: {err}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A row is keyed by column name: two columns sharing one would keep
+    /// only the last, so a join reading `id` gets the wrong table's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplicate_column_names_are_refused() {
+        let (lua, dir) = db_state("dupcol").await;
+        for call in ["query", "query_row", "query_one"] {
+            let err = lua
+                .load(format!("return nitr.db:{call}('SELECT 1 AS id, 2 AS id')"))
+                .eval_async::<Value>()
+                .await
+                .expect_err(call)
+                .to_string();
+            assert!(err.contains("columns 1 and 2"), "{call}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A transaction whose future is dropped mid-await (the handler's
     /// timeout) must not brick the connection: the flag clears, the next
     /// outer statement rolls the abandoned work back, and a new

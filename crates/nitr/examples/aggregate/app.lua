@@ -48,13 +48,24 @@ app:post("/transfer", function(req)
     local reason
     local ok = pcall(function()
         nitr.db:transaction(function(tx)
-            tx:execute("UPDATE accounts SET balance = balance - ? WHERE name = ?", { amount, from })
+            -- `execute` returns the affected row count: an account that
+            -- does not exist updates nothing, and must fail the transfer
+            -- rather than debit one side only.
+            local debited = tx:execute("UPDATE accounts SET balance = balance - ? WHERE name = ?", { amount, from })
+            if debited ~= 1 then
+                reason = "unknown source account"
+                error(reason)
+            end
             local row = tx:query_row("SELECT balance FROM accounts WHERE name = ?", { from })
             if row.balance < 0 then
                 reason = "insufficient funds"
                 error(reason)
             end
-            tx:execute("UPDATE accounts SET balance = balance + ? WHERE name = ?", { amount, to })
+            local credited = tx:execute("UPDATE accounts SET balance = balance + ? WHERE name = ?", { amount, to })
+            if credited ~= 1 then
+                reason = "unknown destination account"
+                error(reason)
+            end
         end)
     end)
 

@@ -46,6 +46,8 @@ struct Upstream {
     requests: Arc<AtomicUsize>,
     fail_first: Arc<AtomicUsize>,
     traceparents: Arc<Mutex<Vec<Option<String>>>>,
+    in_flight: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
 }
 
 impl Upstream {
@@ -78,6 +80,29 @@ impl Upstream {
                                     .and_then(|v| v.to_str().ok())
                                     .map(str::to_string),
                             );
+                            match req.uri().path() {
+                                "/slow" => {
+                                    let now = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                                    state.peak.fetch_max(now, Ordering::SeqCst);
+                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                    state.in_flight.fetch_sub(1, Ordering::SeqCst);
+                                }
+                                "/headers" => {
+                                    return Ok(Response::builder()
+                                        .header("set-cookie", "a=1; Path=/")
+                                        .header("set-cookie", "b=2; Path=/")
+                                        .header(
+                                            "content-disposition",
+                                            hyper::header::HeaderValue::from_bytes(
+                                                "attachment; filename=\"résumé.pdf\"".as_bytes(),
+                                            )
+                                            .expect("header"),
+                                        )
+                                        .body(Full::new(Bytes::new()))
+                                        .expect("response"));
+                                }
+                                _ => {}
+                            }
                             // Fail the first N, then succeed: a retry that
                             // works has to be visible as a later success.
                             let remaining = state.fail_first.load(Ordering::SeqCst);
@@ -425,6 +450,42 @@ app:get("/traced", function(req)
     return nitr.json({ status = resp.status })
 end)
 
+app:get("/url", function(req)
+    local resp = nitr.fetch("get", nitr.cfg.upstream .. "echo?x=1"):send()
+    return nitr.json({ url = resp.url, joined = "got " .. resp.url })
+end)
+
+app:get("/many", function(req)
+    local handles = {}
+    for i = 1, 9 do
+        handles[i] = nitr.fetch("get", nitr.cfg.upstream .. "slow")
+    end
+    local results = table.pack(nitr.await_all(table.unpack(handles)))
+    local statuses = {}
+    for i = 1, results.n do
+        statuses[i] = results[i].status
+    end
+    return nitr.json({ statuses = statuses })
+end)
+
+app:get("/headers", function(req)
+    local resp = nitr.fetch("get", nitr.cfg.upstream .. "headers"):send()
+    local cookies = {}
+    for _, h in ipairs(resp.raw_headers) do
+        if h.name == "set-cookie" then
+            cookies[#cookies + 1] = h.value
+        end
+    end
+    return nitr.json({ cookies = cookies, disposition = resp.headers["content-disposition"] })
+end)
+
+app:get("/refused-retry", function(req)
+    local ok, err = pcall(function()
+        nitr.fetch("get", nitr.cfg.upstream, { retry = { attempts = 5 } }):send()
+    end)
+    return nitr.json({ ok = ok, err = tostring(err) })
+end)
+
 app:get("/private", function(req)
     local ok, err = pcall(function()
         nitr.fetch("get", "http://localhost:9/"):send()
@@ -520,6 +581,76 @@ async fn trace_context_is_forwarded_when_enabled() {
     assert_eq!(parts[0], "00");
     assert_eq!(parts[1].len(), 32, "trace id must be 16 bytes");
     assert_eq!(parts[2].len(), 16, "span id must be 8 bytes");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_response_url_is_the_final_url_as_a_string() {
+    let upstream = Upstream::default();
+    let addr = upstream.start().await;
+    let mut srv = fetch_server(addr, |_| {}).await;
+    let body = srv.json("/url").await;
+    assert_eq!(body["url"], format!("http://{addr}/echo?x=1"));
+    assert_eq!(body["joined"], format!("got http://{addr}/echo?x=1"));
+    srv.stop().await;
+}
+
+/// More handles than `[fetch] max_concurrent` all run, at most that many
+/// at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn await_all_caps_concurrency_instead_of_refusing() {
+    let upstream = Upstream::default();
+    let addr = upstream.start().await;
+    let mut srv = fetch_server(addr, |cfg| cfg.fetch.max_concurrent = 2).await;
+    let body = srv.json("/many").await;
+    assert_eq!(
+        body["statuses"],
+        serde_json::Value::from(vec![200; 9]),
+        "{body}"
+    );
+    assert_eq!(upstream.peak.load(Ordering::SeqCst), 2);
+    srv.stop().await;
+}
+
+/// Repeated headers and non-ASCII values reach the script: `headers`
+/// keeps the last value per name, `raw_headers` every one, in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn response_headers_keep_repeats_and_non_ascii_values() {
+    let upstream = Upstream::default();
+    let addr = upstream.start().await;
+    let mut srv = fetch_server(addr, |_| {}).await;
+    let body = srv.json("/headers").await;
+    assert_eq!(
+        body["cookies"],
+        serde_json::json!(["a=1; Path=/", "b=2; Path=/"])
+    );
+    assert_eq!(body["disposition"], "attachment; filename=\"résumé.pdf\"");
+    srv.stop().await;
+}
+
+/// A policy refusal answers the same on every attempt: it fails at once
+/// instead of sleeping through the backoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_fetch_is_not_retried() {
+    let upstream = Upstream::default();
+    let addr = upstream.start().await;
+    let mut srv = fetch_server(addr, |cfg| {
+        cfg.fetch.allowed_hosts = Some(vec!["only.example".into()]);
+    })
+    .await;
+    let started = std::time::Instant::now();
+    let body = srv.json("/refused-retry").await;
+    assert_eq!(body["ok"], false);
+    assert!(
+        body["err"].as_str().expect("err").contains("allowed_hosts"),
+        "{body}"
+    );
+    // Four exponential retries sleep at least 50 + 100 + 200 + 400 ms.
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "took {:?}",
+        started.elapsed()
+    );
+    srv.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

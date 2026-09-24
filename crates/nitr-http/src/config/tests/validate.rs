@@ -324,6 +324,29 @@ fn the_multipart_section_parses_without_the_multipart_feature() {
     );
 }
 
+/// A stream holds its state for its whole life: when streams can take
+/// every state, open streams make every other request wait
+/// `pool_wait_ms` and then 503. The default on one worker is that case.
+#[test]
+fn stream_slots_for_every_state_warn() {
+    for (workers, max_streams) in [(1, None), (1, Some(1)), (4, Some(4))] {
+        let mut cfg = valid_base();
+        cfg.workers = workers;
+        cfg.max_streams = max_streams;
+        assert!(
+            cfg.streams_warning().is_some(),
+            "workers = {workers}, max_streams = {max_streams:?}"
+        );
+    }
+    let mut cfg = valid_base();
+    cfg.workers = 4;
+    assert_eq!(
+        cfg.streams_warning(),
+        None,
+        "the default keeps a state free"
+    );
+}
+
 #[test]
 fn contradictions_are_startup_errors() {
     let ok = valid_base();
@@ -334,6 +357,18 @@ fn contradictions_are_startup_errors() {
     cfg.max_streams = Some(5);
     let err = cfg.validate().expect_err("max_streams > workers");
     assert!(err.to_string().contains("max_streams"), "got: {err}");
+
+    // mlua enforces the allocator limit only when it is above zero.
+    let mut cfg = valid_base();
+    cfg.lua.memory_limit = 0;
+    let err = cfg.validate().expect_err("memory_limit = 0");
+    assert!(err.to_string().contains("[lua] memory_limit"), "got: {err}");
+
+    // Zero slots answers every stream 503, after its handler already ran.
+    let mut cfg = valid_base();
+    cfg.max_streams = Some(0);
+    let err = cfg.validate().expect_err("max_streams = 0");
+    assert!(err.to_string().contains("max_streams = 0"), "got: {err}");
 
     let mut cfg = valid_base();
     cfg.limits.pool_wait_ms = 60_000;

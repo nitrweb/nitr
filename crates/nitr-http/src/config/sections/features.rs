@@ -90,9 +90,10 @@ impl FetchConfig {
     }
 }
 
-/// Static file serving (`[static]` section): requests under `mount` are
-/// served from `dir` entirely in Rust, before any Lua dispatch. Scripts
-/// can add further mounts with `app:static(mount, dir, opts?)`.
+/// Static file serving (`[static]` section): a `GET` or `HEAD` under
+/// `mount` that no route serves with that method is answered from `dir`
+/// entirely in Rust, without a Lua state. Scripts can add further mounts
+/// with `app:static(mount, dir, opts?)`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StaticConfig {

@@ -201,6 +201,25 @@ async fn handle_inner(
     let guards = req.guard_body(protection.max_body_bytes(), protection.body_read_timeout());
     req.limits = protection.form_limits();
 
+    // Routed before a state is checked out: a static file, a 404, a 405 or
+    // an `OPTIONS` answer never waits for one.
+    let routed = match pool.companion::<app::Routing>() {
+        Some(routing) => match routing.lookup(req.req.method(), req.req.uri().path()) {
+            app::Lookup::Route { index, params } => Some((routing, index, params)),
+            app::Lookup::Options(allowed) => return options_response(&allowed),
+            app::Lookup::MethodNotAllowed(allowed) => {
+                let fallback = || method_not_allowed(&allowed);
+                return static_file_or(&routing.statics, &req, protection.compression(), fallback)
+                    .await;
+            }
+            app::Lookup::NotFound => {
+                return static_or(&routing.statics, &req, protection.compression(), not_found)
+                    .await;
+            }
+        },
+        None => None,
+    };
+
     // Bounded wait for a state: past the budget the request is shed rather
     // than queued behind an overloaded pool. Nothing Lua-side has run yet,
     // so shedding is cheap.
@@ -223,7 +242,18 @@ async fn handle_inner(
     nitr_std::reset_outbound_budget(rt.lua());
     nitr_std::set_trace_context(rt.lua(), &req.id);
 
-    let target = match resolve(&rt, &req, protection.compression()).await {
+    let target = match routed {
+        Some((routing, index, params)) => app::routed_chain(rt.lua(), routing, index, |chain| {
+            chain_target(chain, params)
+        }),
+        None => Ok(None),
+    };
+    let target = match target {
+        Ok(Some(target)) => Ok(target),
+        Ok(None) => resolve(&rt, &req, protection.compression()).await,
+        Err(err) => Err(err),
+    };
+    let target = match target {
         Ok(target) => target,
         Err(err) => {
             tracing::error!("failed to resolve the request route: {err}");
@@ -233,22 +263,9 @@ async fn handle_inner(
 
     match target {
         Target::Static(resp) => resp,
-        Target::NotFound => plain_response(StatusCode::NOT_FOUND, "Not Found"),
-        // An `OPTIONS` on a path that exists is a question about the
-        // resource, not a request the application should have to answer;
-        // RFC 9110 wants `Allow`, not `405`.
-        Target::Options(allowed) => {
-            let mut resp = empty_response(StatusCode::NO_CONTENT)?;
-            resp.headers_mut()
-                .insert(header::ALLOW, crate::cors::allow_header(&allowed));
-            Ok(resp)
-        }
-        Target::MethodNotAllowed(allowed) => {
-            let mut resp = plain_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")?;
-            resp.headers_mut()
-                .insert(header::ALLOW, crate::cors::allow_header(&allowed));
-            Ok(resp)
-        }
+        Target::NotFound => not_found(),
+        Target::Options(allowed) => options_response(&allowed),
+        Target::MethodNotAllowed(allowed) => method_not_allowed(&allowed),
         Target::Chain {
             chain,
             params,
@@ -277,7 +294,7 @@ async fn handle_inner(
             #[cfg(feature = "multipart")]
             let _spool = match (&input, &req.limits.upload_root) {
                 (Some((schemas, _)), Some(root)) if schemas.needs_spool(content) => {
-                    let spool = crate::validation::spool::SpoolDir::new(root, &req.id);
+                    let spool = crate::validation::spool::SpoolDir::new(root);
                     req.spool_dir = Some(spool.path().to_path_buf());
                     Some(spool)
                 }
@@ -380,6 +397,15 @@ async fn handle_inner(
                     header::HeaderValue::from_static("close"),
                 );
                 return Ok(resp);
+            }
+
+            #[cfg(feature = "multipart")]
+            if let Error::Lua(lua_err) = &err
+                && let Some(limit) = lua_err.downcast_ref::<crate::multipart::LimitExceeded>()
+            {
+                tracing::debug!("request rejected: {limit}");
+                discard_body(&req_ud);
+                return plain_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large");
             }
 
             // Classified once, on the error path only; the structured
@@ -516,8 +542,73 @@ fn finish(
     }
 }
 
+fn not_found() -> Result<HttpResponse> {
+    plain_response(StatusCode::NOT_FOUND, "Not Found")
+}
+
+fn method_not_allowed(allowed: &[Method]) -> Result<HttpResponse> {
+    let mut resp = plain_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")?;
+    resp.headers_mut()
+        .insert(header::ALLOW, crate::cors::allow_header(allowed));
+    Ok(resp)
+}
+
+/// An `OPTIONS` on a path that exists is a question about the resource, not
+/// a request the application should have to answer; RFC 9110 wants
+/// `Allow`, not `405`.
+fn options_response(allowed: &[Method]) -> Result<HttpResponse> {
+    let mut resp = empty_response(StatusCode::NO_CONTENT)?;
+    resp.headers_mut()
+        .insert(header::ALLOW, crate::cors::allow_header(allowed));
+    Ok(resp)
+}
+
+/// What the mounts have for a path no route matches (an SPA mount's page
+/// included), else `fallback`.
+async fn static_or(
+    statics: &Arc<Vec<StaticMount>>,
+    req: &LuaRequest,
+    compression: &crate::compress::Compression,
+    fallback: impl FnOnce() -> Result<HttpResponse>,
+) -> Result<HttpResponse> {
+    match static_files::try_serve(statics, req, compression, true).await {
+        Some(resp) => resp,
+        None => fallback(),
+    }
+}
+
+/// The file a mount has for a path routed only for other methods, else
+/// `fallback`: a `POST /contact` route does not hide `contact/index.html`
+/// from a `GET`, while a path a route knows is no SPA miss and keeps its
+/// 405.
+async fn static_file_or(
+    statics: &Arc<Vec<StaticMount>>,
+    req: &LuaRequest,
+    compression: &crate::compress::Compression,
+    fallback: impl FnOnce() -> Result<HttpResponse>,
+) -> Result<HttpResponse> {
+    match static_files::try_serve(statics, req, compression, false).await {
+        Some(resp) => resp,
+        None => fallback(),
+    }
+}
+
+fn chain_target(chain: &app::Chain, params: Vec<(String, String)>) -> Target {
+    Target::Chain {
+        chain: chain.fns.clone(),
+        params,
+        // Resolved at compile time: the route's own handler first, the
+        // app-wide one as fallback.
+        error_fn: chain.error_fn.clone(),
+        input: chain.input.clone(),
+        invalid_fn: chain.invalid_fn.clone(),
+    }
+}
+
 /// Routes the request in Rust against this state's compiled dispatch
-/// table. Static mounts are consulted after a router miss.
+/// table, for a pool without shared routing or a state that compiled a
+/// different application. Static mounts answer as in [`static_or`] and
+/// [`static_file_or`].
 async fn resolve(
     rt: &Runtime,
     req: &LuaRequest,
@@ -531,15 +622,7 @@ async fn resolve(
         // (see `lookup`); the body is dropped once the response is
         // complete.
         let target = match app.lookup(req.req.method(), req.req.uri().path()) {
-            app::Lookup::Route { index, params } => Target::Chain {
-                chain: app.chains[index].fns.clone(),
-                params,
-                // Resolved at compile time: the route's own handler first,
-                // the app-wide one as fallback.
-                error_fn: app.chains[index].error_fn.clone(),
-                input: app.chains[index].input.clone(),
-                invalid_fn: app.chains[index].invalid_fn.clone(),
-            },
+            app::Lookup::Route { index, params } => chain_target(&app.chains[index], params),
             app::Lookup::Options(allowed) => Target::Options(allowed),
             app::Lookup::MethodNotAllowed(allowed) => Target::MethodNotAllowed(allowed),
             app::Lookup::NotFound => Target::NotFound,
@@ -547,15 +630,17 @@ async fn resolve(
         (target, state.statics.clone())
     };
 
-    Ok(match target {
-        Target::NotFound if !statics.is_empty() => {
-            match static_files::try_serve(&statics, req, compression).await {
-                Some(resp) => Target::Static(resp),
-                None => target,
-            }
-        }
-        other => other,
-    })
+    let spa_fallback = match target {
+        Target::NotFound => true,
+        Target::MethodNotAllowed(_) => false,
+        other => return Ok(other),
+    };
+    Ok(
+        match static_files::try_serve(&statics, req, compression, spa_fallback).await {
+            Some(resp) => Target::Static(resp),
+            None => target,
+        },
+    )
 }
 
 mod error_page;

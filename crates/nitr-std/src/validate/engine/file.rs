@@ -53,7 +53,10 @@ impl Ctx<'_> {
             .as_ref()
             .expect("file rules carry their file part");
         #[allow(clippy::expect_used)]
-        let max_bytes = rule.max_bytes.expect("file rules carry `max_bytes`");
+        let max_bytes = rule
+            .max_bytes
+            .expect("file rules carry `max_bytes`")
+            .min(info.cap);
         if info.size > max_bytes {
             return Ok(Some(("max_bytes", vec![("max", Param::Size(max_bytes))])));
         }

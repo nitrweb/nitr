@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use mlua::{
     AnyUserData, ExternalResult, Function, Lua, Table, UserData, UserDataMethods, Value, Variadic,
 };
@@ -178,7 +179,7 @@ async fn send_with_retries(
         let reason = match execute(client, spec.clone(), opts).await {
             Ok(resp) if last || !is_retryable(resp.status()) => return Ok(resp),
             Ok(resp) => format!("upstream answered {}", resp.status()),
-            Err(err) if last => return Err(err),
+            Err(err) if last || !is_transient(&err) => return Err(err),
             Err(err) => err.to_string(),
         };
         let delay = backoff(attempt, exponential);
@@ -190,6 +191,29 @@ async fn send_with_retries(
         );
         tokio::time::sleep(delay).await;
     }
+}
+
+/// Whether another attempt could succeed: a network failure could, a
+/// refusal by the fetch policy (scheme, `allowed_hosts`, a private
+/// address, the redirect limit) answers the same every time.
+fn is_transient(err: &mlua::Error) -> bool {
+    if let Some(err) = err.downcast_ref::<reqwest::Error>() {
+        return !err.is_builder() && !refused_by_policy(err);
+    }
+    // `check_url`'s own lookup: DNS failing is a network failure too.
+    err.downcast_ref::<std::io::Error>().is_some()
+}
+
+/// The guarded resolver's refusal reaches reqwest as a connect error.
+fn refused_by_policy(err: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(err) = source {
+        if err.is::<super::policy::Refused>() {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 /// Performs one attempt under the fetch policy, following redirects
@@ -473,14 +497,6 @@ pub(crate) fn create_await_all_fn(lua: &Lua, opts: Arc<FetchOptions>) -> mlua::R
     lua.create_async_function(move |lua, handles: Variadic<AnyUserData>| {
         let opts = opts.clone();
         async move {
-            let max_concurrent = opts.max_concurrent;
-            if handles.len() > max_concurrent {
-                return Err(mlua::Error::RuntimeError(format!(
-                    "await_all called with {} handles, fetch.max_concurrent is {max_concurrent}",
-                    handles.len()
-                )));
-            }
-
             // Each handle's work is copied out before awaiting, so no Lua
             // borrow lives across a suspension point.
             // Boxed: a `RequestSpec` is much larger than a pending query,
@@ -525,22 +541,26 @@ pub(crate) fn create_await_all_fn(lua: &Lua, opts: Arc<FetchOptions>) -> mlua::R
                 ));
             }
 
-            let results = futures_util::future::try_join_all(jobs.into_iter().map(|job| {
-                let lua = lua.clone();
-                async move {
-                    match job {
-                        Job::Fetch(job) => {
-                            let (client, spec, opts) = *job;
-                            let resp = send_with_retries(&client, spec, &opts).await?;
-                            lua.create_userdata(resp).map(Value::UserData)
+            // At most `max_concurrent` in flight, results in argument order.
+            let results: Vec<Value> = futures_util::stream::iter(jobs)
+                .map(|job| {
+                    let lua = lua.clone();
+                    async move {
+                        match job {
+                            Job::Fetch(job) => {
+                                let (client, spec, opts) = *job;
+                                let resp = send_with_retries(&client, spec, &opts).await?;
+                                lua.create_userdata(resp).map(Value::UserData)
+                            }
+                            Job::Mocked(resp) => lua.create_userdata(*resp).map(Value::UserData),
+                            #[cfg(feature = "db")]
+                            Job::Query(query) => query.run(&lua).await,
                         }
-                        Job::Mocked(resp) => lua.create_userdata(*resp).map(Value::UserData),
-                        #[cfg(feature = "db")]
-                        Job::Query(query) => query.run(&lua).await,
                     }
-                }
-            }))
-            .await?;
+                })
+                .buffered(opts.max_concurrent.max(1))
+                .try_collect()
+                .await?;
             Ok(Variadic::from_iter(results))
         }
     })

@@ -158,6 +158,13 @@ pub struct ShutdownConfig {
     /// legitimately outlive a normal request. They are cut at
     /// `grace + stream_grace`.
     pub stream_grace: u64,
+    /// Seconds the main listener keeps serving after the signal, with
+    /// readiness already answering 503, so a balancer probing that port
+    /// sees "draining" and moves traffic before the port closes. Unset:
+    /// 5 when the probes share the main listener, else 0 (a separate
+    /// `[health] bind` stays up through the drain, and dev mode stops at
+    /// once).
+    pub readiness_delay: Option<u64>,
 }
 
 impl Default for ShutdownConfig {
@@ -165,6 +172,7 @@ impl Default for ShutdownConfig {
         Self {
             grace: 30,
             stream_grace: 5,
+            readiness_delay: None,
         }
     }
 }

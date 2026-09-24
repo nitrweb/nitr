@@ -39,8 +39,11 @@ pub struct FileInfo {
     pub detected: Detection,
     /// Whether the declared text subtype's structure was present.
     pub text_subtype_ok: bool,
-    /// Bytes spooled.
+    /// Bytes received.
     pub size: u64,
+    /// The most bytes the spool stores: the rule's `max_bytes` capped by
+    /// `[limits] max_file_bytes`. A larger `size` is a file cut short.
+    pub cap: u64,
     /// Image dimensions when the header carried them.
     pub width: Option<u32>,
     /// See `width`.

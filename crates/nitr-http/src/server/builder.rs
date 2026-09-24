@@ -220,7 +220,7 @@ impl ServerBuilder {
         // would mean two instances rolling out at once race to change the
         // schema, each believing it is alone.
         check_migrations(&cfg)?;
-        // Spooled uploads a crashed process left behind.
+        // Spooled uploads and half-saved parts a crashed process left behind.
         #[cfg(feature = "multipart")]
         if let Some(root) = &cfg.multipart.upload_dir {
             crate::validation::spool::sweep(root);
@@ -253,11 +253,7 @@ impl ServerBuilder {
         }
         let pool = new_pool(built, &cfg, builtins, &setup_fns, &modules, cache.clone());
 
-        // Streaming responses hold a pooled state for their lifetime; by
-        // default keep at least one state free for short requests.
-        let max_streams = cfg
-            .max_streams
-            .unwrap_or_else(|| cfg.workers.max(1).saturating_sub(1).max(1));
+        let max_streams = cfg.effective_max_streams();
 
         // The certificate and key are read exactly here: once, before a
         // port exists, so a broken pair is a build failure (`nitr check`

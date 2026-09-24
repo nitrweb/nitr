@@ -59,6 +59,10 @@ app:get("/read", function(req)
     })
 end)
 
+app:get("/uri", function(req)
+    return nitr.json(req.uri)
+end)
+
 app:get("/negotiate", function(req)
     return nitr.negotiate(req, {
         ["application/json"] = function(r) return nitr.json({ kind = "json" }) end,
@@ -181,6 +185,24 @@ async fn helpers_cookies_and_negotiation_end_to_end() {
         .expect("tampered read");
     let body: serde_json::Value = resp.json().await.expect("tampered body");
     assert!(body["verified"].is_null());
+
+    // req.uri: HTTP/1.1 sends the path alone, so the authority comes
+    // from `Host` and the scheme from the listener.
+    let uri: serde_json::Value = client
+        .get(format!("{base}/uri?x=1"))
+        .send()
+        .await
+        .expect("uri")
+        .json()
+        .await
+        .expect("json");
+    let addr = server.addr();
+    assert_eq!(uri["scheme"], "http", "{uri}");
+    assert_eq!(uri["host"], addr.ip().to_string(), "{uri}");
+    assert_eq!(uri["port"], addr.port(), "{uri}");
+    assert_eq!(uri["authority"], addr.to_string(), "{uri}");
+    assert_eq!(uri["path"], "/uri", "{uri}");
+    assert_eq!(uri["query"], "x=1", "{uri}");
 
     // nitr.negotiate() picks by Accept header.
     let resp = client

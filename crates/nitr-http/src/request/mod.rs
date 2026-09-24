@@ -29,6 +29,9 @@ pub use fresh::is_fresh;
 /// Wrapper around the incoming request that implements UserData.
 pub(crate) struct LuaRequest {
     pub(crate) peer_addr: SocketAddr,
+    /// Whether the connection is TLS: the scheme an HTTP/1.1 request
+    /// target does not carry.
+    pub(crate) tls: bool,
     pub(crate) req: Request<IncomingBody>,
     /// Path parameters captured by the router (empty for the catch-all).
     pub(crate) params: Vec<(String, String)>,
@@ -50,7 +53,7 @@ pub(crate) struct LuaRequest {
     /// relying on the limiter installed in another file. `u64::MAX` until
     /// the guard runs (nothing to clamp against yet).
     pub(crate) body_limit: u64,
-    /// The whole body, once route validation read it, so a handler's
+    /// The whole body, once route validation or a handler read it, so
     /// `req:json()`/`req:text()`/`req:form()` still work afterwards: the
     /// read happens once, whoever asks first.
     pub(crate) cached_body: Option<Bytes>,
@@ -99,6 +102,23 @@ impl Default for FormLimits {
 }
 
 impl LuaRequest {
+    /// The whole body, read once and kept, so `req:form()`, `req:text()`
+    /// and `req:json()` all see it whichever runs first.
+    async fn whole_body(&mut self) -> mlua::Result<Bytes> {
+        if let Some(cached) = &self.cached_body {
+            return Ok(cached.clone());
+        }
+        let body = self
+            .req
+            .body_mut()
+            .collect()
+            .await
+            .into_lua_err()?
+            .to_bytes();
+        self.cached_body = Some(body.clone());
+        Ok(body)
+    }
+
     /// A request as the dispatch path receives it, before routing: every
     /// other field starts at its pre-dispatch default (the handler fills
     /// in the configured limits and the router's parameters). The one
@@ -111,6 +131,7 @@ impl LuaRequest {
     ) -> Self {
         Self {
             peer_addr,
+            tls: false,
             req,
             params: Vec::new(),
             id,
@@ -228,14 +249,36 @@ impl UserData for LuaRequest {
             }
             Ok(table)
         });
+        // An HTTP/1.1 request target is the path alone: the authority is
+        // the client-sent `Host` header, the scheme the listener's.
         fields.add_field_method_get("uri", |lua, req| {
             let table = lua.create_table()?;
             let uri = req.req.uri();
-            table.set("scheme", uri.scheme_str().unwrap_or_default())?;
-            table.set("host", uri.host().unwrap_or_default())?;
-            table.set("port", uri.port().map_or(0, |v| v.as_u16()))?;
+            let scheme = match uri.scheme_str() {
+                Some(scheme) => scheme,
+                None if req.tls => "https",
+                None => "http",
+            };
+            let authority = uri.authority().cloned().or_else(|| {
+                req.req
+                    .headers()
+                    .get(hyper::header::HOST)?
+                    .to_str()
+                    .ok()?
+                    .parse::<hyper::http::uri::Authority>()
+                    .ok()
+            });
+            let default_port = if scheme == "https" { 443 } else { 80 };
+            table.set("scheme", scheme)?;
+            table.set("host", authority.as_ref().map_or("", |a| a.host()))?;
+            table.set(
+                "port",
+                authority
+                    .as_ref()
+                    .map_or(0, |a| a.port_u16().unwrap_or(default_port)),
+            )?;
             table.set("path", uri.path())?;
-            table.set("authority", uri.authority().map_or("", |a| a.as_str()))?;
+            table.set("authority", authority.as_ref().map_or("", |a| a.as_str()))?;
             table.set("query", uri.query().unwrap_or_default())?;
             Ok(table)
         });
@@ -348,16 +391,7 @@ impl UserData for LuaRequest {
         // Repeated keys keep the last value, matching `req.query`.
         methods.add_async_method_mut("form", |lua, mut req, ()| async move {
             if req.cached_form.is_none() {
-                let body = match req.cached_body.clone() {
-                    Some(cached) => cached,
-                    None => req
-                        .req
-                        .body_mut()
-                        .collect()
-                        .await
-                        .into_lua_err()?
-                        .to_bytes(),
-                };
+                let body = req.whole_body().await?;
                 req.cached_form = Some(
                     url::form_urlencoded::parse(&body)
                         .map(|(k, v)| (k.into_owned(), v.into_owned()))
@@ -402,10 +436,7 @@ impl UserData for LuaRequest {
                 };
                 count += 1;
                 if count > limits.max_parts {
-                    return Err(mlua::Error::RuntimeError(format!(
-                        "multipart body has more than {} parts",
-                        limits.max_parts
-                    )));
+                    return Err(crate::multipart::too_many_parts(limits.max_parts));
                 }
                 let part = lua.create_userdata(crate::multipart::LuaPart::new(
                     field,
@@ -439,22 +470,11 @@ impl UserData for LuaRequest {
         );
 
         methods.add_async_method_mut("text", |lua, mut req, ()| async move {
-            if let Some(cached) = &req.cached_body {
-                return lua.create_string(cached);
-            }
-            let reader = req.req.body_mut();
-            let body = reader.collect().await.into_lua_err()?;
-            lua.create_string(body.to_bytes())
+            lua.create_string(req.whole_body().await?)
         });
 
         methods.add_async_method_mut("json", |lua, mut req, ()| async move {
-            let buf = match req.cached_body.clone() {
-                Some(cached) => cached,
-                None => {
-                    let reader = req.req.body_mut();
-                    reader.collect().await.into_lua_err()?.to_bytes()
-                }
-            };
+            let buf = req.whole_body().await?;
             if buf.is_empty() {
                 return Err(mlua::Error::external(
                     "Unexpected end of JSON input, probably request body is empty or already consumed",

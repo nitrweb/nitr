@@ -55,7 +55,7 @@ mod tests;
 mod upload;
 
 pub(crate) use part::LuaPart;
-pub(crate) use part::too_large;
+pub(crate) use part::{LimitExceeded, too_large, too_many_parts};
 pub use upload::{resolve_upload_path, safe_filename};
 
 /// What a fuzzed multipart walk observed: how many parts were admitted,
@@ -109,9 +109,7 @@ pub async fn consume_for_fuzzing(
     while let Some(mut field) = parser.next_field().await.into_lua_err()? {
         walk.parts += 1;
         if walk.parts > max_parts {
-            return Err(mlua::Error::RuntimeError(format!(
-                "multipart body has more than {max_parts} parts"
-            )));
+            return Err(too_many_parts(max_parts));
         }
         let mut read = 0u64;
         while let Some(chunk) = field.chunk().await.into_lua_err()? {

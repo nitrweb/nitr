@@ -23,7 +23,7 @@
 
 ## Overview
 
-Nitr serves HTTP requests with Lua 5.4 scripts. An application is two files: an optional `config.lua` that runs **once** at startup, and an `app.lua` that builds the application (routes and middleware) once per Lua state. The server keeps a fixed pool of independent Lua states (one per CPU core by default), so requests execute in parallel without locking, and every script runs under configurable safety limits (restricted stdlib, memory cap, execution timeout).
+Nitr serves HTTP requests with Lua 5.4 scripts. An application is two files: an optional `config.lua` that runs **once per build** of the Lua pool (at startup and on every reload), and an `app.lua` that builds the application (routes and middleware) once per Lua state. The server keeps a fixed pool of independent Lua states (one per CPU core by default), so requests execute in parallel without locking, and every script runs under configurable safety limits (restricted stdlib, memory cap, execution timeout).
 
 Everything Nitr exposes to Lua lives on one global namespace table, `nitr` — `nitr.app()`, `nitr.json`, `nitr.db`, `nitr.crypto`, and so on. Nitr registers no other globals, so scripts never collide with the Lua standard library, and your own Rust extensions mount on the same namespace under `nitr.ext.*` — separated from the standard library, so nothing Nitr ships can ever collide with your modules.
 
@@ -32,7 +32,7 @@ Nitr is both a **binary** (`nitr`, configured via `nitr.toml`) and a **library c
 ## Features
 
 - **Pool of Lua states over a multi-thread runtime:** one request per state, no global locks, natural backpressure.
-- **Safety by default**: `io`/`os` excluded from the stdlib (opt-in), 8 MiB memory limit per state, 30 s execution budget enforced by an instruction-count hook (stops `while true do end`) plus an async timeout, `require` confined to the scripts directory, no native Lua modules.
+- **Safety by default**: `io`/`os` excluded from the stdlib (opt-in), 8 MiB memory limit per state, 30 s execution budget enforced by an instruction-count hook (stops `while true do end`; `__gc` finalizers, which would run outside it, are refused) plus an async timeout, `require` confined to the scripts directory, no native Lua modules.
 - **One namespaced standard library:** `nitr.json`, `nitr.fetch` (HTTP client with SSRF policy, opt-in retries and a per-request outbound budget), `nitr.template` (minijinja), `nitr.db` (SQLite in WAL mode, runs off the async threads), `nitr.cache` (bounded, shared across states), `nitr.log`, `nitr.crypto`/`nitr.auth`, `nitr.dbg`.
 - **Data you can deploy:** SQLite with WAL, a busy timeout and foreign keys on by default; plain-SQL migrations applied by `nitr migrate` and a server that refuses to start with a pending one.
 - **Rust-side routing (`nitr.app()`):** path parameters, middleware chains composed once at load, per-app error handler, 404/405 answered without entering Lua.
@@ -123,13 +123,13 @@ return app
 
 ### The configuration script (optional)
 
-Runs exactly **once** at startup, before requests are served. Use it for setup (e.g. schema migrations); the returned table is available to handlers as `nitr.cfg`. It must return plain data (tables, strings, numbers, booleans) — it is snapshotted and shared with every Lua state. The database connection arrives as the script's vararg.
+Runs **once per build** of the Lua pool: at startup, before requests are served, and again on every reload (`SIGHUP`, `nitr reload`, and each save in dev mode). Keep it idempotent (`CREATE TABLE IF NOT EXISTS`, not a bare `INSERT`); the returned table is available to handlers as `nitr.cfg`. It must return plain data (tables, strings, numbers, booleans) — it is snapshotted and shared with every Lua state. The database connection arrives as the script's vararg.
 
 ```lua
 -- scripts/config.lua
 local db = ...
 db:execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)")
-return { started_at = os.date("%Y-%m-%dT%H:%M:%S") }
+return { started_at = nitr.time.iso8601(nitr.time.now()) }
 ```
 
 ## Lua API
@@ -186,7 +186,7 @@ The `nitr.*` standard library provides building blocks — enable the features y
 | Module | Description |
 | --- | --- |
 | `nitr.json:encode(v)` / `nitr.json:decode(s)` | JSON codec (serde); callable as the response helper above |
-| `nitr.fetch(method, url, opts?)` → `client:send()` | HTTP client (shared pool, timeouts, SSRF policy with a guarded resolver, per-hop redirect checks, opt-in `retry = { attempts, backoff }` on idempotent methods, per-request outbound budget). Response: `.status`, `.headers`, `.url`, `:text()`, `:json()`, `:read()` |
+| `nitr.fetch(method, url, opts?)` → `client:send()` | HTTP client (shared pool, timeouts, SSRF policy with a guarded resolver, per-hop redirect checks, opt-in `retry = { attempts, backoff }` on idempotent methods, per-request outbound budget). Response: `.status`, `.headers`, `.raw_headers`, `.url`, `:text()`, `:json()`, `:read()` |
 | `nitr.cache:get/set/delete/clear/remember/stats` | Bounded TTL+LRU cache shared by every state. Entries are plain data, so no Lua value crosses between states; per-process, so not a session store |
 | `nitr.await_all(h1, h2, ...)` | Run several `fetch` (or `query_async`) handles concurrently, capped by `fetch.max_concurrent` |
 | `nitr.template:render(name, data?)` | minijinja templates from `[templating] dir` |

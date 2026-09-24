@@ -29,7 +29,12 @@ end)
 
 app:post("/echo-form", function(req)
     local form = req:form()
-    return nitr.json({ email = form.email, note = form.note })
+    return nitr.json({ email = form.email, note = form.note, raw = req:text() })
+end)
+
+app:post("/text-then-json", function(req)
+    local raw = req:text()
+    return nitr.json({ raw = raw, name = req:json().name })
 end)
 
 -- Reads the body in bounded chunks rather than all at once, so a body
@@ -423,6 +428,27 @@ async fn form_and_multipart_bodies_are_parsed_in_rust() {
     let body: serde_json::Value = resp.json().await.expect("json");
     assert_eq!(body["email"], "a@b.com");
     assert_eq!(body["note"], "hello there!");
+    assert_eq!(
+        body["raw"], "email=a%40b.com&note=hello+there%21",
+        "the body stays readable after req:form()"
+    );
+
+    let body: serde_json::Value = srv
+        .client()
+        .post(srv.url("/text-then-json"))
+        .header("content-type", "application/json")
+        .body(r#"{"name":"ann"}"#)
+        .send()
+        .await
+        .expect("json body")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(body["raw"], r#"{"name":"ann"}"#);
+    assert_eq!(
+        body["name"], "ann",
+        "the body stays readable after req:text()"
+    );
 
     // multipart: one ordinary field and one file.
     // Large enough that buffering it into the Lua heap would be a visible
@@ -808,6 +834,301 @@ return app
         "a rejected upload must not leave a truncated file behind"
     );
 
+    // A rejected upload over an existing file leaves that file as it was.
+    let body: serde_json::Value = post(multipart(&[("doc", Some("small.bin"), vec![b'x'; 1025])]))
+        .send()
+        .await
+        .expect("oversized overwrite")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(body["ok"], false, "got: {body}");
+    assert_eq!(
+        std::fs::read(uploads.join("small.bin")).expect("still there"),
+        vec![b'z'; 1024],
+        "a rejected upload must not destroy the file it would have replaced"
+    );
+
+    // An accepted upload still replaces it.
+    let body: serde_json::Value = post(multipart(&[("doc", Some("small.bin"), vec![b'y'; 8])]))
+        .send()
+        .await
+        .expect("overwrite")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(body["ok"], true, "got: {body}");
+    assert_eq!(
+        std::fs::read(uploads.join("small.bin")).expect("replaced"),
+        vec![b'y'; 8]
+    );
+    let left: Vec<_> = std::fs::read_dir(&uploads)
+        .expect("uploads")
+        .map(|entry| entry.expect("entry").file_name())
+        .filter(|name| name != ".nitr-tmp")
+        .collect();
+    assert_eq!(left, ["small.bin"]);
+    let staged = std::fs::read_dir(uploads.join(".nitr-tmp")).map_or(0, |e| e.count());
+    assert_eq!(staged, 0, "no temporary file may be left behind");
+
+    srv.stop().await;
+}
+
+/// Requests that need no Lua are routed before a state is checked out: a
+/// static file, the SPA page and an `OPTIONS` answer while the only state
+/// is busy. A route for another method does not hide a static file from
+/// `GET`, but a path a route knows keeps its 405: the SPA fallback is for
+/// unknown paths only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn static_files_and_unrouted_answers_need_no_lua_state() {
+    let b = TestServer::builder("standards-routing-first")
+        .handler(
+            r#"
+local app = nitr.app()
+app:post("/slow", function(req)
+    while req:read(8192) do end
+    return nitr.text("read")
+end)
+app:post("/contact", function(req) return nitr.text("posted") end)
+return app
+"#,
+        )
+        .builtins(nitr::Builtins::HTTP);
+    b.dir().write("public/data.txt", "static bytes");
+    b.dir().write("public/index.html", "<p>spa</p>");
+    b.dir()
+        .write("public/contact/index.html", "<p>contact form</p>");
+    let public = b.dir().join("public");
+    let mut srv = b
+        .config(move |cfg| {
+            cfg.workers = 1;
+            cfg.static_files.dir = Some(public);
+            cfg.static_files.spa = true;
+            cfg.limits.pool_wait_ms = 200;
+            cfg.limits.body_read_ms = 10_000;
+            cfg.lua.exec_timeout_ms = 10_000;
+        })
+        .spawn()
+        .await;
+
+    // The only state, held by a body that never finishes arriving.
+    let mut sock = tokio::net::TcpStream::connect(srv.addr())
+        .await
+        .expect("connect");
+    sock.write_all(b"POST /slow HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100000\r\n\r\nabc")
+        .await
+        .expect("write");
+    for _ in 0..100 {
+        if srv.pool().available() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        srv.pool().available(),
+        0,
+        "the slow request holds the state"
+    );
+
+    let resp = srv.get("/data.txt").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.expect("body"), "static bytes");
+    let resp = srv.get("/missing").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.expect("body"), "<p>spa</p>");
+    let resp = srv.get("/slow").await;
+    assert_eq!(resp.status(), 405, "a known path is not an SPA miss");
+    assert_eq!(resp.headers()["allow"], "OPTIONS, POST");
+    let resp = srv
+        .client()
+        .request(reqwest::Method::OPTIONS, srv.url("/contact"))
+        .send()
+        .await
+        .expect("options");
+    assert_eq!(resp.status(), 204);
+
+    drop(sock);
+    let resp = srv.get("/contact").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.expect("body"), "<p>contact form</p>");
+    let resp = srv
+        .client()
+        .post(srv.url("/contact"))
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(resp.text().await.expect("body"), "posted");
+    srv.stop().await;
+}
+
+/// A multipart limit the handler does not catch is answered 413, like
+/// `[limits] max_body_bytes`, not as a handler failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_uncaught_multipart_limit_is_a_413() {
+    let mut srv = builder()
+        .config(|cfg| {
+            cfg.limits.max_form_parts = 1;
+            cfg.limits.max_field_bytes = 8;
+        })
+        .spawn()
+        .await;
+    let boundary = "----nitrlimit413";
+    let part = |name: &str, value: &str| {
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+        )
+    };
+    for body in [
+        format!("{}{}--{boundary}--\r\n", part("a", "1"), part("b", "2")),
+        format!("{}--{boundary}--\r\n", part("a", "0123456789")),
+    ] {
+        let resp = srv
+            .client()
+            .post(srv.url("/upload"))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await
+            .expect("post");
+        assert_eq!(resp.status(), 413);
+    }
+    srv.stop().await;
+}
+
+/// A save in flight writes under the upload root's spool, which the next
+/// boot sweeps: a process killed mid-save leaves nothing beside the
+/// target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_save_in_flight_stages_under_the_swept_spool() {
+    let b = TestServer::builder("standards-multipart-staged-save")
+        .handler(
+            r#"
+local app = nitr.app()
+app:post("/upload", function(req)
+    req:multipart(function(part) part:save(part.safe_filename) end)
+    return "saved"
+end)
+return app
+"#,
+        )
+        .builtins(nitr::Builtins::HTTP)
+        .upload_dir();
+    let uploads = b.dir().join("uploads");
+    let mut srv = b.spawn().await;
+
+    let boundary = "----nitrstagedsave";
+    let mut sock = tokio::net::TcpStream::connect(srv.addr())
+        .await
+        .expect("connect");
+    sock.write_all(
+        format!(
+            "POST /upload HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: multipart/form-data; boundary={boundary}\r\n\
+             Content-Length: 100000\r\n\r\n--{boundary}\r\nContent-Disposition: \
+             form-data; name=\"doc\"; filename=\"doc.bin\"\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .expect("write head");
+    sock.write_all(&[b'z'; 512]).await.expect("write part");
+
+    let spool = uploads.join(".nitr-tmp");
+    let mut staged = 0;
+    for _ in 0..100 {
+        staged = std::fs::read_dir(&spool).map_or(0, |entries| entries.count());
+        if staged > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(staged, 1, "the partial file is staged in the spool");
+    let beside: Vec<_> = std::fs::read_dir(&uploads)
+        .expect("uploads")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert_eq!(
+        beside,
+        [".nitr-tmp"],
+        "nothing is written beside the target"
+    );
+    drop(sock);
+    srv.stop().await;
+}
+
+/// A `part:save` cut off by the execution budget while the client stalls
+/// mid-part is dropped, not failed: its partial file must still go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_save_dropped_by_the_budget_leaves_nothing_behind() {
+    let b = TestServer::builder("standards-multipart-dropped-save")
+        .handler(
+            r#"
+local app = nitr.app()
+app:post("/upload", function(req)
+    req:multipart(function(part) part:save(part.safe_filename) end)
+    return "saved"
+end)
+return app
+"#,
+        )
+        .builtins(nitr::Builtins::HTTP)
+        .config(|cfg| {
+            cfg.workers = 1;
+            cfg.lua.exec_timeout_ms = 300;
+            cfg.limits.pool_wait_ms = 300;
+            cfg.limits.body_read_ms = 10_000;
+        })
+        .upload_dir();
+    let uploads = b.dir().join("uploads");
+    let mut srv = b.spawn().await;
+
+    let boundary = "----nitrdroppedsave";
+    let head = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"doc\"; \
+         filename=\"doc.bin\"\r\n\r\n"
+    );
+    let mut sock = tokio::net::TcpStream::connect(srv.addr())
+        .await
+        .expect("connect");
+    sock.write_all(
+        format!(
+            "POST /upload HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: multipart/form-data; boundary={boundary}\r\n\
+             Content-Length: 100000\r\n\r\n{head}"
+        )
+        .as_bytes(),
+    )
+    .await
+    .expect("write head");
+    sock.write_all(&[b'z'; 512]).await.expect("write part");
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut response))
+        .await
+        .expect("the budget answers the stalled request")
+        .expect("read");
+    assert!(
+        String::from_utf8_lossy(&response).starts_with("HTTP/1.1 500"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    let mut left = Vec::new();
+    for _ in 0..100 {
+        left = std::fs::read_dir(&uploads)
+            .expect("uploads")
+            .chain(std::fs::read_dir(uploads.join(".nitr-tmp")).expect("spool"))
+            .map(|entry| entry.expect("entry").file_name())
+            .filter(|name| name != ".nitr-tmp")
+            .collect();
+        if left.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(left.is_empty(), "left behind: {left:?}");
     srv.stop().await;
 }
 

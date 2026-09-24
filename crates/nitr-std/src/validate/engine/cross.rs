@@ -154,7 +154,7 @@ impl Ctx<'_> {
                 if value.is_nil() {
                     continue;
                 }
-                let canon = canonical(self.lua, &value)?;
+                let canon = canonical(&value)?;
                 match &first {
                     None => first = Some((name.clone(), canon)),
                     Some((other, expected)) if *expected != canon => {

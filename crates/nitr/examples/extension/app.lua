@@ -26,7 +26,11 @@ app:put("/inventory/:item", function(req)
     if not delta then
         return nitr.error(400, { code = "NOT_A_NUMBER" })
     end
-    local count = nitr.ext.kv.add(req.params.item, delta)
+    -- The module refuses an overflow with an ordinary Lua error.
+    local ok, count = pcall(nitr.ext.kv.add, req.params.item, delta)
+    if not ok then
+        return nitr.error(422, { code = "OUT_OF_RANGE" })
+    end
     nitr.log.info("inventory updated", { item = req.params.item, count = count })
     return nitr.json({ item = req.params.item, count = count })
 end)

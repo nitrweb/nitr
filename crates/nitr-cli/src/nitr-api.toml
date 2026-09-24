@@ -33,7 +33,7 @@ fields = [
   { name = "headers", type = "table<string, string>", desc = "Request headers, lowercase names." },
   { name = "id", type = "string", desc = "The request id (UUIDv7, echoed as `X-Request-ID`)." },
   { name = "remote_addr", type = "string", desc = "Peer address (`\"ip:port\"`)." },
-  { name = "uri", type = "table", desc = "URI components: `scheme`, `host`, `port`, `path`, `authority`, `query`." },
+  { name = "uri", type = "table", desc = "URI components: `scheme`, `host`, `port`, `path`, `authority`, `query`. An HTTP/1.1 request carries only the path, so `authority`, `host` and `port` come from the client-sent `Host` header (`port` is the scheme's default when it names none) and `scheme` from the listener (`https` under `[tls]`)." },
   { name = "cookies", type = "nitr.RequestCookies", desc = "Parsed request cookies." },
   { name = "valid", type = "table|nil", desc = "The route's validated input — `{ body, query, params, headers }` as its `input` declaration coerced, stripped and normalized them; nil on routes without `input`." },
 ]
@@ -56,7 +56,7 @@ returns = [{ type = "table<string, string>" }]
 [[fn]]
 name = "nitr.Request:multipart"
 feature = "http"
-desc = "Invokes `fn(part)` once per part of a `multipart/form-data` body, in arrival order; returns the part count. (Needs the `multipart` Cargo feature.)"
+desc = "Invokes `fn(part)` once per part of a `multipart/form-data` body, in arrival order; returns the part count. A `[limits]` bound a part crosses (`max_form_parts`, `max_field_bytes`, `max_file_bytes`) raises; uncaught, it answers 413. (Needs the `multipart` Cargo feature.)"
 params = [{ name = "fn", type = "fun(part: nitr.Part)" }]
 returns = [{ type = "integer", desc = "Number of parts seen." }]
 
@@ -209,7 +209,7 @@ params = [{ name = "handler", type = "fun(err: table, req: nitr.Request): nitr.R
 
 [[fn]]
 name = "nitr.App:static"
-desc = "Mounts a static directory, served in Rust. Options: `{ spa = boolean, cache_control = string, dotfiles = boolean }` — dotfiles are hidden unless `dotfiles = true` (`.well-known/` is always served)."
+desc = "Mounts a static directory, served in Rust without a Lua state. Routes win: the mount answers a GET or HEAD for a path no route serves with that method. Options: `{ spa = boolean, cache_control = string, dotfiles = boolean }` — dotfiles are hidden unless `dotfiles = true` (`.well-known/` is always served)."
 params = [
   { name = "mount", type = "string" },
   { name = "dir", type = "string" },
@@ -233,7 +233,7 @@ returns = [{ type = "string" }]
 
 [[fn]]
 name = "nitr.Part:save"
-desc = "Streams a file part to `path` without entering the Lua heap; returns the bytes written."
+desc = "Streams a file part to `path` without entering the Lua heap; returns the bytes written. An existing file at `path` is replaced only once the whole part is written."
 params = [{ name = "path", type = "string" }]
 returns = [{ type = "integer" }]
 
@@ -256,7 +256,8 @@ name = "nitr.FetchResponse"
 desc = "An outbound response."
 fields = [
   { name = "status", type = "integer", desc = "HTTP status code." },
-  { name = "headers", type = "table<string, string>", desc = "Response headers." },
+  { name = "headers", type = "table<string, string>", desc = "Response headers, lowercase names: the last value of a repeated one, as the bytes the upstream sent." },
+  { name = "raw_headers", type = "table[]", desc = "`{ name, value }` pairs in order, repeats included (every `Set-Cookie`)." },
   { name = "url", type = "string", desc = "Final URL after redirects." },
 ]
 
@@ -290,7 +291,7 @@ returns = [
 
 [[fn]]
 name = "nitr.Schema:partial"
-desc = "A copy with every top-level field optional — the PATCH body of a POST schema."
+desc = "A copy with every top-level field optional and no defaults filled in — the PATCH body of a POST schema, which must not reset what it omits."
 returns = [{ type = "nitr.Schema" }]
 
 [[fn]]
@@ -378,7 +379,7 @@ desc = "A database transaction handle inside `nitr.db:transaction`; same query A
 [[fn]]
 name = "nitr.json"
 feature = "json"
-desc = "As a function: a JSON response (`nitr.json({ ok = true })`). Also the codec: `nitr.json:encode(v)` / `nitr.json:decode(s)`."
+desc = "As a function: a JSON response (`nitr.json({ ok = true })`). Also the codec: `nitr.json:encode(v)` / `nitr.json:decode(s)`. A table whose keys are `1..n` (holes as `null`) is an array; one mixing list items and named keys has no JSON shape and raises, here and wherever a value is serialized (cache, session, JWT, templates)."
 params = [
   { name = "value", type = "any" },
   { name = "status", type = "integer?", desc = "Status code (default 200)." },
@@ -429,10 +430,10 @@ returns = [{ type = "nitr.Response" }]
 [[fn]]
 name = "nitr.negotiate"
 feature = "http"
-desc = "Picks the offer whose media type best matches the `Accept` header; function values are called with the request. No match answers 406."
+desc = "Picks the offer whose media type best matches the `Accept` header; function values are called with the request. No match answers 406. Offers are a list `{ { type, value }, ... }`, where a tie goes to the earlier entry, or a map `{ [type] = value }`, where it goes to the type that sorts first."
 params = [
   { name = "req", type = "nitr.Request" },
-  { name = "offers", type = "table<string, any>" },
+  { name = "offers", type = "table" },
 ]
 returns = [{ type = "any" }]
 
@@ -506,7 +507,7 @@ returns = [{ type = "any" }]
 [[fn]]
 name = "nitr.fetch"
 feature = "fetch"
-desc = "An outbound HTTP request (SSRF-guarded, redirect-checked). Options: `headers`, `query`, `json`, `body`, `timeout`, `retry`. Returns an unsent handle."
+desc = "An outbound HTTP request (SSRF-guarded, redirect-checked). Options: `headers`, `query`, `json`, `body`, `timeout`, `retry`. Returns an unsent handle. `retry = { attempts, backoff }` repeats an idempotent request after a network failure or a retryable status, never after a refusal by the `[fetch]` policy."
 params = [
   { name = "method", type = "string" },
   { name = "url", type = "string" },
@@ -517,7 +518,7 @@ returns = [{ type = "nitr.FetchHandle" }]
 [[fn]]
 name = "nitr.await_all"
 feature = "fetch"
-desc = "Runs fetch handles (and `db:query_async` handles) concurrently, passed as separate arguments (`nitr.await_all(h1, h2)`), and returns their results as multiple values in the same order. Capped by `[fetch] max_concurrent`."
+desc = "Runs fetch handles (and `db:query_async` handles) concurrently, passed as separate arguments (`nitr.await_all(h1, h2)`), and returns their results as multiple values in the same order. At most `[fetch] max_concurrent` run at a time; the rest wait their turn."
 params = [{ name = "...", type = "nitr.FetchHandle|table" }]
 returns = [{ type = "..." }]
 
@@ -532,9 +533,9 @@ methods = [
 [[table]]
 name = "nitr.db"
 feature = "db"
-desc = "The SQLite database (`database` in nitr.toml): WAL, busy timeout, foreign keys on."
+desc = "The SQLite database (`database` in nitr.toml): WAL, busy timeout, foreign keys on. A row is a column→value table, so a query whose result columns share a name raises (alias one with `AS`)."
 methods = [
-  { name = "execute", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "integer", desc = "Affected row count." }], desc = "Runs a statement." },
+  { name = "execute", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?", desc = "Positional values; `nil` (anywhere, trailing included) and JSON `null` bind NULL. A table from `table.pack` counts to its `n`, which is also how a lone NULL is passed (`{ n = 1 }`): an empty list is not padded, so a statement called without its parameters fails." }], returns = [{ type = "integer", desc = "Affected row count." }], desc = "Runs a statement." },
   { name = "query", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "table[]" }], desc = "All rows, each a column→value table. A result larger than `[database] max_rows` (default 10000) raises rather than truncating." },
   { name = "query_row", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "table|nil" }], desc = "The first row as a column→value table, or nil when the query returns no rows." },
   { name = "query_one", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "table" }], desc = "The row of a query that must return exactly one row (a column→value table); raises when it returns none or more than one." },
@@ -596,7 +597,7 @@ feature = "cache"
 desc = "The bounded TTL+LRU cache shared by every state. Entries are plain data; per-process, so not a session store."
 methods = [
   { name = "get", params = [{ name = "key", type = "string" }], returns = [{ type = "any" }], desc = "The cached value, or nil." },
-  { name = "set", params = [{ name = "key", type = "string" }, { name = "value", type = "any" }, { name = "opts", type = "table?" }], desc = "Stores a value; `opts` is `{ ttl = seconds }`." },
+  { name = "set", params = [{ name = "key", type = "string" }, { name = "value", type = "any" }, { name = "opts", type = "table?" }], desc = "Stores a value; `opts` is `{ ttl = seconds }` (`0` never expires, as `[cache] default_ttl`). Setting `nil` removes the key." },
   { name = "delete", params = [{ name = "key", type = "string" }], returns = [{ type = "boolean" }], desc = "Removes a key; whether it was there." },
   { name = "clear", desc = "Empties the cache." },
   { name = "remember", params = [{ name = "key", type = "string" }, { name = "opts", type = "table|fun(): any" }, { name = "fn", type = "fun(): any|nil" }], returns = [{ type = "any" }], desc = "The cached value, or `fn()`'s result, stored and returned. Call as `remember(key, fn)` or `remember(key, { ttl = seconds }, fn)`." },
@@ -634,7 +635,7 @@ functions = [
   { name = "text_file", params = [{ name = "opts", type = "table?" }], returns = [{ type = "table" }], desc = "A `file` rule preset: txt, csv, md, json, xml, yaml; UTF-8 required; `max_bytes = \"1mb\"`." },
   { name = "archive", params = [{ name = "opts", type = "table?" }], returns = [{ type = "table" }], desc = "A `file` rule preset: zip, gzip, tar, bz2, xz, zstd, 7z; `max_bytes = \"50mb\"`." },
   { name = "audio", params = [{ name = "opts", type = "table?" }], returns = [{ type = "table" }], desc = "A `file` rule preset: mp3, wav, ogg, flac, m4a; `max_bytes = \"50mb\"`." },
-  { name = "video", params = [{ name = "opts", type = "table?" }], returns = [{ type = "table" }], desc = "A `file` rule preset: mp4, mov, webm, mkv; `max_bytes = \"500mb\"` (above the default `[limits] max_file_bytes`)." },
+  { name = "video", params = [{ name = "opts", type = "table?" }], returns = [{ type = "table" }], desc = "A `file` rule preset: mp4, mov, webm, mkv; `max_bytes = \"500mb\"` (above the default `[limits] max_file_bytes`, which still caps it)." },
   { name = "font", params = [{ name = "opts", type = "table?" }], returns = [{ type = "table" }], desc = "A `file` rule preset: woff, woff2, ttf, otf; `max_bytes = \"5mb\"`." },
   { name = "any_file", params = [{ name = "opts", type = "table", desc = "`max_bytes` required." }], returns = [{ type = "table" }], desc = "A `file` rule accepting any type; executables are still refused." },
 ]

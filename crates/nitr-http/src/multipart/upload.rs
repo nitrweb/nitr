@@ -74,10 +74,8 @@ pub async fn resolve_upload_path(root: &std::path::Path, rel: &str) -> mlua::Res
         )));
     }
 
-    // The final component is checked with `symlink_metadata` (which
-    // does not follow) *before* the open, because `File::create`
-    // truncates whatever it lands on: a link checked afterwards has
-    // already been written through.
+    // `symlink_metadata` does not follow the final component, so a link
+    // planted in the upload root is refused rather than written through.
     let target = canonical_parent.join(&name);
     match tokio::fs::symlink_metadata(&target).await {
         Ok(meta) if meta.file_type().is_symlink() => Err(mlua::Error::RuntimeError(format!(

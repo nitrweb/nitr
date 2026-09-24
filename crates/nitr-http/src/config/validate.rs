@@ -85,6 +85,22 @@ impl Config {
                 )));
             }
         }
+        // mlua enforces the allocator limit only above zero (memory.rs),
+        // so 0 would silently lift the cap on every state.
+        if self.lua.memory_limit == 0 {
+            return Err(Error::Config(
+                "[lua] memory_limit = 0 removes the per-state memory cap: set a size in \
+                 bytes (default 8388608)"
+                    .into(),
+            ));
+        }
+        if self.max_streams == Some(0) {
+            return Err(Error::Config(
+                "max_streams = 0 refuses every streaming response, after its handler has \
+                 already run: remove it for the default (workers - 1), or set it to 1 or more"
+                    .into(),
+            ));
+        }
         if let Some(max_streams) = self.max_streams
             && max_streams > self.workers.max(1)
         {
@@ -164,6 +180,26 @@ impl Config {
             }
         }
         self.validate_paths()
+    }
+
+    /// The warning for streams that can hold every state, when they can.
+    ///
+    /// A stream keeps its state until it ends: with a slot for every
+    /// state, open streams leave none for anything else, and every other
+    /// request waits `pool_wait_ms` and gets a 503. The default is that
+    /// case on a single worker. Given when the server starts serving, not
+    /// in [`warnings`](Self::warnings): `nitr openapi` builds on one worker
+    /// and never serves.
+    pub(crate) fn streams_warning(&self) -> Option<String> {
+        (self.effective_max_streams() >= self.workers.max(1)).then(|| {
+            format!(
+                "max_streams = {} allows a streaming response on every one of the {} Lua \
+                 state(s): while that many streams are open, every other request waits \
+                 [limits] pool_wait_ms and gets a 503; raise workers or lower max_streams",
+                self.effective_max_streams(),
+                self.workers.max(1)
+            )
+        })
     }
 
     /// Configurations that are legal but suspicious, as values.

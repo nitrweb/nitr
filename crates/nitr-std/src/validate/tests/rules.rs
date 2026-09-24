@@ -391,3 +391,36 @@ fn cidr_prefixes_are_canonical() {
         assert!(!Format::Cidr.check(bad), "{bad}");
     }
 }
+
+/// JSON arrays and objects both arrive as Lua tables: the rule checks the
+/// key shape, or `{"tags":{"admin":true}}` passes as an empty array.
+#[tokio::test]
+async fn arrays_and_tables_check_their_key_shape() {
+    let lua = Lua::new();
+    let s = schema(
+        &lua,
+        r#"{ tags = { "array", items = "string" }, addr = { type = "table", fields = { city = "string" } } }"#,
+    );
+    let (_, err) = check(&lua, &s, r#"{ tags = { admin = true } }"#).await;
+    assert_eq!(field(&err, "tags"), "must be a list");
+    let (_, err) = check(&lua, &s, r#"{ tags = { "a", x = 1 } }"#).await;
+    assert_eq!(field(&err, "tags"), "must be a list");
+    let (_, err) = check(&lua, &s, r#"{ addr = { "Paris" } }"#).await;
+    assert_eq!(field(&err, "addr"), "must be an object");
+    let (_, err) = check(&lua, &s, r#"{ tags = {}, addr = {} }"#).await;
+    assert!(err.is_nil(), "empty is both: {err:?}");
+    let (_, err) = check(&lua, &s, r#"{ tags = { "a" }, addr = { city = "Paris" } }"#).await;
+    assert!(err.is_nil(), "{err:?}");
+}
+
+/// Integers above 2^53 do not survive a trip through `f64`: two distinct
+/// ids must stay distinct, while `1` and `1.0` stay equal.
+#[tokio::test]
+async fn unique_keeps_large_integers_apart() {
+    let lua = Lua::new();
+    let s = schema(&lua, r#"{ ids = { "array|unique", items = "number" } }"#);
+    let (_, err) = check(&lua, &s, "{ ids = { 9007199254740993, 9007199254740992 } }").await;
+    assert!(err.is_nil(), "{err:?}");
+    let (_, err) = check(&lua, &s, "{ ids = { 1, 1.0 } }").await;
+    assert_eq!(field(&err, "ids"), "must not contain duplicates");
+}

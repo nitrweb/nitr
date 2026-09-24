@@ -34,7 +34,7 @@ async fn main() -> nitr::Result {
     Server::builder()
         .listen(([127, 0, 0, 1], port).into())
         .handler_script("crates/nitr/examples/static-site/app.lua")
-        .builtins(Builtins::JSON | Builtins::HTTP | Builtins::LOG)
+        .builtins(Builtins::JSON | Builtins::HTTP | Builtins::LOG | Builtins::TIME)
         .build()
         .await?
         .serve()

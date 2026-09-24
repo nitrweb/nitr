@@ -102,3 +102,20 @@ async fn a_compiled_schema_nests_as_a_table_rule() {
     assert_eq!(field(&err, "user.email"), "is required");
     assert_eq!(field(&err, "users[1].email"), "must be an email address");
 }
+
+/// A PATCH body omits what it does not change: a default filled in would
+/// overwrite the stored value.
+#[tokio::test]
+async fn partial_schemas_fill_no_defaults() {
+    let lua = Lua::new();
+    let base = schema(
+        &lua,
+        r#"{ title = "string|required", status = "string|default:draft" }"#,
+    );
+    let partial: mlua::AnyUserData = base.call_method("partial", ()).unwrap();
+    let (data, err) = check(&lua, &partial, r#"{ title = "x" }"#).await;
+    assert!(err.is_nil(), "{err:?}");
+    assert!(data_table(data).get::<Value>("status").unwrap().is_nil());
+    let (data, _) = check(&lua, &base, r#"{ title = "x" }"#).await;
+    assert_eq!(data_table(data).get::<String>("status").unwrap(), "draft");
+}

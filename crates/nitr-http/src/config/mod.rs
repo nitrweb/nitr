@@ -44,8 +44,9 @@ pub struct Config {
     /// handlers.
     pub workers: usize,
     /// Maximum concurrent streaming responses (each holds a pooled state
-    /// for its whole lifetime). Defaults to `workers - 1` (at least 1) so
-    /// idle streams cannot pin the entire pool.
+    /// for its whole lifetime). Defaults to `workers - 1`, so idle streams
+    /// cannot pin the entire pool; with one worker that is still 1, and
+    /// startup warns that one stream then holds the only state.
     pub max_streams: Option<usize>,
     /// Development mode: hot-reload the handler script on change.
     pub dev_mode: bool,
@@ -141,6 +142,23 @@ impl Default for Config {
 }
 
 impl Config {
+    /// `[shutdown] readiness_delay`, or its default (see there).
+    pub(crate) fn readiness_delay(&self) -> std::time::Duration {
+        let probes_on_main = self.health.enabled && self.health.bind.is_none();
+        let secs = match self.shutdown.readiness_delay {
+            Some(secs) => secs,
+            None if probes_on_main && !self.dev_mode => 5,
+            None => 0,
+        };
+        std::time::Duration::from_secs(secs)
+    }
+
+    /// `max_streams`, or its default: `workers - 1`, at least 1.
+    pub(crate) fn effective_max_streams(&self) -> usize {
+        self.max_streams
+            .unwrap_or_else(|| self.workers.max(1).saturating_sub(1).max(1))
+    }
+
     /// Loads the configuration from a TOML file.
     pub fn from_file(path: &Path) -> Result<Self> {
         let data = std::fs::read_to_string(path).map_err(|err| {

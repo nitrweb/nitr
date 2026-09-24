@@ -8,7 +8,8 @@
 //!
 //! Generation ignores `[openapi] enabled`: the flags gate serving, not
 //! generation. The build is the one `nitr check` performs, so the
-//! configuration script runs once here too.
+//! configuration script runs once here too, against a scratch database
+//! migrated like the live one.
 
 #[cfg(feature = "openapi")]
 use std::path::Path;
@@ -19,6 +20,9 @@ use anyhow::Context as _;
 use anyhow::bail;
 
 use nitr::Config;
+
+#[cfg(feature = "openapi")]
+use crate::cmd::scratch_db::ScratchDb;
 
 /// What `nitr openapi` was asked to do.
 #[derive(Debug, Default)]
@@ -75,11 +79,21 @@ pub(crate) async fn run(cfg: Config, args: OpenapiArgs) -> anyhow::Result<Outcom
         refuse_bad_site_dir(dir)?;
     }
 
-    let cfg = Config {
+    let mut cfg = Config {
         workers: 1,
         dev_mode: false,
         ..cfg
     };
+    // The document is the routes, never the data: the build runs against a
+    // private, migrated copy of the schema, so a fresh CI checkout needs no
+    // database and the application's own is never created or read.
+    let _scratch = cfg.database.as_mut().map(|db| {
+        let scratch = ScratchDb::new("openapi");
+        db.path = scratch.path().to_path_buf();
+        scratch
+    });
+    #[cfg(feature = "db")]
+    crate::cmd::scratch_db::migrate(&cfg).await?;
     let server = Server::builder()
         .config(cfg)
         .build()
