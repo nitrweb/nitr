@@ -84,3 +84,21 @@ async fn serves_lua_handlers_end_to_end() {
     // Graceful shutdown.
     server.stop().await;
 }
+
+/// A loop at file scope in the handler script fails the build under the
+/// execution budget instead of hanging the boot, `nitr check` or a reload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_loop_at_file_scope_fails_the_build_within_the_budget() {
+    let mut builder = TestServer::builder("server-load-budget")
+        .handler("local app = nitr.app()\nwhile true do end\nreturn app")
+        .config(|cfg| {
+            cfg.lua.exec_timeout_ms = 200;
+            cfg.limits.pool_wait_ms = 200;
+        });
+    let err = tokio::time::timeout(std::time::Duration::from_secs(10), builder.try_build())
+        .await
+        .expect("the build must end")
+        .expect_err("must not build")
+        .to_string();
+    assert!(err.contains("time budget"), "{err}");
+}

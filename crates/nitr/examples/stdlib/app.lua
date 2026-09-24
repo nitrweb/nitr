@@ -19,7 +19,7 @@ end)
 -- Crypto primitives: hashing, HMAC, and OS randomness.
 app:get("/token", function(req)
     local token = nitr.crypto.sha256(nitr.crypto.random_bytes(32))
-    local mac = nitr.crypto.hmac_sha256("server-secret", token)
+    local mac = nitr.crypto.hmac_sha256(nitr.cfg.mac_secret, token)
     return nitr.json({ token = token, mac = mac })
 end)
 
@@ -126,16 +126,16 @@ end)
 app:post("/jwt", function(req)
     local token = nitr.crypto.jwt.sign(
         { sub = "ada", exp = nitr.time.now() + 3600 },
-        "jwt-demo-secret"
+        nitr.cfg.jwt_secret
     )
-    local claims, why = nitr.crypto.jwt.verify(token, "jwt-demo-secret", {
+    local claims, why = nitr.crypto.jwt.verify(token, nitr.cfg.jwt_secret, {
         algorithms = { "HS256" },
     })
     return nitr.json({ token = token, sub = claims and claims.sub, error = why })
 end)
 
 -- Stateless sessions: the whole session travels in a signed cookie.
-local SESSION = { secret = "session-demo-secret-0123" }
+local SESSION = { secret = nitr.cfg.session_secret }
 
 app:post("/login", function(req)
     local session = nitr.session(req, SESSION)

@@ -65,7 +65,7 @@ fn jwt_reject(lua: &Lua, reason: &str) -> mlua::Result<(Value, Value)> {
 /// It enforces the signature, the mandatory `algorithms` allow-list, and
 /// `exp`/`nbf`. It checks **no registered claim beyond those**, and the
 /// omissions are invisible at the call site, so they are written down
-/// here and in `docs-feat/jwt.md`:
+/// here:
 ///
 /// - **`iss` and `aud` are never read.** A token minted for another
 ///   audience, or by another issuer, verifies here exactly like one minted
@@ -80,9 +80,8 @@ fn jwt_reject(lua: &Lua, reason: &str) -> mlua::Result<(Value, Value)> {
 ///
 /// Shipping primitives rather than a framework is deliberate — a claim
 /// policy belongs to the application — but an undocumented omission is a
-/// defect regardless of that. See `docs-feat/jwt.md` for the caller-side
-/// checks to write, including the `aud`-is-a-string-or-an-array edge
-/// (RFC 7519 §4.1.3).
+/// defect regardless of that. The caller compares `iss` and `aud` itself,
+/// remembering that `aud` is a string or an array (RFC 7519 §4.1.3).
 pub(super) fn create_jwt_table(lua: &Lua) -> mlua::Result<Table> {
     let jwt = lua.create_table()?;
 

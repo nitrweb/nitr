@@ -42,7 +42,10 @@ pub(crate) fn create_env_table(lua: &Lua, opts: &EnvOptions) -> mlua::Result<Tab
     env.set(
         "number",
         lua.create_function(move |lua, (name, default): (String, Option<Value>)| {
-            match read(lua, &policy, &name).and_then(|v| v.trim().parse::<f64>().ok()) {
+            let parsed = read(lua, &policy, &name)
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|n| n.is_finite());
+            match parsed {
                 Some(n) => Ok(Value::Number(n)),
                 None => Ok(default.unwrap_or(Value::Nil)),
             }
@@ -171,6 +174,31 @@ mod tests {
         assert_eq!(b, "fallback");
         assert_eq!(c, 42.0);
         assert!(d);
+    }
+
+    /// `nan` and `inf` parse as floats but are not numbers a setting can
+    /// mean: they read as unparseable, so the default answers.
+    #[test]
+    fn number_refuses_non_finite_values() {
+        let lua = mlua::Lua::new();
+        let doubles = crate::testing::Doubles::new();
+        lua.set_app_data(doubles.clone());
+        let table = create_env_table(&lua, &EnvOptions::default()).expect("table");
+        lua.globals().set("env", table).expect("set");
+        for value in ["nan", "inf", "-inf", "NaN"] {
+            doubles.set_env("APP_LIMIT", Some(value.into()));
+            let n: f64 = lua
+                .load(r#"return env.number("APP_LIMIT", 7)"#)
+                .eval()
+                .expect("eval");
+            assert_eq!(n, 7.0, "{value}");
+        }
+        doubles.set_env("APP_LIMIT", Some("2.5".into()));
+        let n: f64 = lua
+            .load(r#"return env.number("APP_LIMIT", 7)"#)
+            .eval()
+            .expect("eval");
+        assert_eq!(n, 2.5);
     }
 
     /// A test's override answers only for names the policy lets scripts

@@ -299,7 +299,7 @@ fn aead_cipher(key: &LuaString) -> mlua::Result<XChaCha20Poly1305> {
     if key.len() != 32 {
         return Err(mlua::Error::RuntimeError(format!(
             "seal/open take a 32-byte key, got {} bytes — generate one with \
-             nitr.crypto.random_bytes(32) or derive one with nitr.crypto.sha256",
+             nitr.crypto.random_bytes(32) and keep it in the configuration",
             key.len()
         )));
     }

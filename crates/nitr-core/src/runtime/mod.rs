@@ -58,7 +58,8 @@ const EXEC_TIMEOUT_GRACE: Duration = Duration::from_millis(100);
 /// limit and instruction hook enforce. The stock `load` defaults its mode
 /// to `"bt"`; this wrapper pins it to `"t"` whatever the caller asked for,
 /// and `string.dump` goes too, since producing bytecode is the other half
-/// of that primitive. The wrapper preserves the argument count: an
+/// of that primitive. `loadfile` and `dofile`, present only with `io`,
+/// are pinned the same way. The wrapper preserves the argument count: an
 /// explicit `nil` environment is not the same as an absent one.
 ///
 /// **An uncatchable budget error.** The instruction hook raises an
@@ -72,8 +73,8 @@ const EXEC_TIMEOUT_GRACE: Duration = Duration::from_millis(100);
 /// error can come back through; each is wrapped so a failure caught
 /// *after* the deadline is re-raised as the budget error. The wrappers
 /// are Lua functions rather than Rust callbacks so a body that yields (an
-/// async builtin inside `pcall`) keeps working. Startup runs with the deadline unset, so the
-/// wrappers are inert until a budgeted call begins.
+/// async builtin inside `pcall`) keeps working. The wrappers are inert
+/// until a deadline is armed: a budgeted call, or the load of a script.
 ///
 /// **No finalizers.** Lua runs `__gc` metamethods with hooks disabled, so
 /// a finalizer is out of the budget's reach and a spinning one never
@@ -96,6 +97,21 @@ load = function(chunk, name, _, ...)
     return checked_load(raw_load(chunk, name, "t"))
 end
 if string then string.dump = nil end
+
+if loadfile then
+    local raw_loadfile = loadfile
+    loadfile = function(name, _, ...)
+        if select("#", ...) > 0 then
+            return raw_loadfile(name, "t", (...))
+        end
+        return raw_loadfile(name, "t")
+    end
+    dofile = function(name)
+        local chunk, err = raw_loadfile(name, "t")
+        if not chunk then error(err, 0) end
+        return chunk()
+    end
+end
 
 setmetatable = function(t, mt)
     if type(mt) == "table" and rawget(mt, "__gc") ~= nil then
@@ -167,6 +183,15 @@ impl DeadlineHandle {
                 Ordering::Relaxed,
             );
         }
+    }
+}
+
+/// A deadline armed by [`Runtime::arm`], lifted on drop.
+struct Armed<'a>(&'a Runtime);
+
+impl Drop for Armed<'_> {
+    fn drop(&mut self) {
+        self.0.clear_deadline();
     }
 }
 
@@ -434,11 +459,19 @@ impl Runtime {
         // The chunk itself receives the arguments as its varargs, so the
         // script sees `db` via `local db = ...` at the top. A failure while
         // it runs (a misspelled `db:` method, a nil index) gets the same
-        // in-context rendering as a parse error.
-        let value = chunk
-            .call_async::<Value>(args)
-            .await
-            .map_err(|err| load_error(cfg_src, err))?;
+        // in-context rendering as a parse error. The run is budgeted like
+        // a call: a loop here would hang every boot and reload.
+        let value = {
+            let _armed = self.arm();
+            let call = chunk.call_async::<Value>(args);
+            match self.opts.exec_timeout {
+                Some(timeout) => tokio::time::timeout(timeout + EXEC_TIMEOUT_GRACE, call)
+                    .await
+                    .map_err(|_| Error::Timeout)?,
+                None => call.await,
+            }
+            .map_err(|err| load_error(cfg_src, err))?
+        };
         let cfg = match value {
             Value::Table(cfg) => cfg,
             // The pre-1.0 wrapper form; point migrations at the new shape.
@@ -584,6 +617,25 @@ impl Runtime {
         self.thread = Some(thread);
         self.clear_deadline();
         self.classify(result)
+    }
+
+    /// Arms the execution deadline for a stretch of work; the guard lifts
+    /// it again. A no-op without an execution timeout.
+    fn arm(&self) -> Armed<'_> {
+        if let Some(timeout) = self.opts.exec_timeout {
+            self.deadline.store(
+                (self.epoch.elapsed() + timeout).as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+        }
+        Armed(self)
+    }
+
+    /// Runs `f` on this state under the execution budget, as a call is:
+    /// the load of a script has the same limits as the handlers in it.
+    pub fn budgeted<R>(&self, f: impl FnOnce(&Lua) -> Result<R>) -> Result<R> {
+        let _armed = self.arm();
+        f(&self.lua)
     }
 
     /// Lifts the deadline once a budgeted call has returned. The state is

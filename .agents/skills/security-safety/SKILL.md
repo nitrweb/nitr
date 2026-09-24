@@ -36,8 +36,8 @@ an assumption (see `investigate`).
     pending futures are dropped at once.
   - Any other way Lua runs code in protected mode, or with hooks off,
     escapes the budget unless you have proven otherwise.
-  - Startup (`config.lua` and the handler's top level) runs with no
-    deadline.
+  - The load of `config.lua` and of the handler script (file scope, at
+    startup and on every reload) runs under the same deadline.
 - **Memory:** the allocator limit set by `[lua] memory_limit`. mlua
   treats `0` as no limit, so startup refuses it.
 - **Serialization:** every Lua value that reaches a serializer passes

@@ -670,8 +670,7 @@ end)
 return app
 "#;
 
-/// T-5 (audit 3, phase 5): the two recipes `docs-feat/tls.md` documents,
-/// executed rather than quoted — the HSTS middleware and the
+/// The two recipes for a TLS deployment, executed rather than quoted — the HSTS middleware and the
 /// plaintext-to-HTTPS redirect instance (path and query preserved, the
 /// canonical host from configuration and never from the request's Host
 /// header).

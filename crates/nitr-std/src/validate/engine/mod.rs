@@ -172,6 +172,7 @@ impl<'a> Ctx<'a> {
         self.errors.push(ErrorEntry {
             path: path.to_string(),
             field: field.to_string(),
+            part: None,
             rule: rule.to_string(),
             message,
             params: params
@@ -288,6 +289,7 @@ impl<'a> Ctx<'a> {
             self.errors.push(ErrorEntry {
                 path: path.render(),
                 field: path.field_name().to_string(),
+                part: None,
                 rule: "unknown".into(),
                 message: format!("has {extra} more unknown fields"),
                 params: vec![("count".into(), Param::Num(extra as f64))],

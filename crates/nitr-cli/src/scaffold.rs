@@ -94,15 +94,18 @@ dir = "public"
 mount = "/"
 
 # The OpenAPI document, generated from the routes' `input` and `doc`
-# tables: served at /openapi.json, and kept current in openapi.json while
-# `nitr dev` runs (`nitr openapi --check` is the CI drift gate).
+# tables. `nitr openapi` prints it whatever `enabled` says (`--check` is
+# the CI drift gate); `enabled = true` also serves it at /openapi.json and
+# keeps openapi.json current while `nitr dev` runs. Off here: a route map
+# is reconnaissance material, so publishing it is a decision.
 [openapi]
-enabled = true
+enabled = false
 output = "openapi.json"
 
 # Swagger UI at /docs, rendering the document from this binary (no CDN).
+# Off for the same reason; turn both on for development.
 [swagger]
-enabled = true
+enabled = false
 try_it_out = true
 "#;
 
@@ -303,13 +306,6 @@ t.describe("notes API", function()
         local resp = api:get("/notes", { query = { limit = 500 } })
         t.expect(resp).to_have_status(422)
         t.expect(resp:json().fields["query.limit"]).to_equal("must be at most 100")
-    end)
-
-    t.it("publishes what it enforces", function()
-        local spec = t.get("/openapi.json"):json()
-        local limit = spec.paths["/api/notes"].get.parameters[1]
-        t.expect(limit).to_match_object({ name = "limit", schema = { maximum = 100 } })
-        t.expect(spec.components.schemas.NoteInput.required[1]).to_equal("text")
     end)
 end)
 "#;

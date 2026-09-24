@@ -18,6 +18,9 @@ pub struct ErrorEntry {
     pub path: String,
     /// The nearest named field (`tags` for `tags[2]`), empty for the root.
     pub field: String,
+    /// The request part the path was prefixed with (`body`, `query`, …);
+    /// none for a schema checked on its own.
+    pub part: Option<String>,
     /// The rule code (`required`, `min_len`, `check`, …).
     pub rule: String,
     /// The rendered, sanitized message.
@@ -53,9 +56,6 @@ pub struct ValidationError {
     pub entries: Vec<ErrorEntry>,
 }
 
-/// The request parts a path may be prefixed with.
-const PARTS: [&str; 4] = ["body", "query", "params", "headers"];
-
 impl ValidationError {
     /// A single failure not tied to a schema field: a body that is not
     /// JSON, say. `rule` is the code, `message` the text.
@@ -65,6 +65,7 @@ impl ValidationError {
             entries: vec![ErrorEntry {
                 path: "$".into(),
                 field: String::new(),
+                part: None,
                 rule: rule.into(),
                 message: message.into(),
                 params: Vec::new(),
@@ -82,6 +83,7 @@ impl ValidationError {
             } else {
                 format!("{part}.{}", entry.path)
             };
+            entry.part = Some(part.to_string());
         }
     }
 
@@ -104,11 +106,10 @@ impl ValidationError {
             }
             let e = lua.create_table()?;
             e.set("path", entry.path.as_str())?;
-            let (part, field) = split_part(&entry.path, &entry.field);
-            if let Some(part) = part {
-                e.set("part", part)?;
+            if let Some(part) = &entry.part {
+                e.set("part", part.as_str())?;
             }
-            e.set("field", field)?;
+            e.set("field", entry.field.as_str())?;
             e.set("rule", entry.rule.as_str())?;
             e.set("message", entry.message.as_str())?;
             if !entry.params.is_empty() {
@@ -138,11 +139,10 @@ impl ValidationError {
                 .or_insert_with(|| serde_json::Value::String(entry.message.clone()));
             let mut e = serde_json::Map::new();
             e.insert("path".into(), entry.path.clone().into());
-            let (part, field) = split_part(&entry.path, &entry.field);
-            if let Some(part) = part {
-                e.insert("part".into(), part.into());
+            if let Some(part) = &entry.part {
+                e.insert("part".into(), part.clone().into());
             }
-            e.insert("field".into(), field.into());
+            e.insert("field".into(), entry.field.clone().into());
             e.insert("rule".into(), entry.rule.clone().into());
             e.insert("message".into(), entry.message.clone().into());
             if let Some(params) = entry.params_json() {
@@ -162,22 +162,6 @@ impl ValidationError {
     }
 }
 
-/// Splits `body.text` into (`body`, `text`) once the paths carry a part
-/// prefix; a bare path has no part.
-fn split_part<'a>(path: &'a str, field: &'a str) -> (Option<&'a str>, &'a str) {
-    for part in PARTS {
-        if path == part {
-            return (Some(part), "");
-        }
-        if let Some(rest) = path.strip_prefix(part)
-            && rest.starts_with('.')
-        {
-            return (Some(part), field);
-        }
-    }
-    (None, field)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +170,7 @@ mod tests {
         ErrorEntry {
             path: path.into(),
             field: field.into(),
+            part: None,
             rule: rule.into(),
             message: format!("{rule} failed"),
             params: vec![("min".into(), Param::Num(3.0))],
@@ -193,27 +178,44 @@ mod tests {
         }
     }
 
+    /// The part is what `prefix` said, never a guess from the path text:
+    /// a field named `body` is a field named `body`.
     #[test]
     fn prefixing_turns_the_root_into_the_part_name() {
         let mut err = ValidationError::single("json", "must be valid JSON");
         err.prefix("body");
         assert_eq!(err.entries[0].path, "body");
-        assert_eq!(split_part("body", ""), (Some("body"), ""));
-        assert_eq!(split_part("body.a", "a"), (Some("body"), "a"));
-        assert_eq!(split_part("bodyguard", "bodyguard"), (None, "bodyguard"));
-        assert_eq!(split_part("a", "a"), (None, "a"));
+        let json = err.to_json();
+        assert_eq!(json["errors"][0]["part"], "body");
+        assert_eq!(json["errors"][0]["field"], "");
+
+        let mut err = ValidationError {
+            message: "validation failed".into(),
+            entries: vec![entry("body", "body", "required")],
+        };
+        let json = err.to_json();
+        assert!(json["errors"][0].get("part").is_none(), "{json}");
+        assert_eq!(json["errors"][0]["field"], "body");
+        err.prefix("query");
+        let json = err.to_json();
+        assert_eq!(json["errors"][0]["path"], "query.body");
+        assert_eq!(json["errors"][0]["part"], "query");
+        assert_eq!(json["errors"][0]["field"], "body");
     }
 
     #[test]
     fn merge_keeps_paths_sorted_and_json_carries_every_field() {
         let mut err = ValidationError {
             message: "validation failed".into(),
-            entries: vec![entry("query.b", "b", "min")],
+            entries: vec![entry("b", "b", "min")],
         };
-        err.merge(ValidationError {
+        err.prefix("query");
+        let mut body = ValidationError {
             message: String::new(),
-            entries: vec![entry("body.a", "a", "required")],
-        });
+            entries: vec![entry("a", "a", "required")],
+        };
+        body.prefix("body");
+        err.merge(body);
         assert_eq!(err.entries[0].path, "body.a");
         let json = err.to_json();
         assert_eq!(json["code"], "VALIDATION_FAILED");

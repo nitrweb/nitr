@@ -14,8 +14,8 @@ app:get("/", function(req)
 end)
 
 -- What the server knows about the connection. `req.headers.host` is what
--- the client asked for, which is also the name the certificate had to
--- cover for the handshake to have got this far.
+-- the client wrote in the request; the name the certificate covered is the
+-- one it sent in the handshake (SNI), and nothing checks the two agree.
 app:get("/whoami", function(req)
     return nitr.json({
         host = req.headers.host,

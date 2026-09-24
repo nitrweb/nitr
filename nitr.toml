@@ -8,7 +8,8 @@
 # Address the server binds to. Default: "127.0.0.1:3000"
 listen = "127.0.0.1:3000"
 
-# Lua script executed once per request. Default: "scripts/handler.lua"
+# The handler script: loaded once per Lua state (at startup and on every
+# reload); its routes then serve the requests. Default: "scripts/handler.lua"
 handler_script = "scripts/handler.lua"
 
 # Lua script executed once per build of the Lua pool: at startup and on
@@ -17,8 +18,9 @@ handler_script = "scripts/handler.lua"
 # Optional: when absent, `nitr.cfg` is nil.
 config_script = "scripts/config.lua"
 
-# Development mode: hot-reload the handler script on change.
-# Default: false (also enabled by the --dev flag).
+# Development mode: hot-reload the scripts on change, and send error
+# details (message, source line, traceback) to clients with the 500.
+# Default: false (also enabled by the --dev flag and `nitr dev`).
 dev_mode = true
 
 # Number of pooled Lua states (max concurrently executing handlers).
@@ -149,7 +151,9 @@ path = "scripts/file.db"
 #enabled = true
 #algorithms = ["br", "gzip"]  # offered best-first; the server's order wins
 #min_size = 1024              # below this, compressing costs more than it saves
-#types = ["text/*", "application/json", "application/javascript"]
+#types = ["text/*", "application/json", "application/javascript",
+#         "application/xml", "image/svg+xml"]  # a full type wins over its
+                                              # never-compressed family
 
 # Cross-origin resource sharing, enforced in Rust: a preflight is answered
 # without reaching a Lua state. Disabled until `origins` is set.
@@ -250,7 +254,7 @@ path = "scripts/file.db"
 #dir = "public"              # directory to serve; unset disables
 #mount = "/"                 # URL prefix
 #spa = false                 # serve index.html for unknown paths
-#cache_control = "public, max-age=3600"
+#cache_control = "public, max-age=3600"  # unset sends no Cache-Control
 #dotfiles = false            # serve .-prefixed names (.well-known/ always is)
 
 # Template rendering for the `nitr.template` builtin (minijinja).
@@ -380,7 +384,9 @@ stdlib = ["math", "table", "string", "utf8", "coroutine", "package"]
 # cap). Default: 8388608 (8 MiB)
 #memory_limit = 8388608
 
-# Wall-clock budget per handler invocation in milliseconds; 0 disables it.
+# Wall-clock budget in milliseconds per handler invocation, and per script
+# load (config.lua and the handler script's file scope, at startup and on
+# every reload); 0 disables it.
 # Enforced by an instruction-count hook (stops CPU-bound loops) plus an
 # async timeout (stops slow I/O). Lua runs `__gc` finalizers with the hook
 # off, so `setmetatable` refuses a metatable carrying `__gc`.

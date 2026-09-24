@@ -424,3 +424,62 @@ async fn unique_keeps_large_integers_apart() {
     let (_, err) = check(&lua, &s, "{ ids = { 1, 1.0 } }").await;
     assert_eq!(field(&err, "ids"), "must not contain duplicates");
 }
+
+/// A shorthand array's `contains` literal is typed by the items, which
+/// shorthand cannot see: `contains:3` on integer items is the integer 3.
+#[tokio::test]
+async fn shorthand_array_literals_take_the_items_type() {
+    let lua = Lua::new();
+    let s = schema(
+        &lua,
+        r#"{
+            nums = { "array|contains:3", items = "integer" },
+            picks = { "array|contains_any:1,2", items = "number" },
+            flags = { "array|contains:true", items = "boolean" },
+        }"#,
+    );
+    let (_, err) = check(
+        &lua,
+        &s,
+        "{ nums = { 1, 2 }, picks = { 9 }, flags = { false } }",
+    )
+    .await;
+    assert_eq!(field(&err, "nums"), "must include 3");
+    assert_eq!(field(&err, "picks"), "must include one of: 1, 2");
+    assert_eq!(field(&err, "flags"), "must include true");
+    let (_, err) = check(
+        &lua,
+        &s,
+        "{ nums = { 3 }, picks = { 2 }, flags = { true } }",
+    )
+    .await;
+    assert!(err.is_nil(), "{err:?}");
+}
+
+/// A field may be named like a request part: its error still names it.
+#[tokio::test]
+async fn a_field_named_like_a_part_keeps_its_name_in_errors() {
+    let lua = Lua::new();
+    let s = schema(&lua, r#"{ body = "string|required", query = "string" }"#);
+    let (_, err) = check(&lua, &s, r#"{ query = 1 }"#).await;
+    let errors = errors_of(&err);
+    let first: Table = errors.get(1).unwrap();
+    assert_eq!(first.get::<String>("path").unwrap(), "body");
+    assert_eq!(first.get::<String>("field").unwrap(), "body");
+    assert!(first.get::<Value>("part").unwrap().is_nil());
+    let second: Table = errors.get(2).unwrap();
+    assert_eq!(second.get::<String>("field").unwrap(), "query");
+    assert!(second.get::<Value>("part").unwrap().is_nil());
+}
+
+/// `any` measures the value's JSON; a table JSON cannot hold is not a
+/// small value, it is no JSON value.
+#[tokio::test]
+async fn any_refuses_a_table_json_cannot_hold() {
+    let lua = Lua::new();
+    let s = schema(&lua, r#"{ meta = { type = "any", max_bytes = 64 } }"#);
+    let (_, err) = check(&lua, &s, r#"{ meta = { "a", total = 1 } }"#).await;
+    assert_eq!(field(&err, "meta"), "must be a JSON value");
+    let (_, err) = check(&lua, &s, r#"{ meta = { "a", "b" } }"#).await;
+    assert!(err.is_nil(), "{err:?}");
+}

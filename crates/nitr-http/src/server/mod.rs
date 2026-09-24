@@ -52,6 +52,10 @@ pub struct Server {
     /// routing before requests begin to fail. Read by
     /// [`is_ready()`](Self::is_ready), which a readiness probe surfaces.
     ready: Arc<AtomicBool>,
+    /// The `SIGHUP` stream, taken at build so the signal is owned before
+    /// a pidfile can name this process; `serve` forwards it to reloads.
+    #[cfg(unix)]
+    reload_signal: Option<tokio::signal::unix::Signal>,
     /// The shared `nitr.cache`, held here so a reload hands the new pool
     /// the same storage rather than starting cold.
     cache: Option<nitr_std::Cache>,

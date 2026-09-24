@@ -90,8 +90,8 @@ impl Protection {
             pool_wait: Duration::from_millis(cfg.limits.pool_wait_ms),
             rate: cfg.rate_limit.enabled.then(|| {
                 RateLimiter::new(
-                    cfg.rate_limit.requests.max(1),
-                    Duration::from_secs(cfg.rate_limit.window.max(1)),
+                    cfg.rate_limit.requests,
+                    Duration::from_secs(cfg.rate_limit.window),
                     cfg.rate_limit.trust_forwarded_for,
                 )
             }),

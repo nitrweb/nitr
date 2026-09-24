@@ -143,7 +143,11 @@ app:get(
 -- Registration, for where the hash comes from when it is not an operator
 -- at a terminal. Same function `nitr hash-password` calls.
 app:post("/register", function(req)
-    local body = nitr.json:decode(req:text() or "") or {}
+    -- A body that is not JSON is the client's mistake, not a server error.
+    local ok, body = pcall(function() return nitr.json:decode(req:text()) end)
+    if not ok or type(body) ~= "table" then
+        return nitr.json({ error = "a JSON body is required" }, 400)
+    end
     if type(body.user) ~= "string" or type(body.password) ~= "string" then
         return nitr.json({ error = "user and password are required" }, 400)
     end
@@ -156,7 +160,9 @@ app:post("/register", function(req)
         return nitr.json({ error = "password too long" }, 400)
     end
     -- An existing account is not overwritten: otherwise anyone could
-    -- re-register a known user with a password of their choosing.
+    -- re-register a known user with a password of their choosing. The 409
+    -- does say the name is taken; registration cannot avoid that, which is
+    -- why it is the login path above that gives nothing away.
     if users[body.user] then
         return nitr.json({ error = "user already exists" }, 409)
     end

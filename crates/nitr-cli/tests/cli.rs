@@ -473,6 +473,21 @@ fn build_produces_a_self_contained_artifact() {
         );
     }
 
+    // A bundle carries its own configuration: a `--config` it would have
+    // ignored is refused instead.
+    std::fs::write(empty.join("other.toml"), "listen = \"127.0.0.1:0\"\n").expect("write");
+    let out = Command::new(&artifact)
+        .current_dir(&empty)
+        .args(["-c", "other.toml", "check"])
+        .output()
+        .expect("run the artifact with --config");
+    assert!(!out.status.success(), "a bundle must refuse --config");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--config is not accepted"),
+        "got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
     // Building from a bundle is refused: bundles are built from the plain
     // binary, not stacked.
     let out = Command::new(&artifact)
@@ -486,6 +501,71 @@ fn build_produces_a_self_contained_artifact() {
         "got: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// A `[log] level` that is not a level or a filter is refused by name,
+/// not turned into a target that logs nothing.
+#[test]
+fn an_invalid_log_level_is_refused_by_name() {
+    require_runnable_binary!();
+    let dir = scaffold("log-level", true);
+    let mut toml = std::fs::read_to_string(dir.join("nitr.toml")).expect("toml");
+    toml.push_str("\n[log]\nlevel = \"notice\"\n");
+    std::fs::write(dir.join("nitr.toml"), toml).expect("write");
+    let out = nitr()
+        .current_dir(&dir)
+        .env_remove("RUST_LOG")
+        .arg("check")
+        .output()
+        .expect("run check");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("[log] level"), "got: {stderr}");
+}
+
+/// `--status` reports; it creates no database file, switches no journal
+/// mode and creates no ledger table. Only `migrate` writes.
+#[cfg(feature = "db")]
+#[test]
+fn migrate_status_applies_and_creates_nothing() {
+    require_runnable_binary!();
+    let dir = scaffold("migrate-status", false);
+    let db = dir.join("data/app.db");
+    let out = nitr()
+        .current_dir(&dir)
+        .args(["migrate", "--status"])
+        .output()
+        .expect("run migrate --status");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("pending"), "got: {stdout}");
+    assert!(!db.exists(), "--status must not create the database");
+
+    let out = nitr()
+        .current_dir(&dir)
+        .arg("migrate")
+        .output()
+        .expect("run migrate");
+    assert!(out.status.success());
+    let before = std::fs::metadata(&db)
+        .expect("db")
+        .modified()
+        .expect("mtime");
+    let out = nitr()
+        .current_dir(&dir)
+        .args(["migrate", "--status"])
+        .output()
+        .expect("run migrate --status");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("applied"));
+    let after = std::fs::metadata(&db)
+        .expect("db")
+        .modified()
+        .expect("mtime");
+    assert_eq!(before, after, "--status must not write to the database");
 }
 
 /// `nitr run` writes the configured pidfile, `nitr reload` signals through
@@ -519,7 +599,7 @@ fn scaffolded_app_tests_pass_and_filter() {
         stdout.contains("ok   notes API > creates a note"),
         "got: {stdout}"
     );
-    assert!(stdout.contains("10 passed, 0 failed"), "got: {stdout}");
+    assert!(stdout.contains("9 passed, 0 failed"), "got: {stdout}");
 
     let out = nitr()
         .current_dir(&dir)
@@ -529,7 +609,7 @@ fn scaffolded_app_tests_pass_and_filter() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "filtered run failed: {stdout}");
     assert!(
-        stdout.contains("4 passed, 0 failed, 6 filtered out"),
+        stdout.contains("4 passed, 0 failed, 5 filtered out"),
         "got: {stdout}"
     );
 

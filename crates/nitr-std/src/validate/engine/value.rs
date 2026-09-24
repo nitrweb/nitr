@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use mlua::{LuaSerdeExt, Value};
+use mlua::Value;
 
 use super::path::FieldPath;
 use super::util::{canonical, fraction_digits, is_sequence};
@@ -419,10 +419,10 @@ impl Ctx<'_> {
                 // Invariant: schema compilation requires `max_bytes` on `any`.
                 #[allow(clippy::expect_used)]
                 let max = rule.max_bytes.expect("any rules carry `max_bytes`");
-                let json: serde_json::Value = self.lua.from_value(value.clone())?;
-                let size = serde_json::to_vec(&json)
-                    .map(|v| v.len() as u64)
-                    .unwrap_or(u64::MAX);
+                let Ok(json) = crate::bounded::to_json_vec(&value) else {
+                    fail!("type", type_params());
+                };
+                let size = json.len() as u64;
                 if size > max {
                     fail!("max_bytes", vec![("max", Param::Size(max))]);
                 }

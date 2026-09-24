@@ -35,10 +35,8 @@ pub(crate) fn migrate(cfg: &Config, status_only: bool) -> anyhow::Result<()> {
         "no migrations directory found (looked for `migrations/`; set \
          [database] migrations_dir to point elsewhere)",
     )?;
-    let conn = nitr::stdlib::db_open(&db.path, &db.pragmas())?;
-
     if status_only {
-        let entries = nitr::stdlib::migrate::status(&conn, &dir)?;
+        let entries = nitr::stdlib::migrate::status_at(&db.path, &dir)?;
         if entries.is_empty() {
             println!("no migrations in {}", dir.display());
             return Ok(());
@@ -70,6 +68,7 @@ pub(crate) fn migrate(cfg: &Config, status_only: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let conn = nitr::stdlib::db_open(&db.path, &db.pragmas())?;
     let applied = nitr::stdlib::migrate::run(&conn, &dir)?;
     if applied.is_empty() {
         println!("ok: the schema is up to date");

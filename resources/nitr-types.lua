@@ -418,7 +418,7 @@ function nitr.error(code, body) end
 ---@return string
 function nitr.etag(value, weak) end
 
----As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field). Options: `secret` (required), `cookie` (the cookie NAME, default `_csrf`), `header`, `field`, and `cookie_opts` (the cookie ATTRIBUTES, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set). Note `nitr.session` spells its attribute table `cookie` — here that key is the name. Unsafe requests a browser marks `Sec-Fetch-Site: cross-site` are refused before the token is checked, unless `cookie_opts.same_site = "None"` (the setting that means to accept cross-site posts). (std feature: `http`)
+---As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field of an urlencoded form; a multipart form or a JSON body sends the header). Options: `secret` (required), `cookie` (the cookie NAME, default `_csrf`), `header`, `field`, and `cookie_opts` (the cookie ATTRIBUTES, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set). Note `nitr.session` spells its attribute table `cookie` — here that key is the name. Unsafe requests a browser marks `Sec-Fetch-Site: cross-site` are refused before the token is checked, unless `cookie_opts.same_site = "None"` (the setting that means to accept cross-site posts). (std feature: `http`)
 ---@class nitr.csrf
 ---@overload fun(opts: table): fun
 nitr.csrf = {}
@@ -516,7 +516,7 @@ function nitr.db:transaction(fn) end
 ---@return table _ A pending handle for `nitr.await_all`.
 function nitr.db:query_async(sql, params, kind) end
 
----Structured logging into the request span. Fields become real keys in JSON log output. (std feature: `log`)
+---Structured logging into the request span. The fields table travels as one `fields` value: a JSON document inside the text line, a JSON string inside the JSON line. (std feature: `log`)
 nitr.log = {}
 
 ---Debug-level record.
@@ -599,7 +599,7 @@ function nitr.crypto.seal(key, plaintext, aad) end
 ---@return string|nil
 function nitr.crypto.open(key, sealed, aad) end
 
----HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list and checks `exp`/`nbf` when present. It does NOT check `iss`, `aud` or `typ` — those are the caller's job — and a token with no `exp` never expires. See docs-feat/jwt.md. (std feature: `crypto`)
+---HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list and checks `exp`/`nbf` when present. It does NOT check `iss`, `aud` or `typ` — those are the caller's job — and a token with no `exp` never expires. (std feature: `crypto`)
 nitr.crypto.jwt = {}
 
 ---Signs a token.
@@ -831,7 +831,7 @@ function nitr.path.is_absolute(path) end
 ---Percent-encoding, query strings, and a lexical URL splitter. (std feature: `url`)
 nitr.url = {}
 
----Percent-encodes a component (like `encodeURIComponent`).
+---Percent-encodes a component: everything but ASCII letters, digits and `-_.~` (RFC 3986 unreserved). Stricter than `encodeURIComponent`, which also leaves `!*'()` alone.
 ---@param value string
 ---@return string
 function nitr.url.encode(value) end

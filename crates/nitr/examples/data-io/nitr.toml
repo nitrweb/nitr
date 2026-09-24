@@ -5,7 +5,7 @@ handler_script = "crates/nitr/examples/data-io/app.lua"
 features = ["json", "http", "log", "db", "cache", "fetch"]
 
 [database]
-path = "/tmp/nitr-data-io-example.db"
+path = "crates/nitr/examples/data-io/data/example.db"
 journal_mode = "wal"
 busy_timeout = 5000
 synchronous = "normal"

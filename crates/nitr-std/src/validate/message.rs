@@ -229,6 +229,7 @@ pub(crate) fn default_message(rule: &str, kind: &str, params: &BTreeMap<&str, Pa
             "array" => "must be a list".into(),
             "table" | "map" => "must be an object".into(),
             "file" => "must be a file".into(),
+            "any" => "must be a JSON value".into(),
             _ => format!("must be a {kind}"),
         },
         "required" => "is required".into(),

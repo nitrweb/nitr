@@ -32,7 +32,8 @@ pub use sections::*;
 pub struct Config {
     /// Address the server binds to.
     pub listen: SocketAddr,
-    /// Lua script executed once per request.
+    /// The handler script, loaded once per Lua state at startup and on
+    /// every reload; its routes serve the requests.
     pub handler_script: PathBuf,
     /// Lua script executed once at startup; its returned table is passed to
     /// the handler on every request.

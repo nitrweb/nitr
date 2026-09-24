@@ -60,6 +60,14 @@ pub(super) async fn check(lua: &Lua, schema: &mlua::AnyUserData, input: &str) ->
     f.call_async((schema, value)).await.expect("check")
 }
 
+/// The `errors` list of a failed check.
+pub(super) fn errors_of(err: &Value) -> Table {
+    let Value::Table(err) = err else {
+        panic!("expected error table, got {err:?}");
+    };
+    err.get("errors").expect("errors")
+}
+
 pub(super) fn fields_of(err: &Value) -> Table {
     let Value::Table(err) = err else {
         panic!("expected error table, got {err:?}");

@@ -108,7 +108,8 @@ impl ServerBuilder {
         self
     }
 
-    /// Lua script executed once per request.
+    /// The handler script, loaded once per Lua state at startup and on
+    /// every reload; its routes serve the requests.
     pub fn handler_script(mut self, path: impl Into<PathBuf>) -> Self {
         self.cfg.handler_script = path.into();
         self
@@ -263,8 +264,24 @@ impl ServerBuilder {
         #[cfg(feature = "tls")]
         let tls = Arc::new(RwLock::new(load_tls(&cfg.tls)?));
 
+        // Owned from here, before the caller writes a pidfile: a reload
+        // sent to a server that is not serving yet is dropped, never fatal
+        // (the default disposition of `SIGHUP` is to terminate).
+        #[cfg(unix)]
+        let reload_signal = {
+            use tokio::signal::unix::{SignalKind, signal};
+            match signal(SignalKind::hangup()) {
+                Ok(signal) => Some(signal),
+                Err(err) => {
+                    tracing::warn!("failed to install the SIGHUP reload handler: {err}");
+                    None
+                }
+            }
+        };
         Ok(Server {
             protection: Arc::new(protection),
+            #[cfg(unix)]
+            reload_signal,
             #[cfg(feature = "openapi")]
             docs,
             cfg,

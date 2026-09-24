@@ -48,7 +48,7 @@ A well-formed entity tag for whatever identifies the resource (a row version, an
 
 ### `nitr.csrf(opts) -> fun` (std feature: `http`)
 
-As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field). Options: `secret` (required), `cookie` (the cookie NAME, default `_csrf`), `header`, `field`, and `cookie_opts` (the cookie ATTRIBUTES, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set). Note `nitr.session` spells its attribute table `cookie` — here that key is the name. Unsafe requests a browser marks `Sec-Fetch-Site: cross-site` are refused before the token is checked, unless `cookie_opts.same_site = "None"` (the setting that means to accept cross-site posts).
+As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field of an urlencoded form; a multipart form or a JSON body sends the header). Options: `secret` (required), `cookie` (the cookie NAME, default `_csrf`), `header`, `field`, and `cookie_opts` (the cookie ATTRIBUTES, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set). Note `nitr.session` spells its attribute table `cookie` — here that key is the name. Unsafe requests a browser marks `Sec-Fetch-Site: cross-site` are refused before the token is checked, unless `cookie_opts.same_site = "None"` (the setting that means to accept cross-site posts).
 
 - `nitr.csrf.token(req) -> string` — The request's token, for a form or meta tag. Requires the middleware.
 
@@ -101,7 +101,7 @@ The SQLite database (`database` in nitr.toml): WAL, busy timeout, foreign keys o
 
 ### `nitr.log` (std feature: `log`)
 
-Structured logging into the request span. Fields become real keys in JSON log output.
+Structured logging into the request span. The fields table travels as one `fields` value: a JSON document inside the text line, a JSON string inside the JSON line.
 
 - `nitr.log.debug(msg, fields)` — Debug-level record.
 - `nitr.log.info(msg, fields)` — Info-level record.
@@ -125,7 +125,7 @@ Crypto primitives (RustCrypto): compose them; never reimplement them in Lua.
 
 ### `nitr.crypto.jwt` (std feature: `crypto`)
 
-HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list and checks `exp`/`nbf` when present. It does NOT check `iss`, `aud` or `typ` — those are the caller's job — and a token with no `exp` never expires. See docs-feat/jwt.md.
+HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list and checks `exp`/`nbf` when present. It does NOT check `iss`, `aud` or `typ` — those are the caller's job — and a token with no `exp` never expires.
 
 - `nitr.crypto.jwt.sign(claims, key, opts) -> string` — Signs a token.
 - `nitr.crypto.jwt.verify(token, key, opts) -> table|nil, string|nil` — Verifies the signature, the `alg` against the allow-list, and `exp`/`nbf` if the token carries them. Checks no other claim: compare `iss`/`aud` yourself, and require `exp` if your tokens must expire (`aud` may be a string or an array).
@@ -202,7 +202,7 @@ Lexical path manipulation (POSIX and Windows styles). Pure text: nothing touches
 
 Percent-encoding, query strings, and a lexical URL splitter.
 
-- `nitr.url.encode(value) -> string` — Percent-encodes a component (like `encodeURIComponent`).
+- `nitr.url.encode(value) -> string` — Percent-encodes a component: everything but ASCII letters, digits and `-_.~` (RFC 3986 unreserved). Stricter than `encodeURIComponent`, which also leaves `!*'()` alone.
 - `nitr.url.decode(value) -> string` — Percent-decodes (`+` is left alone — that is a form convention).
 - `nitr.url.query_parse(query) -> table<string, string>` — Parses a query string (`+` as space; last duplicate wins).
 - `nitr.url.query_build(params) -> string` — Builds a query string, keys sorted.

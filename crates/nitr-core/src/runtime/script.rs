@@ -34,7 +34,7 @@ impl Runtime {
     /// This does not interpret the result; callers decide what the script is
     /// expected to return (e.g. a handler function or an application object).
     pub fn eval_script(&self, path: &Path) -> Result<Value> {
-        eval_script(&self.lua, path)
+        self.budgeted(|lua| eval_script(lua, path))
     }
 }
 

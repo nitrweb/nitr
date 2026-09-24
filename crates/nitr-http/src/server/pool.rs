@@ -56,12 +56,7 @@ pub(super) fn new_pool(
             rt.set_cfg_snapshot(snapshot)?;
         }
         set_nitr_cfg(&rt)?;
-        app::load(
-            rt.lua(),
-            &cfg.handler_script,
-            &base_statics,
-            &input_env(&cfg),
-        )?;
+        rt.budgeted(|lua| app::load(lua, &cfg.handler_script, &base_statics, &input_env(&cfg)))?;
         Ok(rt)
     });
     match routing {
@@ -158,7 +153,7 @@ pub(super) async fn build_runtimes(
     };
     set_nitr_cfg(&bootstrap)?;
     let env = input_env(cfg);
-    if app::load(bootstrap.lua(), &cfg.handler_script, &base_statics, &env)? {
+    if bootstrap.budgeted(|lua| app::load(lua, &cfg.handler_script, &base_statics, &env))? {
         // The disk the validated uploads of one moment may occupy, so the
         // operator has seen the number before the first upload.
         tracing::info!(
@@ -201,7 +196,7 @@ pub(super) async fn build_runtimes(
                     rt.set_cfg_snapshot(snapshot)?;
                 }
                 set_nitr_cfg(&rt)?;
-                app::load(rt.lua(), &cfg.handler_script, &base_statics, &env)?;
+                rt.budgeted(|lua| app::load(lua, &cfg.handler_script, &base_statics, &env))?;
                 runtimes.push(rt);
             }
             Ok(runtimes)

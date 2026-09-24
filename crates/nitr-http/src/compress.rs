@@ -97,7 +97,9 @@ pub struct Compression {
     enabled: bool,
     #[cfg(feature = "compression")]
     min_size: u64,
-    /// Compressible content types; an entry ending in `*` matches a prefix.
+    /// Compressible content types; an entry ending in `*` matches a
+    /// prefix, and a full type is compressed even in a family that never
+    /// is otherwise (`image/svg+xml`).
     #[cfg(feature = "compression")]
     types: Vec<String>,
 }
@@ -280,19 +282,30 @@ impl Compression {
             .next()
             .unwrap_or_default()
             .trim();
-        if content_type.is_empty()
-            || INCOMPRESSIBLE
-                .iter()
-                .any(|p| starts_with_ignore_ascii_case(content_type, p))
+        if content_type.is_empty() {
+            return false;
+        }
+        // A type named in full is compressible whatever family it is in:
+        // `image/svg+xml` is text, and `image/` is otherwise never worth
+        // a compressor.
+        if self
+            .types
+            .iter()
+            .any(|pattern| !pattern.ends_with('*') && pattern.eq_ignore_ascii_case(content_type))
+        {
+            return true;
+        }
+        if INCOMPRESSIBLE
+            .iter()
+            .any(|p| starts_with_ignore_ascii_case(content_type, p))
         {
             return false;
         }
-        self.types
-            .iter()
-            .any(|pattern| match pattern.strip_suffix('*') {
-                Some(prefix) => starts_with_ignore_ascii_case(content_type, prefix),
-                None => pattern.eq_ignore_ascii_case(content_type),
-            })
+        self.types.iter().any(|pattern| {
+            pattern
+                .strip_suffix('*')
+                .is_some_and(|prefix| starts_with_ignore_ascii_case(content_type, prefix))
+        })
     }
 }
 
@@ -570,6 +583,18 @@ mod tests {
         let mut out = Vec::new();
         brotli::BrotliDecompress(&mut &compressed[..], &mut out).expect("decode");
         assert_eq!(out, BIG_JSON);
+    }
+
+    /// A type the configuration names is compressible whatever family it
+    /// belongs to: the default list carries `image/svg+xml`, which is
+    /// text, and `image/` is otherwise never compressed.
+    #[tokio::test]
+    async fn a_listed_type_wins_over_its_incompressible_family() {
+        let p = policy(true);
+        let resp = response(StatusCode::OK, "image/svg+xml", BIG_JSON);
+        assert!(p.should_compress(&resp), "svg is in the default list");
+        let resp = response(StatusCode::OK, "image/png", BIG_JSON);
+        assert!(!p.should_compress(&resp), "png is not");
     }
 
     #[tokio::test]

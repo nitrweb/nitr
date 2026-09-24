@@ -88,7 +88,7 @@ local app = nitr.app()
 -- shape anyway — a real deployment stores hashes minted by
 -- `nitr hash-password` rather than burning argon2 per boot. The refusal
 -- and its wording are pinned by `a_top_level_async_call_explains_itself`
--- below; the change record is docs-feat/stability.md.
+-- below.
 local users = {
     -- `nitr hash-password` for "lovelace".
     ada = "$argon2id$v=19$m=19456,t=2,p=1$vMXfHutNUW2TKOAlXkcjhw$4inB2KB+UGSwuLVU21BPzcYITNSqQ7Hs39S0/v8g6Pw",

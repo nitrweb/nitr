@@ -54,7 +54,10 @@ async fn main() -> nitr::Result {
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
 
-    let db_path = std::env::temp_dir().join("nitr-data-io-example.db");
+    // The same file `nitr.toml` names, so `nitr migrate -c` and this
+    // binary agree on the database.
+    let db_path = PathBuf::from(format!("{DIR}/data/example.db"));
+    std::fs::create_dir_all(format!("{DIR}/data"))?;
     let migrations = PathBuf::from(format!("{DIR}/migrations"));
     let mut database = DatabaseConfig::new(&db_path);
     database.migrations_dir = Some(migrations.clone());

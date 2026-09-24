@@ -52,6 +52,7 @@ async fn main() -> nitr::Result {
         .config(cfg)
         .listen(([127, 0, 0, 1], port).into())
         .handler_script("crates/nitr/examples/stdlib/app.lua")
+        .config_script("crates/nitr/examples/stdlib/config.lua")
         .builtins(Builtins::minimal() | Builtins::LOG | Builtins::CRYPTO)
         .build()
         .await?

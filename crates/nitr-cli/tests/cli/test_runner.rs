@@ -1242,6 +1242,53 @@ end)
 /// first wait, so a listener made only for the waits used to swallow a
 /// press that landed mid-run: the run finished and the session waited on.
 #[cfg(unix)]
+/// With a machine reporter on stdout, `--watch` keeps its own chatter on
+/// stderr: stdout stays one parseable document per run.
+#[test]
+fn watch_keeps_a_json_stdout_clean() {
+    require_runnable_binary!();
+    let dir = app(
+        "watch-json",
+        &[
+            ("nitr.toml", MINIMAL_TOML),
+            ("app.lua", MINIMAL_APP),
+            (
+                "tests/one_test.lua",
+                "local t = nitr.test\nt.it(\"passes\", function() t.expect(1).to_equal(1) end)\n",
+            ),
+        ],
+    );
+    let out_path = dir.join("stdout.log");
+    let err_path = dir.join("stderr.log");
+    let mut child = nitr()
+        .current_dir(dir.as_ref())
+        .args(["test", "--watch", "--reporter", "json"])
+        .env_remove("RUST_LOG")
+        .env("NO_COLOR", "1")
+        .stdout(std::fs::File::create(&out_path).expect("stdout file"))
+        .stderr(std::fs::File::create(&err_path).expect("stderr file"))
+        .spawn()
+        .expect("spawn nitr test --watch");
+    let read = |path: &Path| std::fs::read_to_string(path).unwrap_or_default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !(read(&out_path) + &read(&err_path)).contains("watching for changes") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first run: {}",
+            read(&out_path)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    super::signal(child.id(), "-INT");
+    let _ = child.wait();
+    let stdout = read(&out_path);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&stdout).is_ok(),
+        "stdout must be the JSON report alone:\n{stdout}"
+    );
+    assert!(read(&err_path).contains("watching for changes"));
+}
+
 #[test]
 fn watch_stops_on_ctrl_c_during_a_rerun() {
     require_runnable_binary!();

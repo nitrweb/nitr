@@ -1,5 +1,5 @@
 //! Server-Sent Events: a live ticker paced by a custom Rust `time`
-//! module, mounted at `nitr.time` through the `module()` extension
+//! module, mounted at `nitr.ext.time` through the `module()` extension
 //! point — the same mechanism used for any custom Rust/Lua binding.
 //!
 //! Run from the repository root:
@@ -34,7 +34,7 @@ async fn main() -> nitr::Result {
         .handler_script("crates/nitr/examples/sse/app.lua")
         .builtins(Builtins::JSON | Builtins::HTTP)
         // A custom Rust module: the returned table is mounted at
-        // `nitr.time` in every pooled Lua state, so handlers call
+        // `nitr.ext.time` in every pooled Lua state, so handlers call
         // `nitr.ext.time.sleep(ms)` — an async function that suspends the
         // Lua coroutine on the tokio timer without blocking the runtime.
         .module("time", |lua| {

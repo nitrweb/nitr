@@ -15,8 +15,10 @@
 //! way a browser (WHATWG) parser would. For fetching, `nitr.fetch`
 //! performs its own strict parsing; this is for reading and building.
 
-use mlua::{Lua, Table, Value};
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode, utf8_percent_encode};
+use mlua::{Lua, LuaString, Table, Value};
+use percent_encoding::{
+    AsciiSet, NON_ALPHANUMERIC, percent_decode, percent_encode, utf8_percent_encode,
+};
 
 /// Component encoding: everything except ASCII alphanumerics and the RFC
 /// 3986 unreserved marks `-_.~` — the `encodeURIComponent` behavior.
@@ -27,17 +29,20 @@ const COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'~');
 
 /// Decodes one `application/x-www-form-urlencoded` token: `+` is a space,
-/// then percent-decoding.
-fn form_decode(s: &str) -> String {
-    let plus_replaced = s.replace('+', " ");
-    percent_decode(plus_replaced.as_bytes())
-        .decode_utf8_lossy()
-        .into_owned()
+/// then percent-decoding. Bytes, as `decode` gives them: a Lua string is
+/// bytes, and a value that is not UTF-8 is still the value.
+fn form_decode(s: &[u8]) -> Vec<u8> {
+    let plus_replaced: Vec<u8> = s
+        .iter()
+        .map(|&b| if b == b'+' { b' ' } else { b })
+        .collect();
+    percent_decode(&plus_replaced).collect()
 }
 
-/// Splits `authority` into (userinfo, host, port), tolerating IPv6
-/// bracket notation.
-fn split_authority(authority: &str) -> (Option<&str>, &str, Option<u16>) {
+/// Splits `authority` into (userinfo, host, port text), tolerating IPv6
+/// bracket notation. The port is the digits after the last colon when
+/// there are any; the caller decides whether they are a port.
+fn split_authority(authority: &str) -> (Option<&str>, &str, Option<&str>) {
     let (userinfo, host_port) = match authority.rsplit_once('@') {
         Some((user, rest)) => (Some(user), rest),
         None => (None, authority),
@@ -45,7 +50,11 @@ fn split_authority(authority: &str) -> (Option<&str>, &str, Option<u16>) {
     // `[::1]:8080` — the colon that matters is after the bracket.
     let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
         match rest.split_once(']') {
-            Some((host, port)) => (host, port.strip_prefix(':')),
+            Some((host, "")) => (host, None),
+            Some((host, port)) => match port.strip_prefix(':') {
+                Some(port) if port.chars().all(|c| c.is_ascii_digit()) => (host, Some(port)),
+                _ => (host_port, None),
+            },
             None => (host_port, None),
         }
     } else {
@@ -54,7 +63,7 @@ fn split_authority(authority: &str) -> (Option<&str>, &str, Option<u16>) {
             _ => (host_port, None),
         }
     };
-    (userinfo, host, port.and_then(|p| p.parse().ok()))
+    (userinfo, host, port.filter(|p| !p.is_empty()))
 }
 
 /// Builds the `nitr.url` table.
@@ -80,12 +89,19 @@ pub fn create_url_table(lua: &Lua) -> mlua::Result<Table> {
     // keep the last value, matching `req.query`.
     url.set(
         "query_parse",
-        lua.create_function(|lua, query: String| {
+        lua.create_function(|lua, query: LuaString| {
             let table = lua.create_table()?;
-            let query = query.strip_prefix('?').unwrap_or(&query);
-            for pair in query.split('&').filter(|p| !p.is_empty()) {
-                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-                table.set(form_decode(key), form_decode(value))?;
+            let query = query.as_bytes();
+            let query = query.strip_prefix(b"?").unwrap_or(&query);
+            for pair in query.split(|&b| b == b'&').filter(|p| !p.is_empty()) {
+                let (key, value) = match pair.iter().position(|&b| b == b'=') {
+                    Some(at) => (&pair[..at], &pair[at + 1..]),
+                    None => (pair, &b""[..]),
+                };
+                table.set(
+                    lua.create_string(form_decode(key))?,
+                    lua.create_string(form_decode(value))?,
+                )?;
             }
             Ok(table)
         })?,
@@ -96,13 +112,13 @@ pub fn create_url_table(lua: &Lua) -> mlua::Result<Table> {
     url.set(
         "query_build",
         lua.create_function(|_, params: Table| {
-            let mut pairs: Vec<(String, String)> = Vec::new();
+            let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
             for pair in params.pairs::<Value, Value>() {
                 let (key, value) = pair?;
                 let key = match key {
-                    Value::String(s) => s.to_string_lossy().to_string(),
-                    Value::Integer(n) => n.to_string(),
-                    Value::Number(n) => n.to_string(),
+                    Value::String(s) => s.as_bytes().to_vec(),
+                    Value::Integer(n) => n.to_string().into_bytes(),
+                    Value::Number(n) => n.to_string().into_bytes(),
                     other => {
                         return Err(mlua::Error::RuntimeError(format!(
                             "query keys must be strings or numbers, got {}",
@@ -111,10 +127,10 @@ pub fn create_url_table(lua: &Lua) -> mlua::Result<Table> {
                     }
                 };
                 let value = match value {
-                    Value::String(s) => s.to_string_lossy().to_string(),
-                    Value::Integer(n) => n.to_string(),
-                    Value::Number(n) => n.to_string(),
-                    Value::Boolean(b) => b.to_string(),
+                    Value::String(s) => s.as_bytes().to_vec(),
+                    Value::Integer(n) => n.to_string().into_bytes(),
+                    Value::Number(n) => n.to_string().into_bytes(),
+                    Value::Boolean(b) => b.to_string().into_bytes(),
                     other => {
                         return Err(mlua::Error::RuntimeError(format!(
                             "query values must be strings, numbers or booleans, got {}",
@@ -130,8 +146,8 @@ pub fn create_url_table(lua: &Lua) -> mlua::Result<Table> {
                 .map(|(k, v)| {
                     format!(
                         "{}={}",
-                        utf8_percent_encode(k, COMPONENT),
-                        utf8_percent_encode(v, COMPONENT)
+                        percent_encode(k, COMPONENT),
+                        percent_encode(v, COMPONENT)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -172,6 +188,12 @@ pub fn create_url_table(lua: &Lua) -> mlua::Result<Table> {
                 }
                 out.set("host", host)?;
                 if let Some(port) = port {
+                    let Ok(port) = port.parse::<u16>() else {
+                        return Ok((
+                            Value::Nil,
+                            Value::String(lua.create_string("port out of range")?),
+                        ));
+                    };
                     out.set("port", port)?;
                 }
                 rest = &after[end..];
@@ -239,6 +261,47 @@ mod tests {
             .expect("params");
         let built: String = build.call(params).expect("build");
         assert_eq!(built, "a=1&b=x%20y&ok=true");
+    }
+
+    /// A Lua string is bytes: a key or value that is not UTF-8 is
+    /// percent-encoded as its bytes and decoded back to them, as `decode`
+    /// does, never replaced with U+FFFD.
+    #[test]
+    fn non_utf8_bytes_survive_query_build_and_parse() {
+        let lua = Lua::new();
+        lua.globals()
+            .set("url", create_url_table(&lua).expect("url"))
+            .expect("set");
+        let built: String = lua
+            .load(r#"return url.query_build({ ["k\xff"] = "v\xfe" })"#)
+            .eval()
+            .expect("build");
+        assert_eq!(built, "k%FF=v%FE");
+        let (key, value): (mlua::LuaString, mlua::LuaString) = lua
+            .load(
+                r#"local t = url.query_parse("k%FF=v%FE")
+                   for k, v in pairs(t) do return k, v end"#,
+            )
+            .eval()
+            .expect("parse");
+        assert_eq!(&*key.as_bytes(), b"k\xff");
+        assert_eq!(&*value.as_bytes(), b"v\xfe");
+    }
+
+    /// A port that is digits but not a port is a malformed URL, not a URL
+    /// without a port.
+    #[test]
+    fn parse_refuses_a_port_out_of_range() {
+        let lua = Lua::new();
+        let url = create_url_table(&lua).expect("url");
+        let parse: mlua::Function = url.get("parse").expect("fn");
+        let (parsed, reason): (Value, Option<String>) =
+            parse.call("http://example.com:99999/x").expect("parse");
+        assert!(parsed.is_nil(), "{parsed:?}");
+        assert!(
+            reason.as_deref().is_some_and(|r| r.contains("port")),
+            "{reason:?}"
+        );
     }
 
     #[test]
@@ -318,6 +381,13 @@ mod tests {
             parse.call("http://example.com:abc/x").expect("parse");
         assert_eq!(parsed.get::<String>("host").unwrap(), "example.com:abc");
         assert!(parsed.get::<Option<u16>>("port").unwrap().is_none());
+        let (parsed, _): (Table, Option<String>) = parse.call("http://[::1]:abc/x").expect("parse");
+        assert_eq!(parsed.get::<String>("host").unwrap(), "[::1]:abc");
+        assert!(parsed.get::<Option<u16>>("port").unwrap().is_none());
+        let (parsed, _): (Table, Option<String>) =
+            parse.call("http://[::1]:8080/x").expect("parse");
+        assert_eq!(parsed.get::<String>("host").unwrap(), "::1");
+        assert_eq!(parsed.get::<u16>("port").unwrap(), 8080);
 
         let (parsed, err): (Value, Option<String>) = parse.call("").expect("parse");
         assert!(parsed.is_nil());

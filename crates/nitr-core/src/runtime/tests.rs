@@ -297,6 +297,94 @@ async fn the_execution_budget_cannot_be_caught_and_ignored() {
     }
 }
 
+/// The load of a script is budgeted like a call: a loop at file scope
+/// fails the load instead of hanging the boot, `nitr check` or a reload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_loads_run_under_the_execution_budget() {
+    let mut rt = test_runtime(Some(Duration::from_millis(100)));
+    let path = write_temp_script("spin.lua", "while true do end");
+
+    let started = Instant::now();
+    let err = tokio::time::timeout(Duration::from_secs(10), rt.register_cfg_fn(&path, ()))
+        .await
+        .unwrap_or_else(|_| panic!("the configuration script escaped the budget"))
+        .expect_err("must trip the budget");
+    assert!(err.to_string().contains("time budget"), "{err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+
+    // `eval_script` is synchronous: a hang would hang the test, so it runs
+    // on a thread the test can give up on.
+    let spun = tokio::task::spawn_blocking(move || {
+        let err = rt.eval_script(&path).expect_err("must trip the budget");
+        (rt, err.to_string())
+    });
+    let (rt, err) = tokio::time::timeout(Duration::from_secs(10), spun)
+        .await
+        .unwrap_or_else(|_| panic!("the handler script escaped the budget"))
+        .expect("join");
+    assert!(err.contains("time budget"), "{err}");
+
+    // The deadline is gone once the load returns: the state is usable.
+    let plain: i64 = rt.lua().load("return 1 + 1").eval().expect("eval");
+    assert_eq!(plain, 2);
+}
+
+/// With `io` enabled, `dofile` and `loadfile` load text only, as `load`
+/// does: bytecode is the sandbox escape they would otherwise reopen.
+#[test]
+fn dofile_and_loadfile_load_text_only() {
+    let rt = Runtime::new_with(RuntimeOpts {
+        libs: StdLib::MATH | StdLib::TABLE | StdLib::STRING | StdLib::IO,
+        memory_limit: MEMORY_LIMIT,
+        dev_mode: false,
+        exec_timeout: None,
+        package_dir: None,
+        extra_package_dirs: Vec::new(),
+    })
+    .expect("runtime");
+    let lua = rt.lua();
+    let text = write_temp_script("chunk.lua", "return 42");
+    let bytecode = lua
+        .load("return 42")
+        .into_function()
+        .expect("compile")
+        .dump(false);
+    let binary = write_temp_script("chunk.luac", "");
+    std::fs::write(&binary, bytecode).expect("write bytecode");
+    lua.globals()
+        .set("text", text.to_string_lossy().to_string())
+        .expect("set");
+    lua.globals()
+        .set("binary", binary.to_string_lossy().to_string())
+        .expect("set");
+    let (loaded, reason, ran, ran_reason, via_text, via_dofile): (
+        bool,
+        String,
+        bool,
+        String,
+        i64,
+        i64,
+    ) = lua
+        .load(
+            r#"local f, err = loadfile(binary)
+               local ok, why = pcall(dofile, binary)
+               return f ~= nil, tostring(err), ok, tostring(why), loadfile(text)(), dofile(text)"#,
+        )
+        .eval()
+        .expect("eval");
+    assert!(!loaded, "loadfile must refuse bytecode");
+    assert!(reason.contains("binary chunk"), "{reason}");
+    assert!(!ran, "dofile must refuse bytecode");
+    assert!(ran_reason.contains("binary chunk"), "{ran_reason}");
+    assert_eq!((via_text, via_dofile), (42, 42));
+    let _ = std::fs::remove_file(text);
+    let _ = std::fs::remove_file(binary);
+}
+
 /// Lua runs `__gc` finalizers with hooks off (lgc.c `GCTM` sets
 /// `allowhook = 0`), so no budget reaches a spinning finalizer and the
 /// state never returns. A metatable carrying `__gc` is refused instead.

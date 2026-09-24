@@ -364,6 +364,48 @@ fn contradictions_are_startup_errors() {
     let err = cfg.validate().expect_err("memory_limit = 0");
     assert!(err.to_string().contains("[lua] memory_limit"), "got: {err}");
 
+    // Hyper's header buffer refuses a longer request line first (431), so
+    // a `max_uri_bytes` at or above it can never give its 414.
+    let mut cfg = valid_base();
+    cfg.limits.max_header_bytes = 16 * 1024;
+    cfg.limits.max_uri_bytes = 16 * 1024;
+    let err = cfg
+        .validate()
+        .expect_err("max_uri_bytes >= max_header_bytes");
+    assert!(
+        err.to_string().contains("[limits] max_uri_bytes"),
+        "got: {err}"
+    );
+
+    // A limit of zero requests or a zero-second window is not a limit.
+    for (requests, window) in [(0, 60), (100, 0)] {
+        let mut cfg = valid_base();
+        cfg.rate_limit.enabled = true;
+        cfg.rate_limit.requests = requests;
+        cfg.rate_limit.window = window;
+        let err = cfg.validate().expect_err("rate limit of zero");
+        assert!(err.to_string().contains("[rate_limit]"), "got: {err}");
+    }
+
+    // An origin is a scheme and a host: a path or a trailing slash never
+    // matches the browser's `Origin` header.
+    for origin in [
+        "https://app.example/",
+        "https://app.example/app",
+        "app.example",
+    ] {
+        let mut cfg = valid_base();
+        cfg.cors.origins = Some(vec![origin.into()]);
+        let err = cfg.validate().expect_err(origin);
+        assert!(
+            err.to_string().contains("[cors] origins"),
+            "{origin}: {err}"
+        );
+    }
+    let mut cfg = valid_base();
+    cfg.cors.origins = Some(vec!["https://app.example:8443".into(), "*".into()]);
+    cfg.validate().expect("well-formed origins");
+
     // Zero slots answers every stream 503, after its handler already ran.
     let mut cfg = valid_base();
     cfg.max_streams = Some(0);

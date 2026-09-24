@@ -467,7 +467,7 @@ returns = [{ type = "string" }]
 [[fn]]
 name = "nitr.csrf"
 feature = "http"
-desc = "As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field). Options: `secret` (required), `cookie` (the cookie NAME, default `_csrf`), `header`, `field`, and `cookie_opts` (the cookie ATTRIBUTES, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set). Note `nitr.session` spells its attribute table `cookie` — here that key is the name. Unsafe requests a browser marks `Sec-Fetch-Site: cross-site` are refused before the token is checked, unless `cookie_opts.same_site = \"None\"` (the setting that means to accept cross-site posts)."
+desc = "As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field of an urlencoded form; a multipart form or a JSON body sends the header). Options: `secret` (required), `cookie` (the cookie NAME, default `_csrf`), `header`, `field`, and `cookie_opts` (the cookie ATTRIBUTES, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set). Note `nitr.session` spells its attribute table `cookie` — here that key is the name. Unsafe requests a browser marks `Sec-Fetch-Site: cross-site` are refused before the token is checked, unless `cookie_opts.same_site = \"None\"` (the setting that means to accept cross-site posts)."
 params = [{ name = "opts", type = "table" }]
 returns = [{ type = "fun" }]
 methods = [
@@ -546,7 +546,7 @@ methods = [
 [[table]]
 name = "nitr.log"
 feature = "log"
-desc = "Structured logging into the request span. Fields become real keys in JSON log output."
+desc = "Structured logging into the request span. The fields table travels as one `fields` value: a JSON document inside the text line, a JSON string inside the JSON line."
 functions = [
   { name = "debug", params = [{ name = "msg", type = "string" }, { name = "fields", type = "table?" }], desc = "Debug-level record." },
   { name = "info", params = [{ name = "msg", type = "string" }, { name = "fields", type = "table?" }], desc = "Info-level record." },
@@ -576,7 +576,7 @@ fields = [
 [[table]]
 name = "nitr.crypto.jwt"
 feature = "crypto"
-desc = "HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list and checks `exp`/`nbf` when present. It does NOT check `iss`, `aud` or `typ` — those are the caller's job — and a token with no `exp` never expires. See docs-feat/jwt.md."
+desc = "HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list and checks `exp`/`nbf` when present. It does NOT check `iss`, `aud` or `typ` — those are the caller's job — and a token with no `exp` never expires."
 functions = [
   { name = "sign", params = [{ name = "claims", type = "table" }, { name = "key", type = "string" }, { name = "opts", type = "table?", desc = "`{ alg = \"HS256\" }`" }], returns = [{ type = "string" }], desc = "Signs a token." },
   { name = "verify", params = [{ name = "token", type = "string" }, { name = "key", type = "string" }, { name = "opts", type = "table", desc = "`{ algorithms = {...}, leeway? }` — the allow-list is required." }], returns = [{ type = "table|nil", desc = "The claims." }, { type = "string|nil", desc = "The rejection reason." }], desc = "Verifies the signature, the `alg` against the allow-list, and `exp`/`nbf` if the token carries them. Checks no other claim: compare `iss`/`aud` yourself, and require `exp` if your tokens must expire (`aud` may be a string or an array)." },
@@ -667,7 +667,7 @@ name = "nitr.url"
 feature = "url"
 desc = "Percent-encoding, query strings, and a lexical URL splitter."
 functions = [
-  { name = "encode", params = [{ name = "value", type = "string" }], returns = [{ type = "string" }], desc = "Percent-encodes a component (like `encodeURIComponent`)." },
+  { name = "encode", params = [{ name = "value", type = "string" }], returns = [{ type = "string" }], desc = "Percent-encodes a component: everything but ASCII letters, digits and `-_.~` (RFC 3986 unreserved). Stricter than `encodeURIComponent`, which also leaves `!*'()` alone." },
   { name = "decode", params = [{ name = "value", type = "string" }], returns = [{ type = "string" }], desc = "Percent-decodes (`+` is left alone — that is a form convention)." },
   { name = "query_parse", params = [{ name = "query", type = "string" }], returns = [{ type = "table<string, string>" }], desc = "Parses a query string (`+` as space; last duplicate wins)." },
   { name = "query_build", params = [{ name = "params", type = "table" }], returns = [{ type = "string" }], desc = "Builds a query string, keys sorted." },

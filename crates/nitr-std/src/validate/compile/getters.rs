@@ -128,7 +128,26 @@ fn literal_of(value: Value, key: &str, path: &str) -> mlua::Result<Literal> {
 }
 
 /// A literal must fit the rule's type: `one_of = { 1, 2 }` on a string
-/// rule could never match anything.
+/// rule could never match anything. Text that spells a value of the type
+/// is that value: shorthand types an array's `contains:3` by the array,
+/// not by the items it cannot see.
+fn fit_literal(lit: Literal, kind: Kind, key: &str, path: &str) -> mlua::Result<Literal> {
+    let lit = match (lit, kind) {
+        (Literal::Str(text), Kind::Number | Kind::Integer) => match text.parse::<f64>() {
+            Ok(n) if n.is_finite() => Literal::Num(n),
+            _ => Literal::Str(text),
+        },
+        (Literal::Str(text), Kind::Boolean) => match text.as_str() {
+            "true" => Literal::Bool(true),
+            "false" => Literal::Bool(false),
+            _ => Literal::Str(text),
+        },
+        (lit, _) => lit,
+    };
+    check_literal_kind(&lit, kind, key, path)?;
+    Ok(lit)
+}
+
 fn check_literal_kind(lit: &Literal, kind: Kind, key: &str, path: &str) -> mlua::Result<()> {
     let ok = matches!(
         (lit, kind),
@@ -158,11 +177,12 @@ pub(super) fn get_literal(
 ) -> mlua::Result<Option<Literal>> {
     match rule.get::<Value>(key)? {
         Value::Nil => Ok(None),
-        value => {
-            let lit = literal_of(value, key, path)?;
-            check_literal_kind(&lit, kind, key, path)?;
-            Ok(Some(lit))
-        }
+        value => Ok(Some(fit_literal(
+            literal_of(value, key, path)?,
+            kind,
+            key,
+            path,
+        )?)),
     }
 }
 
@@ -178,8 +198,7 @@ pub(super) fn get_literals(
             let mut literals = Vec::new();
             for value in list.sequence_values::<Value>() {
                 let lit = literal_of(value?, key, path)?;
-                check_literal_kind(&lit, kind, key, path)?;
-                literals.push(lit);
+                literals.push(fit_literal(lit, kind, key, path)?);
             }
             if literals.is_empty() {
                 return Err(bad_schema(path, format!("`{key}` must not be empty")));

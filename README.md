@@ -348,7 +348,7 @@ For lower-level embedding, `nitr::Runtime` exposes the Lua state, `register_modu
 
 ## Documentation
 
-Current references: the [`nitr.*` API](resources/nitr-api.md) (generated), the [error-handling guide](docs/errors.md), the [passwords and Basic auth guide](docs/passwords.md), the [stability policy](docs/stability.md) and the [threat model](docs/threat-model.md). The original proposal documents are archived in [.docs/](.docs/).
+Current references: the [`nitr.*` API](resources/nitr-api.md) (generated), and the [annotated `nitr.toml`](nitr.toml).
 
 ## Benchmarks
 

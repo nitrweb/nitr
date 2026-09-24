@@ -135,6 +135,12 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
     let mut env_base = PathBuf::from(".");
     let bundled = bundle::load()?;
     let is_bundle = bundled.is_some();
+    if is_bundle && cli.config.is_some() {
+        anyhow::bail!(
+            "this executable carries a bundle with its own configuration; --config is not \
+             accepted (values that must differ per deployment come from the environment)"
+        );
+    }
     let mut cfg = match bundled {
         Some(cfg) => cfg,
         None => match &cli.config {
@@ -204,19 +210,39 @@ fn test_logs(command: &Option<Command>, cfg: &Config) -> Option<TestLogs> {
     }
 }
 
-fn init_logging(cfg: Option<&Config>, dev: bool, to_stderr: bool, test: Option<TestLogs>) {
-    let fallback = || {
+fn init_logging(
+    cfg: Option<&Config>,
+    dev: bool,
+    to_stderr: bool,
+    test: Option<TestLogs>,
+) -> anyhow::Result<()> {
+    let fallback = || -> anyhow::Result<tracing_subscriber::EnvFilter> {
         let configured = cfg.and_then(|c| c.log.level.clone());
-        tracing_subscriber::EnvFilter::new(configured.unwrap_or_else(|| {
+        let level = configured.unwrap_or_else(|| {
             if dev || cfg.is_some_and(|c| c.dev_mode) {
                 "debug".into()
             } else {
                 "info".into()
             }
-        }))
+        });
+        // `EnvFilter` reads a bare word it does not know as a target name
+        // at TRACE, so a misspelt level would silently log almost nothing.
+        let is_level =
+            |word: &str| word.eq_ignore_ascii_case("off") || word.parse::<tracing::Level>().is_ok();
+        let directive_ok = |directive: &str| directive.contains('=') || is_level(directive.trim());
+        if !level.split(',').all(directive_ok) {
+            anyhow::bail!(
+                "[log] level = {level:?} is not a level (error, warn, info, debug, trace, \
+                 off) or a `target=level` list"
+            );
+        }
+        tracing_subscriber::EnvFilter::try_new(&level)
+            .map_err(|err| anyhow::anyhow!("[log] level = {level:?} is not a valid filter: {err}"))
     };
-    let filter =
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| fallback());
+    let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
+        Ok(filter) => filter,
+        Err(_) => fallback()?,
+    };
     let json = matches!(cfg.map(|c| c.log.format), Some(nitr::LogFormat::Json));
     // One color decision drives everything: the log format (JSON must
     // never carry ANSI), the stream the subscriber writes to (stdout),
@@ -238,13 +264,12 @@ fn init_logging(cfg: Option<&Config>, dev: bool, to_stderr: bool, test: Option<T
     nitr::diag::set_console_colors(colors);
     if let Some(test) = test {
         init_test_logging(filter, test, json, colors, to_stderr);
-        return;
+        return Ok(());
     }
     // Span close events are what make the span timings visible: the
     // `request` span's close line is an access-log entry (id, method,
     // path, status), and at debug level the inner spans (`pool_checkout`,
     // `lua_handler`, `db_query`, `fetch`) decompose where the time went.
-    // See docs/logging.md for the schema.
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE);
@@ -253,6 +278,7 @@ fn init_logging(cfg: Option<&Config>, dev: bool, to_stderr: bool, test: Option<T
     } else {
         finish_logging(builder, json, colors);
     }
+    Ok(())
 }
 
 /// The last step of the subscriber setup, over whichever stream was
@@ -541,14 +567,14 @@ async fn run_main() -> anyhow::Result<()> {
     // `init` runs before any configuration exists; everything else loads
     // the configuration first so `[log]` can shape the subscriber.
     if let Some(Command::Init { dir, minimal }) = &cli.command {
-        init_logging(None, cli.dev, logs_to_stderr(&cli.command), None);
+        init_logging(None, cli.dev, logs_to_stderr(&cli.command), None)?;
         return scaffold::init(dir.as_deref().unwrap_or(Path::new(".")), *minimal);
     }
     // `hash-password` needs no application at all: it is the one command
     // an operator runs *before* there is a working nitr.toml, and a
     // broken one must not stand between them and a credential.
     if let Some(Command::HashPassword) = &cli.command {
-        init_logging(None, cli.dev, logs_to_stderr(&cli.command), None);
+        init_logging(None, cli.dev, logs_to_stderr(&cli.command), None)?;
         return cmd::hash_password::hash_password().await;
     }
 
@@ -559,11 +585,11 @@ async fn run_main() -> anyhow::Result<()> {
                 cli.dev,
                 logs_to_stderr(&cli.command),
                 test_logs(&cli.command, &cfg),
-            );
+            )?;
             cfg
         }
         Err(err) => {
-            init_logging(None, cli.dev, logs_to_stderr(&cli.command), None);
+            init_logging(None, cli.dev, logs_to_stderr(&cli.command), None)?;
             return Err(err);
         }
     };

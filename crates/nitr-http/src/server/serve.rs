@@ -67,25 +67,18 @@ impl Server {
         let mut shutdown = std::pin::pin!(shutdown);
 
         // SIGHUP triggers a zero-downtime pool swap (Unix only; the
-        // channel simply stays silent elsewhere). The stream is created
-        // HERE, synchronously, so that by the time the "listening" line is
-        // logged the default disposition (terminate!) is gone — a reload
-        // sent the moment the server looks up must never kill it.
+        // channel simply stays silent elsewhere). The stream was taken at
+        // build, so the signal has been owned since before a pidfile could
+        // name this process.
         let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<()>(1);
         #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
+        if let Some(mut hangup) = self.reload_signal.take() {
             let tx = reload_tx.clone();
-            match signal(SignalKind::hangup()) {
-                Ok(mut hangup) => {
-                    tokio::spawn(async move {
-                        while hangup.recv().await.is_some() {
-                            let _ = tx.try_send(());
-                        }
-                    });
+            tokio::spawn(async move {
+                while hangup.recv().await.is_some() {
+                    let _ = tx.try_send(());
                 }
-                Err(err) => tracing::warn!("failed to install the SIGHUP reload handler: {err}"),
-            }
+            });
         }
         // Dev mode: a notify-based watcher feeds the same reload channel a
         // SIGHUP does, so a save rebuilds the pool immediately instead of
@@ -157,10 +150,9 @@ impl Server {
         // port stays plaintext even under `[tls]`, because a prober that
         // must complete a TLS handshake fails exactly when liveness must
         // still answer — during certificate trouble. The startup line says
-        // so instead of implying it with a bare `http://`; the decision
-        // and its threat-model entry belong to the TLS-surface work
-        // (audits/3-remediation, T-6). One closure serves both listener
-        // branches, so their wording cannot drift apart.
+        // so instead of implying it with a bare `http://`. One closure
+        // serves both listener branches, so their wording cannot drift
+        // apart.
         let tls_enabled = self.cfg.tls.enabled;
         let log_probe_endpoint = move |addr: &str| {
             if tls_enabled {

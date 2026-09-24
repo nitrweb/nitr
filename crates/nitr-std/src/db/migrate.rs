@@ -131,9 +131,20 @@ fn ensure_table(conn: &Connection) -> Result {
     Ok(())
 }
 
-/// `version → checksum` for everything already applied.
+/// `version → checksum` for everything already applied; nothing before
+/// the ledger exists. Reading never creates it: `status` and the boot
+/// check must leave a database as they found it.
 fn applied(conn: &Connection) -> Result<std::collections::HashMap<i64, String>> {
-    ensure_table(conn)?;
+    let ledger: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [TABLE],
+            |row| row.get(0),
+        )
+        .map_err(|err| Error::Config(format!("cannot read {TABLE}: {err}")))?;
+    if ledger == 0 {
+        return Ok(std::collections::HashMap::new());
+    }
     let mut stmt = conn
         .prepare(&format!("SELECT version, checksum FROM {TABLE}"))
         .map_err(|err| Error::Config(format!("cannot read {TABLE}: {err}")))?;
@@ -167,6 +178,29 @@ pub fn status(conn: &Connection, dir: &Path) -> Result<Vec<(Migration, State)>> 
         .collect())
 }
 
+/// [`status`] for the database at `path` without touching it: a missing
+/// file is a database where nothing has run, and an existing one is
+/// opened read-only, with none of the pragmas a live connection sets.
+pub fn status_at(path: &Path, dir: &Path) -> Result<Vec<(Migration, State)>> {
+    if !path.exists() {
+        return Ok(discover(dir)?
+            .into_iter()
+            .map(|migration| (migration, State::Pending))
+            .collect());
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|err| {
+        Error::Config(format!(
+            "failed to open database at {}: {err}",
+            path.display()
+        ))
+    })?;
+    status(&conn, dir)
+}
+
 /// Names of the migrations that have not run yet.
 ///
 /// A migration whose file changed after being applied counts as an error,
@@ -198,6 +232,7 @@ pub fn pending(conn: &Connection, dir: &Path) -> Result<Vec<String>> {
 /// migrations applied and the failing one entirely undone — the database is
 /// always at some version that actually ran, never half of one.
 pub fn run(conn: &Connection, dir: &Path) -> Result<Vec<String>> {
+    ensure_table(conn)?;
     let applied = applied(conn)?;
     let mut done = Vec::new();
 

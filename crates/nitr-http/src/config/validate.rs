@@ -85,6 +85,37 @@ impl Config {
                 )));
             }
         }
+        // hyper reads the request line into a buffer of `max_header_bytes`
+        // (8 KiB at least) and answers a longer one 431 itself, so a URI
+        // bound at or past that buffer could never give its 414.
+        let header_buffer = self.limits.max_header_bytes.max(8 * 1024);
+        if self.limits.max_uri_bytes >= header_buffer {
+            return Err(Error::Config(format!(
+                "[limits] max_uri_bytes = {} is not below the header buffer of {header_buffer} \
+                 bytes ([limits] max_header_bytes, at least 8192): a longer request line is \
+                 refused with 431 before it could be refused with 414",
+                self.limits.max_uri_bytes
+            )));
+        }
+        if self.rate_limit.enabled && (self.rate_limit.requests == 0 || self.rate_limit.window == 0)
+        {
+            return Err(Error::Config(format!(
+                "[rate_limit] requests = {} and window = {} must both be at least 1",
+                self.rate_limit.requests, self.rate_limit.window
+            )));
+        }
+        for origin in self.cors.origins.iter().flatten() {
+            let well_formed = origin == "*"
+                || origin.split_once("://").is_some_and(|(scheme, rest)| {
+                    !scheme.is_empty() && !rest.is_empty() && !rest.contains('/')
+                });
+            if !well_formed {
+                return Err(Error::Config(format!(
+                    "[cors] origins entry `{origin}` is not an origin: a browser sends \
+                     `scheme://host[:port]`, with no path and no trailing slash"
+                )));
+            }
+        }
         // mlua enforces the allocator limit only above zero (memory.rs),
         // so 0 would silently lift the cap on every state.
         if self.lua.memory_limit == 0 {

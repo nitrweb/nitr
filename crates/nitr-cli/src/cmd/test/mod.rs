@@ -722,7 +722,15 @@ pub(crate) async fn watch(cfg: Config, args: &TestArgs) -> anyhow::Result<()> {
             }
         }
     };
-    watch_loop(run_once, &mut changed, tokio::signal::ctrl_c()).await
+    // A machine report owns stdout: the session's own lines go to stderr.
+    let machine_stdout = args.reporter != Reporter::Pretty && args.output.is_none();
+    watch_loop(
+        run_once,
+        &mut changed,
+        tokio::signal::ctrl_c(),
+        machine_stdout,
+    )
+    .await
 }
 
 /// The `--watch` session: a run, a wait for the next change, again —
@@ -740,19 +748,27 @@ async fn watch_loop<R, Fut, S>(
     mut run_once: R,
     changed: &mut tokio::sync::mpsc::Receiver<()>,
     stop: S,
+    machine_stdout: bool,
 ) -> anyhow::Result<()>
 where
     R: FnMut() -> Fut,
     Fut: std::future::Future<Output = ()>,
     S: std::future::Future,
 {
+    let say = |line: &str| {
+        if machine_stdout {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    };
     tokio::pin!(stop);
     loop {
         tokio::select! {
             () = run_once() => {}
             _ = &mut stop => return Ok(()),
         }
-        println!("\nwatching for changes (Ctrl-C to stop)");
+        say("\nwatching for changes (Ctrl-C to stop)");
         tokio::select! {
             got = changed.recv() => {
                 if got.is_none() {
@@ -760,7 +776,7 @@ where
                         "--watch: the file watcher stopped; run with --nocapture to see why"
                     );
                 }
-                println!();
+                say("");
             }
             _ = &mut stop => return Ok(()),
         }
@@ -832,7 +848,7 @@ mod tests {
             runs += 1;
             std::future::ready(())
         };
-        let err = watch_loop(run_once, &mut changed, std::future::pending::<()>())
+        let err = watch_loop(run_once, &mut changed, std::future::pending::<()>(), false)
             .await
             .expect_err("a dead watcher is an error");
         assert!(
@@ -865,7 +881,7 @@ mod tests {
                 }
             }
         };
-        let session = watch_loop(run_once, &mut changed, stop);
+        let session = watch_loop(run_once, &mut changed, stop, false);
         tokio::time::timeout(std::time::Duration::from_secs(5), session)
             .await
             .expect("the stop ends the run in progress")

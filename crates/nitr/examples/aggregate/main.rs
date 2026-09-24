@@ -35,6 +35,9 @@ async fn main() -> nitr::Result {
         .unwrap_or(3000);
 
     let mut cfg = Config::default();
+    // The dashboard fetches this server's own endpoints: with one state,
+    // the fetch would wait for the state its own request holds.
+    cfg.workers = cfg.workers.max(2);
     // This example fetches its own endpoints over loopback, which the
     // SSRF policy refuses by default — so the allow-list is what refuses
     // everything else, and the upstream base is handed to the script via
