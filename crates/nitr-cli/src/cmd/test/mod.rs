@@ -406,6 +406,19 @@ fn call_error(err: &nitr::Error, opts: &nitr::RuntimeOpts) -> String {
     }
 }
 
+/// A test file's path as the runner shows it: `/`-separated on every
+/// platform, so a `file:line` site, an error message and a report read the
+/// same on Windows — where Lua's `%q` would also double every `\`. Only
+/// Windows is rewritten: elsewhere a `\` is a legal file name byte.
+fn portable_path(path: &Path) -> String {
+    let shown = path.display().to_string();
+    if cfg!(windows) {
+        shown.replace('\\', "/")
+    } else {
+        shown
+    }
+}
+
 async fn run_file(
     run: &Run,
     file: &Path,
@@ -418,7 +431,7 @@ async fn run_file(
         .unwrap_or_else(|| file.display().to_string());
     let mut report = FileReport {
         name: name.clone(),
-        path: file.display().to_string(),
+        path: portable_path(file),
         tests: Vec::new(),
         focused: false,
     };
@@ -469,7 +482,7 @@ async fn run_file(
     let chunk = match rt
         .lua()
         .load(source)
-        .set_name(format!("@{}", file.display()))
+        .set_name(format!("@{}", portable_path(file)))
         .set_mode(mlua::chunk::ChunkMode::Text)
         .into_function()
     {
@@ -741,32 +754,61 @@ pub(crate) async fn watch(cfg: Config, args: &TestArgs) -> anyhow::Result<()> {
     else {
         bail!("--watch: there is nothing to watch, or the platform file watcher is unavailable");
     };
-    // One listener for the whole session, raced against the runs as well
-    // as the waits: a Ctrl-C pressed mid-run must not be lost.
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
+    let run_once = || {
+        let cfg = cfg.clone();
+        let args = args.clone();
+        async move {
+            // On a task of its own: a run is CPU-bound Lua that may finish
+            // inside a single poll, and raced in place it would keep the
+            // session from seeing a Ctrl-C until it was done.
+            match tokio::spawn(async move { run(cfg, &args).await }).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => eprintln!("{err:#}"),
+                Err(err) => eprintln!("the test run did not complete: {err}"),
+            }
+        }
+    };
+    watch_loop(run_once, &mut changed, tokio::signal::ctrl_c()).await
+}
+
+/// The `--watch` session: a run, a wait for the next change, again —
+/// until `stop` (Ctrl-C) fires.
+///
+/// `stop` is one future for the whole session, polled during the runs as
+/// well as the waits. Tokio installs its SIGINT handler on the first poll
+/// of `ctrl_c()` and keeps it for the life of the process, so a listener
+/// created fresh for each wait left every Ctrl-C pressed mid-run with no
+/// one to hear it. For the race to mean anything the run must yield,
+/// which is why `watch` hands each run to its own task. A closed `changed` channel means the watcher thread
+/// gave up (its reason is in the log); returning `Ok` then would read as
+/// a clean stop, so it is an error.
+async fn watch_loop<R, Fut, S>(
+    mut run_once: R,
+    changed: &mut tokio::sync::mpsc::Receiver<()>,
+    stop: S,
+) -> anyhow::Result<()>
+where
+    R: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+    S: std::future::Future,
+{
+    tokio::pin!(stop);
     loop {
         tokio::select! {
-            ran = run(cfg.clone(), args) => {
-                if let Err(err) = ran {
-                    eprintln!("{err:#}");
-                }
-            }
-            _ = &mut ctrl_c => return Ok(()),
+            () = run_once() => {}
+            _ = &mut stop => return Ok(()),
         }
         println!("\nwatching for changes (Ctrl-C to stop)");
         tokio::select! {
             got = changed.recv() => {
                 if got.is_none() {
-                    // The watcher thread gave up (its reason is in the
-                    // log): exiting 0 here would read as a clean stop.
                     bail!(
                         "--watch: the file watcher stopped; run with --nocapture to see why"
                     );
                 }
                 println!();
             }
-            _ = &mut ctrl_c => return Ok(()),
+            _ = &mut stop => return Ok(()),
         }
     }
 }
@@ -823,5 +865,68 @@ mod tests {
         refuse_watched_output(&cfg, &dir.join("report.xml")).expect("beside the app");
         refuse_watched_output(&cfg, Path::new("junit.xml")).expect("a bare file name");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A watcher thread that gives up closes its channel: the session
+    /// ends with an error naming it, never with a clean exit 0.
+    #[tokio::test]
+    async fn watch_fails_when_its_watcher_dies() {
+        let (tx, mut changed) = tokio::sync::mpsc::channel(1);
+        drop(tx);
+        let mut runs = 0;
+        let run_once = || {
+            runs += 1;
+            std::future::ready(())
+        };
+        let err = watch_loop(run_once, &mut changed, std::future::pending::<()>())
+            .await
+            .expect_err("a dead watcher is an error");
+        assert!(
+            err.to_string().contains("the file watcher stopped"),
+            "{err}"
+        );
+        assert_eq!(runs, 1);
+    }
+
+    /// A stop raised while a run is in progress ends the session there:
+    /// the one stop future is raced against the runs, not only the waits.
+    /// Without that this hangs (bounded by the timeout).
+    #[tokio::test]
+    async fn watch_stops_in_the_middle_of_a_run() {
+        let (tx, mut changed) = tokio::sync::mpsc::channel(1);
+        tx.send(()).await.expect("queue a change");
+        let (stop_tx, stop) = tokio::sync::oneshot::channel::<()>();
+        let mut stop_tx = Some(stop_tx);
+        let mut runs = 0;
+        let run_once = || {
+            runs += 1;
+            // The second run raises the stop, then never finishes.
+            let second = runs == 2;
+            if second && let Some(stop_tx) = stop_tx.take() {
+                let _ = stop_tx.send(());
+            }
+            async move {
+                if second {
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        let session = watch_loop(run_once, &mut changed, stop);
+        tokio::time::timeout(std::time::Duration::from_secs(5), session)
+            .await
+            .expect("the stop ends the run in progress")
+            .expect("a stop is a clean exit");
+        assert_eq!(runs, 2);
+        drop(tx);
+    }
+
+    /// A test file's shown path is `/`-separated whatever the platform
+    /// joined it with; a `\` inside a Unix file name is left alone.
+    #[test]
+    fn a_test_path_shows_with_forward_slashes() {
+        let joined = Path::new("tests").join("sub").join("a_test.lua");
+        assert_eq!(portable_path(&joined), "tests/sub/a_test.lua");
+        #[cfg(not(windows))]
+        assert_eq!(portable_path(Path::new("tests/a\\b.lua")), "tests/a\\b.lua");
     }
 }
