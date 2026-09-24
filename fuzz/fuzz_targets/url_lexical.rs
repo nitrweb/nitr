@@ -70,18 +70,16 @@
 //! * **`host` implies the input contained `//`.** An authority is only
 //!   ever read out of one; sniffing a host out of a bare path would let
 //!   `parse("/redirect")` name a foreign origin.
-//! * **The port is a `u16` and out-of-range digits are dropped, host
-//!   intact.** This is characterization, not endorsement: `:99999` parses
-//!   into `port.parse::<u16>().ok()`, which yields `None` while the digits
-//!   are still cut off the host — so `host` says `h.example` and `port`
-//!   says nothing, and a script reassembling the two silently targets the
-//!   default port. `:abc` behaves differently (the text stays in `host`).
-//!   Pinning it here means the inconsistency cannot change unnoticed.
+//! * **The port is a `u16`, or the URL is refused.** `:99999` answers
+//!   `nil, "port out of range"` rather than a result whose host lost its
+//!   digits and whose port says nothing, which a script reassembling the
+//!   two would read as the default port. `:abc` is not a port at all and
+//!   stays part of `host`.
 #![no_main]
 use std::collections::BTreeMap;
 
 use libfuzzer_sys::fuzz_target;
-use mlua::{Function, Lua, Table, Value};
+use mlua::{Function, Lua, LuaString, Table, Value};
 use nitr_fuzz::Input;
 
 thread_local! {
@@ -107,14 +105,27 @@ fn member(lua: &Lua, name: &str) -> Function {
         .expect("nitr.url member")
 }
 
-/// A `query_parse` result as a map. Ordering is not part of the contract —
-/// a Lua table has none — so the comparison is over key and value only.
-fn map_of(table: &Table, what: &str) -> BTreeMap<String, String> {
+/// A `query_parse` result as a map of bytes. Ordering is not part of the
+/// contract — a Lua table has none — so the comparison is over key and
+/// value only.
+fn map_of(table: &Table, what: &str) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut out = BTreeMap::new();
-    for pair in table.pairs::<String, String>() {
+    for pair in table.pairs::<LuaString, LuaString>() {
         let (key, value) = pair
             .unwrap_or_else(|err| panic!("{what}: query_parse produced a non-string pair: {err}"));
-        out.insert(key, value);
+        out.insert(key.as_bytes().to_vec(), value.as_bytes().to_vec());
+    }
+    out
+}
+
+/// The same map read as `form_urlencoded` reads bytes: lossy UTF-8.
+fn lossy(map: &BTreeMap<Vec<u8>, Vec<u8>>) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (key, value) in map {
+        out.insert(
+            String::from_utf8_lossy(key).into_owned(),
+            String::from_utf8_lossy(value).into_owned(),
+        );
     }
     out
 }
@@ -122,9 +133,10 @@ fn map_of(table: &Table, what: &str) -> BTreeMap<String, String> {
 /// The oracle: the same parse as implemented by the `url` crate, folded
 /// last-write-wins because that is what writing into a Lua table does.
 ///
-/// Both sides percent-decode with `percent_encoding` and both replace the
-/// invalid UTF-8 a decode can produce (`decode_utf8_lossy` on either side),
-/// so lossiness is *shared* and cannot by itself explain a divergence.
+/// `query_parse` keeps the decoded bytes (a Lua string is bytes), while
+/// `form_urlencoded` replaces invalid UTF-8; the differential compares
+/// `nitr`'s bytes read the same lossy way, so that difference cannot by
+/// itself explain a divergence.
 fn form_urlencoded_map(query: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
@@ -313,7 +325,7 @@ fuzz_target!(|data: &[u8]| {
             let ours = map_of(&bare_table, "query_parse");
             let theirs = form_urlencoded_map(bare);
             assert_eq!(
-                ours, theirs,
+                lossy(&ours), theirs,
                 "nitr.url.query_parse and url::form_urlencoded::parse disagree on {bare:?}: \
                  nitr said {ours:?}, form_urlencoded (which is what req.query uses) said {theirs:?}"
             );
@@ -372,11 +384,18 @@ fuzz_target!(|data: &[u8]| {
                 value.is_nil() && reason.as_deref() == Some("empty URL"),
                 "parse(\"\") must be (nil, \"empty URL\"), got ({value:?}, {err:?})"
             );
-        } else {
+        } else if let Some(reason) = err.as_string() {
+            // The one other refusal: an authority whose port is digits but
+            // not a `u16`. It is reported, never a result with a guessed port.
             assert!(
-                err.is_nil(),
-                "parse({url_text:?}) reported the error {err:?} alongside a result"
+                value.is_nil() && reason.to_string_lossy() == "port out of range",
+                "parse({url_text:?}) reported ({value:?}, {err:?})"
             );
+            assert!(
+                url_text.contains("//") && url_text.contains(':'),
+                "parse({url_text:?}) refused a port it has no authority for"
+            );
+        } else {
             let table = value
                 .as_table()
                 .unwrap_or_else(|| panic!("parse({url_text:?}) returned {value:?}, not a table"));
@@ -384,11 +403,19 @@ fuzz_target!(|data: &[u8]| {
         }
 
         // The port edge, reached by construction rather than by hoping the
-        // fuzzer spells out a six-digit numeral. `split_authority` cuts the
-        // digits off the host and then parses them as a `u16`, so anything
-        // above 65535 leaves the host shortened and the port unreported.
+        // fuzzer spells out a six-digit numeral: a `u16` is the port, and
+        // anything above 65535 is refused rather than dropped.
         let synthetic = format!("//h.example:{port}/p");
-        let (value, _): (Value, Value) = parse.call(synthetic.as_str()).expect("parse");
+        let (value, err): (Value, Value) = parse.call(synthetic.as_str()).expect("parse");
+        let Ok(port) = u16::try_from(port) else {
+            let reason = err.as_string().map(|s| s.to_string_lossy());
+            assert!(
+                value.is_nil() && reason.as_deref() == Some("port out of range"),
+                "parse({synthetic:?}) must refuse the port, got ({value:?}, {err:?})"
+            );
+            lua.gc_collect().expect("gc");
+            return;
+        };
         let table = value.as_table().expect("parse of a synthetic authority");
         check_parse(table, &synthetic);
         assert_eq!(
@@ -408,12 +435,10 @@ fuzz_target!(|data: &[u8]| {
             "parse({synthetic:?}) did not split the path off the authority"
         );
         let got = table.get::<Option<u16>>("port").expect("port");
-        let want = u16::try_from(port).ok();
         assert_eq!(
-            got, want,
-            "parse({synthetic:?}) reported port {got:?}; a port is parsed as a u16, so {port} \
-             must yield {want:?} — and when it yields nothing the digits are still gone from \
-             the host, which is the inconsistency this pins"
+            got,
+            Some(port),
+            "parse({synthetic:?}) reported port {got:?}, not {port}"
         );
 
         lua.gc_collect().expect("gc");

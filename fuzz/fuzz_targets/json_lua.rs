@@ -62,12 +62,13 @@
 //!   exact, a non-UTF8 string (value or key) **refused** with the
 //!   UTF-8 message — it used to come out as an array of bytes, a silent
 //!   change of type that a session field once fell into — an empty
-//!   table `{}` against an array-marked one `[]`, and the three lossy
-//!   cases — a mixed table dropping its map half, a sparse array dropping
-//!   everything past the first hole, and an integer key colliding with
-//!   the equal string key into a document with **duplicate names**. Those
-//!   three are reported as findings; they are asserted here as they
-//!   behave so that a change to any of them is loud instead of silent.
+//!   table `{}` against an array-marked one `[]`, a table mixing list
+//!   items and named keys **refused** (it used to drop its map half), a
+//!   dense sparse array written out with `null` in its holes and a far
+//!   sparse one as a map (both used to stop at the first hole), and the
+//!   one lossy case left, an integer key colliding with the equal string
+//!   key into a document with **duplicate names**, asserted as it behaves
+//!   so that a change to it is loud instead of silent.
 //! * **The grammar the decoder refuses** ([`REFUSED`]). The fixpoint only
 //!   ever fires on documents that *parse*, so on its own it says nothing
 //!   about what `nitr.json.decode` must turn away, and a decoder that grew
@@ -94,6 +95,7 @@ use nitr_fuzz::Input;
 /// anything else means the failure path grew a case.
 const ENCODE_ERRORS: &[&str] = &[
     "nested deeper than 128 levels",
+    "mixes list items and named keys",
     "expands to more than",
     "key must be a string",
     "float key must be finite",
@@ -148,20 +150,27 @@ const SHAPES: &[(&str, &str, Want)] = &[
         "return setmetatable({}, ARRAY_MT)",
         Want::Exact("[]"),
     ),
-    // Lossy, and asserted as it behaves: the table has a border, so it
-    // serializes as a sequence and `a = 3` is gone.
+    // JSON has no shape for it; written as a list, `a = 3` would vanish.
     (
         "a mixed array and map",
         "return {1, 2, a = 3}",
-        Want::Exact("[1,2]"),
+        Want::Refused("mixes list items and named keys"),
     ),
-    // Lossy: `#t` is 1, so everything past the hole is dropped.
+    // Dense enough (the highest key at most twice the count): a list, its
+    // hole a `null`, never cut at the first one.
     (
         "a sparse array",
         "return {[1] = 'a', [3] = 'c'}",
-        Want::Exact("[\"a\"]"),
+        Want::Exact("[\"a\",null,\"c\"]"),
     ),
-    // Lossy, and the worst of the three: an integer key and the equal
+    // Too sparse to write out as a list: a map, so one high index cannot
+    // expand into a run of `null`s.
+    (
+        "a far sparse array",
+        "return {[1] = 'a', [100] = 'z'}",
+        Want::Holds(&["\"1\":\"a\"", "\"100\":\"z\""]),
+    ),
+    // Lossy, and asserted as it behaves: an integer key and the equal
     // string key both stringify, so the document carries the same name
     // twice and re-decoding keeps only one.
     (
