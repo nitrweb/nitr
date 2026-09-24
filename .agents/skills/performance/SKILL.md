@@ -1,58 +1,64 @@
 ---
 name: performance
-description: Performance work in Nitr — measure first, the hot-path rules, and the bounds that exist by design. Read before optimizing anything or touching the request path, the pool, or a limit.
+description: Performance work in Nitr — measure before and after, the hot-path rules for the request path, pool and streaming, and the limits that are safety bounds rather than tuning knobs. Use before optimizing anything or touching the request path, the pool, a cache, or a limit.
 ---
 
 # Performance (Nitr)
 
-Third priority, after safety and security. A faster path that weakens a
-bound, skips a check, or moves work onto the async runtime is a
-regression, not an optimization.
+Performance is the third priority. A faster path that weakens a bound,
+skips a check, or moves blocking work onto the async runtime is a
+regression.
 
-## Measure first
+## Measure, or do not claim
 
-- Benchmarks: `crates/nitr/benches/` (`runtime.rs`, `dispatch.rs`,
-  `stdlib.rs`, shared `common/mod.rs`) on divan through the
-  `codspeed-divan-compat` alias; `cargo bench --features all` locally,
-  CodSpeed in CI. A perf change carries a bench and its before/after
-  numbers in the report.
-- Profiling: `cargo build --profile profiling` keeps symbols with the
-  release code shape.
-- Feature-gated bench groups are `cfg`-ed out, so a minimal build stays
-  measurable; keep new groups the same way.
-- Claims like "this is expensive" are verified with a number or dropped.
+- **Benchmarks:** `crates/nitr/benches/` (`runtime.rs`, `dispatch.rs`,
+  `stdlib.rs`, and the shared `common/mod.rs`), on divan through the
+  `codspeed-divan-compat` alias. Run them locally with
+  `cargo bench --features all`; CI uses CodSpeed.
+- **A performance change reports before-and-after numbers** from the same
+  bench on the same machine. "This is expensive" and "this is faster" are
+  claims (`investigate`): back them with a number, or drop them.
+- **Profiling:** `cargo build --profile profiling` keeps symbols with the
+  release code shape. Profile a live binary under load when bench
+  harnesses distort the picture.
+- **Feature-gated bench groups are `cfg`-ed out,** so a minimal build
+  stays measurable. Keep new groups the same way.
 
 ## Hot-path rules (the request path, the pool, streaming)
 
-- Nothing blocking on a tokio worker: SQLite, argon2, template loading
-  and rendering, file reads over a few KiB go through `spawn_blocking`
-  or the async filesystem API.
-- The accept loop takes no lock and does no I/O beyond accepting; a
-  rebuild (reload) runs on its own task.
-- Per-request allocation is bounded and boring: clone `Arc`s, not data;
-  no `format!` in a loop; prepared statements come from the cache.
-- One shared lock per request at most, held for a bounded, allocation-
-  free critical section (the rate limiter is the model: purge time-gated,
-  map capped). A `retain` under a global mutex on every request is a
-  denial of service waiting for traffic.
-- Channels are bounded (streaming bodies use capacity 2); backpressure
-  is the design, not a bug.
-- Lua states are reused, not rebuilt; a rebuild is for poison only.
+- **Nothing blocking on a tokio worker.** SQLite, argon2, templates and
+  file reads go through `spawn_blocking` or the async filesystem API.
+- **The accept loop** takes no lock and does no I/O beyond accepting. A
+  reload runs on its own task.
+- **Per-request work stays bounded and boring.** Clone `Arc`s, not data.
+  No `format!` in a loop. Prepared statements come from the cache.
+- **At most one shared lock per request,** with a bounded, allocation-free
+  critical section. The rate limiter is the model: purging is time-gated
+  and the map is capped. A `retain` under a global mutex on every request
+  is a denial of service waiting for traffic.
+- **Channels are bounded.** Streaming bodies use capacity 2; backpressure
+  is the design.
+- **Lua states are reused.** A rebuild happens only after poisoning or a
+  reload.
 
-## Bounded by design
+## Bounds, not knobs
 
-These exist for safety and are not tuning knobs: `[limits]` (body, URI,
-headers, connections, pool wait, read timeouts), `[database] max_rows`,
-the JSON depth and node budget, the rate limiter's purge interval and
-bucket cap, `max_response_bytes` and the outbound budget for `fetch`,
-the session cookie size. Raising one is a security decision: state the
-attack it admits and get it reviewed as such.
+These limits exist for safety:
 
-## What not to do
+- `[limits]` (body, URI, headers, connections, pool wait, read timeouts);
+- `[database] max_rows`;
+- the JSON depth and node budget;
+- the rate limiter's purge interval and bucket cap;
+- `max_response_bytes`, and the outbound budget for `fetch`;
+- the session cookie size.
 
-- No micro-optimization without a bench showing the path is hot.
-- No `unsafe`, no `mem::forget`, no hand-rolled allocators.
-- No caching of request-derived data across requests without a bound and
-  an eviction policy (`cache.rs` is the model: entries and bytes, keys
-  counted, TTL clamped).
-- Do not widen a timeout to make a slow test pass; find the stall.
+Raising one is a security decision. State the attack it admits, and get
+it reviewed as one.
+
+## Do not
+
+- Micro-optimize without a bench that shows the path is hot.
+- Use `unsafe`, `mem::forget`, or a hand-rolled allocator.
+- Cache request-derived data across requests without a bound on entries
+  and bytes and an eviction policy (`cache.rs` is the model).
+- Widen a timeout to make a slow test pass. Find the stall.

@@ -1,51 +1,69 @@
 ---
 name: verify
-description: The verification ladder for Nitr changes — format, lint, tests in both feature sets, generated docs, fuzz seams, dependencies, and a live smoke. Run after any change and before declaring a task done or preparing a commit.
+description: The verification ladder for a Nitr change — format, lint, tests in both feature sets, generated API docs, fuzz seams, dependencies, and a live smoke run — plus how to report which steps ran. Use after any change and before declaring a task done or preparing a commit.
 ---
 
 # Verify (Nitr)
 
-Run from the repository root, in order, and stop at the first failure.
-A partial run proves nothing about the steps it skipped.
+Run from the repository root, in this order, and stop at the first
+failure. A step you skipped is reported as skipped, never as passed.
 
-1. **Format** — `cargo fmt --all`
-   Then re-grep any comment or anchor you edited: rustfmt reflows lines.
-2. **Lint** — `make lint`
-   Runs the format check, clippy with `--features all` and with
+| # | Step | Command | When |
+|---|---|---|---|
+| 1 | Format | `cargo fmt --all` | always |
+| 2 | Lint | `make lint` | always |
+| 3 | Test | `make test` | always |
+| 4 | API docs | `NITR_API_REGEN=1 cargo test -p nitr-cli --test api` | `nitr-api.toml` changed |
+| 5 | Fuzz seams | `cd fuzz && RUSTFLAGS="--cfg fuzzing" cargo +nightly check` | `pub mod fuzzing` or `fuzz/` changed |
+| 6 | Dependencies | `cargo deny check` | `Cargo.toml` or a `Cargo.lock` changed |
+| 7 | Live smoke | build it and run it | always, for what you touched |
+
+What each step covers:
+
+1. **Format.** After it runs, re-read any comment or anchor you edited:
+   rustfmt reflows lines.
+2. **Lint.** The format check, clippy with `--features all` and with
    `--no-default-features` (both `--all-targets -- -D warnings`), and
-   `fuzz-check` (fuzz target list and seed directory drift).
-3. **Test** — `make test`
-   `cargo test --features all`, `cargo test --no-default-features`, and the
-   release-profile resilience test. `cargo test` stops at the first failing
-   binary: after a fix, run the full set again.
-4. **Generated docs** — when `crates/nitr-cli/src/nitr-api.toml` changed:
-   `NITR_API_REGEN=1 cargo test -p nitr-cli --test api`
-   then commit `resources/nitr-types.lua` and `resources/nitr-api.md`
-   with it. Without the variable the same test fails on drift.
-5. **Fuzz seams** — when anything under `pub mod fuzzing` or `fuzz/` changed:
-   `cd fuzz && RUSTFLAGS="--cfg fuzzing" cargo +nightly check`
-   and, for a target you touched,
-   `cargo +nightly fuzz run --target x86_64-unknown-linux-gnu <target> -- -max_total_time=60`.
-   Never point a run at `fuzz/seeds/<target>`; libFuzzer writes into the
-   directory it is given.
-6. **Dependencies** — when `Cargo.toml`/`Cargo.lock` changed:
-   `cargo deny check` (licenses, advisories, sources; see `deny.toml`).
-7. **Live smoke** — build and run what you touched: an example
-   (`cargo run --example <name> --features all`, then curl its routes),
-   or the CLI flow (`cargo build -p nitr-cli --features all`, then
-   `nitr init` → `nitr migrate` → `nitr check` → `nitr test` in a scratch
-   directory). Tests do not cover examples; nothing else exercises them.
+   `fuzz-check` (the target lists and the seed directories agree).
+3. **Test.** `cargo test --features all`, then `--no-default-features`,
+   then the release-profile `resilience` test.
+   - `cargo test` stops at the first failing binary. After a fix, rerun
+     the full set.
+   - When surveying failures, use `--no-fail-fast`.
+4. **API docs.** Regenerates `resources/nitr-types.lua` and
+   `resources/nitr-api.md`. They travel in the same commit as the TOML.
+   Without the variable, the same test fails on drift.
+5. **Fuzz seams.** For a target you touched, also run it for 60 s against
+   a scratch corpus. Never run it against `fuzz/seeds/`.
+6. **Dependencies.** Licences, advisories and sources (`deny.toml`). An
+   advisory in a crate you did not touch is still reported. Fix it in its
+   own change.
+7. **Live smoke.**
+   - An example: `cargo run --example <name> --features all`, then `curl`
+     its routes (use `PORT=<n>` when 3000 is taken).
+   - The CLI: `cargo build -p nitr-cli --features all`, then `nitr init`,
+     `nitr migrate`, `nitr check` and `nitr test` in a scratch directory.
+   - The request path: the real binary, and `curl -i`.
 
-Then the final adversarial self-review (`security-safety`, `code-quality`).
+After the ladder: the adversarial review (`security-safety`) and the
+self-review (`code-quality`).
 
 ## Notes
 
-- If the user's cargo config carries nightly-only flags, prefix stable
-  commands with `RUSTFLAGS=""` (the `Makefile` already does).
-- The first build is slow: mlua vendors Lua 5.4, rusqlite bundles SQLite.
-- `cargo fuzz` needs `cargo +nightly` and the explicit `--target`; ASan
-  and a musl default target do not mix.
-- `target/debug/nitr` is stale until `cargo build -p nitr-cli`; the test
-  runner and e2e tests build their own copy.
-- `.claude` is a symlink to `.agents`; edit either, it is one tree.
-- Port 3000 is often occupied locally; examples take `PORT=<n>`.
+- **Run one cargo job at a time.** Release (fat LTO), bench and fuzz
+  builds are memory-heavy. Use `-j2` on small machines.
+- **`target/debug/nitr` is stale** until `cargo build -p nitr-cli`. The
+  CLI tests build their own copy.
+- **The first build is slow:** mlua vendors Lua, and rusqlite bundles
+  SQLite.
+- **Nightly-only flags:** if a user-level cargo config carries them,
+  prefix stable commands with `RUSTFLAGS=""`. The `Makefile` already does.
+- **`cargo fuzz`** needs `+nightly` and the explicit `--target`. ASan and
+  a musl default target do not mix.
+
+## Reporting
+
+For each step, say it passed, failed (with the output), or was skipped
+(with the reason). Test counts beat "all green". A step is never
+described as passing on the strength of a different step, or of an
+earlier run made before your last edit.
