@@ -403,34 +403,23 @@ async fn an_oversized_chunked_body_is_rejected_with_413() {
     .await;
 
     // A chunked body carries no Content-Length, so the declared-size check
-    // cannot see it: only the running count can. Written on a raw socket
-    // because the test client always sets a length.
+    // cannot see it: only the running count can. Two 512-byte chunks reach
+    // the 1 KiB ceiling, and one more byte — the last one sent — crosses
+    // it, so nothing is left unread for the close to reset.
     let mut sock = tokio::net::TcpStream::connect(h.addr())
         .await
         .expect("connect");
-    sock.write_all(b"POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n")
+    sock.write_all(&harness::chunked_past_the_limit("/echo", 512, 2))
         .await
-        .expect("write headers");
-    // 4 KiB in 512-byte chunks, four times the 1 KiB ceiling. The writes are
-    // best-effort: the server is entitled to answer and hang up part-way
-    // through, which is the whole point of counting as bytes arrive.
-    for _ in 0..8 {
-        if sock.write_all(b"200\r\n").await.is_err()
-            || sock.write_all(&[b'x'; 512]).await.is_err()
-            || sock.write_all(b"\r\n").await.is_err()
-        {
-            break;
-        }
-    }
-    let _ = sock.write_all(b"0\r\n\r\n").await;
-
-    // Read just the status line: the connection may stay open afterwards.
-    let mut raw = [0u8; 128];
-    let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut raw))
+        .expect("write request");
+    // To EOF: the incomplete body closes the connection, and a clean end
+    // (not a reset) is what keeps the 413 readable on Windows.
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut raw))
         .await
         .expect("the server must answer, not hang")
         .expect("read response");
-    let head = String::from_utf8_lossy(&raw[..n]);
+    let head = String::from_utf8_lossy(&raw);
     assert!(head.starts_with("HTTP/1.1 413"), "got: {head}");
 
     // An honest small body still passes.
@@ -691,8 +680,9 @@ async fn an_oversized_header_block_is_rejected() {
     // with most of the block still unread in its receive queue — a close
     // with unread data is an RST, not a FIN. What the client then sees is
     // platform-dependent: Linux hands over data buffered before the RST,
-    // while macOS and the BSDs discard the receive queue, so the 431 can
-    // vanish and the read fail with ECONNRESET. Read concurrently with
+    // while Windows, macOS and the BSDs discard the receive queue, so the
+    // 431 can vanish and the read fail (`harness::is_reset`). There is no
+    // byte to stop at: the limit is a read buffer. Read concurrently with
     // the write so the response is captured when it survives, and treat a
     // reset as the refusal itself when it does not — the positive control
     // below is what separates the limit firing from a server that died.
@@ -721,7 +711,7 @@ async fn an_oversized_header_block_is_rejected() {
         // The reset outran the read and took the receive queue with it.
         // Anything that DID arrive first must still lead with the 431 —
         // a reset is an acceptable spelling of refusal, a 200 is not.
-        Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+        Err(err) if harness::is_reset(&err) => {
             assert!(
                 raw.is_empty() || head.starts_with("http/1.1 431"),
                 "data before the reset must lead with 431: {head}"
@@ -823,34 +813,20 @@ async fn oversized_body_still_answers_413_after_the_clamp() {
     assert_eq!(resp.text().await.expect("body"), "1024");
 
     // Over the limit with 256-byte chunks: the running count reaches 1024
-    // at a frame boundary with the body not yet done. Raw socket, because
-    // the test client always declares a length and the declared-size check
-    // would answer first.
+    // at a frame boundary with the body not yet done, and the one-byte
+    // frame after it — the last byte sent — is what the clamp must pull.
     let mut sock = tokio::net::TcpStream::connect(h.addr())
         .await
         .expect("connect");
-    sock.write_all(
-        b"POST /read-huge HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n",
-    )
-    .await
-    .expect("write headers");
-    // Best-effort: the server may answer and hang up mid-body.
-    for _ in 0..8 {
-        if sock.write_all(b"100\r\n").await.is_err()
-            || sock.write_all(&[b'y'; 256]).await.is_err()
-            || sock.write_all(b"\r\n").await.is_err()
-        {
-            break;
-        }
-    }
-    let _ = sock.write_all(b"0\r\n\r\n").await;
-
-    let mut raw = [0u8; 128];
-    let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut raw))
+    sock.write_all(&harness::chunked_past_the_limit("/read-huge", 256, 4))
+        .await
+        .expect("write request");
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut raw))
         .await
         .expect("the server must answer, not hang")
         .expect("read response");
-    let head = String::from_utf8_lossy(&raw[..n]);
+    let head = String::from_utf8_lossy(&raw);
     assert!(head.starts_with("HTTP/1.1 413"), "got: {head}");
 
     h.stop().await;

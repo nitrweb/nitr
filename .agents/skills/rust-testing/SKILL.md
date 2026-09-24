@@ -60,6 +60,14 @@ a dev box.
 - **Effects on another thread are polled to a deadline.** A cleanup in
   `spawn_blocking` or a `Drop` elsewhere lands after the response; assert
   it inside a bounded poll, never right after the call.
+- **A raw-socket rejection leaves nothing unread.** A server that answers
+  and closes with request bytes still queued sends an RST, and Windows,
+  macOS and the BSDs then discard the response the client had not read
+  yet: it passes on Linux and fails elsewhere as `ConnectionAborted`
+  (10053) or `ConnectionReset`. Send in one write and stop at the byte that
+  trips the limit (`harness::chunked_past_the_limit`); only when the limit
+  is a buffer with no byte to aim at, accept `harness::is_reset` as the
+  refusal and keep a positive control beside it.
 
 ## Hygiene
 

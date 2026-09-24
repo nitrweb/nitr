@@ -150,6 +150,46 @@ pub async fn wait_until_listening(addr: SocketAddr) {
     panic!("nothing came up on {addr}");
 }
 
+// Raw-socket rejections.
+//
+// A server that answers and closes with request bytes still unread in its
+// receive queue — or still arriving after the close — sends an RST, not a
+// FIN. Linux keeps what the client had
+// already received readable; Windows, macOS and the BSDs discard it, so
+// the rejection vanishes and the read fails. A raw-socket test therefore
+// sends nothing past the byte that trips the limit, or — when the limit is
+// a buffer it cannot aim at — accepts a reset as the refusal.
+
+/// A chunked `POST` whose last byte on the wire is the one that trips
+/// `[limits] max_body_bytes = frames * frame`: `frames` chunks of `frame`
+/// bytes sum to the limit exactly, then a one-byte chunk crosses it. No
+/// chunk CRLF or terminator follows, so the server has read everything by
+/// the time it answers `413`, and closes with a FIN on every platform.
+///
+/// Raw bytes, because the test client always declares a length and the
+/// declared-size check would answer first. Send them in one write.
+pub fn chunked_past_the_limit(path: &str, frame: usize, frames: usize) -> Vec<u8> {
+    let mut req =
+        format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .into_bytes();
+    for _ in 0..frames {
+        req.extend_from_slice(format!("{frame:x}\r\n").as_bytes());
+        req.extend(std::iter::repeat_n(b'x', frame));
+        req.extend_from_slice(b"\r\n");
+    }
+    req.extend_from_slice(b"1\r\nz");
+    req
+}
+
+/// A read error that is the peer's RST: `ConnectionReset` on Unix,
+/// `ConnectionAborted` (WSAECONNABORTED, 10053) as Windows reports it.
+pub fn is_reset(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+    )
+}
+
 /// Builder for a [`TestServer`]: typed config overrides over a default
 /// minimal [`nitr::Config`], scripts and databases placed in the test's
 /// private directory, readiness waited for, teardown bounded.
