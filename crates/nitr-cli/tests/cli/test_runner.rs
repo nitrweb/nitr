@@ -1237,13 +1237,9 @@ end)
     );
 }
 
-/// A Ctrl-C pressed while `--watch` re-runs the suite stops the session
-/// there, with exit 0. Tokio's SIGINT handler stays installed after the
-/// first wait, so a listener made only for the waits used to swallow a
-/// press that landed mid-run: the run finished and the session waited on.
-#[cfg(unix)]
 /// With a machine reporter on stdout, `--watch` keeps its own chatter on
 /// stderr: stdout stays one parseable document per run.
+#[cfg(unix)]
 #[test]
 fn watch_keeps_a_json_stdout_clean() {
     require_runnable_binary!();
@@ -1289,6 +1285,11 @@ fn watch_keeps_a_json_stdout_clean() {
     assert!(read(&err_path).contains("watching for changes"));
 }
 
+/// A Ctrl-C pressed while `--watch` re-runs the suite stops the session
+/// there, with exit 0. Tokio's SIGINT handler stays installed after the
+/// first wait, so a listener made only for the waits used to swallow a
+/// press that landed mid-run: the run finished and the session waited on.
+#[cfg(unix)]
 #[test]
 fn watch_stops_on_ctrl_c_during_a_rerun() {
     require_runnable_binary!();
