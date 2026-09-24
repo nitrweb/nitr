@@ -606,7 +606,12 @@ async fn run_main() -> anyhow::Result<()> {
                 nocapture,
             };
             if args.watch {
-                return cmd::test::watch(cfg, &args).await;
+                cmd::test::watch(cfg, &args).await?;
+                // Ctrl-C may land mid-run, and a run is Lua that can go
+                // seconds without yielding: returning would drop the
+                // runtime, which waits for that run to reach a yield.
+                // The session is over, so the process ends here.
+                std::process::exit(0);
             }
             // Exit 1 on any failure, or on a `t.only` left in place.
             if cmd::test::run(cfg, &args).await?.failed() {

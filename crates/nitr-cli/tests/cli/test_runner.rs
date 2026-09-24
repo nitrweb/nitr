@@ -76,6 +76,14 @@ app:get("/log", function(req)
     nitr.log.warn("quota low", { used = 9 })
     return nitr.text("logged")
 end)
+app:get("/stream-logs", function(req)
+    return nitr.sse(function(send)
+        for i = 1, 3 do
+            send("tick", tostring(i))
+            nitr.log.info("chunk sent", { i = i })
+        end
+    end)
+end)
 return app
 "#;
 
@@ -1134,4 +1142,175 @@ fn a_named_test_database_is_seeded_once_and_never_the_live_one() {
     let out = run_in(dir.as_ref(), &["test"]);
     assert_eq!(out.code, Some(1));
     assert_has(&out.stderr, &["is [database] path"]);
+}
+
+/// Adversarial row C3: a streaming body is collected to its end inside
+/// `t.request`, so the producer's log lines belong to the test that read
+/// the stream, and none of them reach the next test.
+#[test]
+fn a_streams_log_lines_belong_to_the_test_that_read_it() {
+    require_runnable_binary!();
+    let dir = app(
+        "stream-logs",
+        &[
+            ("nitr.toml", MINIMAL_TOML),
+            ("app.lua", MINIMAL_APP),
+            (
+                "tests/stream_test.lua",
+                r#"local t = nitr.test
+local function chunk_lines()
+    local n = 0
+    for _, entry in ipairs(t.logs()) do
+        if entry.message == "chunk sent" then n = n + 1 end
+    end
+    return n
+end
+t.it("reads the stream", function()
+    t.expect(#t.get("/stream-logs"):sse()).to_equal(3)
+    t.expect(chunk_lines()).to_equal(3)
+end)
+t.it("starts with none of its lines", function()
+    t.expect(chunk_lines()).to_equal(0)
+end)
+"#,
+            ),
+        ],
+    );
+    let out = run_in(dir.as_ref(), &["test"]);
+    assert_eq!(out.code, Some(0), "{}", out.stdout);
+    assert_has(&out.stdout, &["2 passed, 0 failed"]);
+}
+
+/// Adversarial row C4: `before_all` runs inside the first test's call, so
+/// a slow but healthy setup is charged to that test (and marked `slow`)
+/// rather than killed or hidden; the group's other tests do not pay it.
+#[test]
+fn a_slow_before_all_is_charged_to_the_first_test() {
+    require_runnable_binary!();
+    let dir = app(
+        "slow-before-all",
+        &[
+            (
+                "nitr.toml",
+                &format!("{MINIMAL_TOML}\n[testing]\nslow_ms = 100\n"),
+            ),
+            ("app.lua", MINIMAL_APP),
+            (
+                "tests/setup_test.lua",
+                r#"local t = nitr.test
+t.describe("heavy setup", function()
+    t.before_all(function()
+        local started = nitr.time.monotonic()
+        while nitr.time.monotonic() - started < 0.2 do end
+    end)
+    t.it("pays for the setup", function() end)
+    t.it("does not", function() end)
+end)
+"#,
+            ),
+        ],
+    );
+    let out = run_in(dir.as_ref(), &["test"]);
+    assert_eq!(out.code, Some(0), "{}", out.stdout);
+    let line = |name: &str| {
+        out.stdout
+            .lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("no line for {name:?}:\n{}", out.stdout))
+            .to_string()
+    };
+    let first = line("pays for the setup");
+    assert!(
+        first.starts_with("  ok   ") && first.ends_with(" ms, slow)"),
+        "{first}"
+    );
+    let ms: u64 = first
+        .rsplit_once('(')
+        .and_then(|(_, t)| t.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .expect("a duration");
+    assert!(ms >= 200, "the setup's time is in the first test: {first}");
+    let second = line("does not");
+    assert!(
+        second.starts_with("  ok   ") && !second.contains("slow"),
+        "{second}"
+    );
+}
+
+/// A Ctrl-C pressed while `--watch` re-runs the suite stops the session
+/// there, with exit 0. Tokio's SIGINT handler stays installed after the
+/// first wait, so a listener made only for the waits used to swallow a
+/// press that landed mid-run: the run finished and the session waited on.
+#[cfg(unix)]
+#[test]
+fn watch_stops_on_ctrl_c_during_a_rerun() {
+    require_runnable_binary!();
+    // Six tests of 250 ms each: a run is a window of about 1.5 s.
+    let slow = "local t = nitr.test\nfor i = 1, 6 do\n  t.it(\"spins \" .. i, function()\n    local started = nitr.time.monotonic()\n    while nitr.time.monotonic() - started < 0.25 do end\n  end)\nend\n";
+    let dir = app(
+        "watch-ctrl-c",
+        &[
+            ("nitr.toml", MINIMAL_TOML),
+            ("app.lua", MINIMAL_APP),
+            ("tests/slow_test.lua", slow),
+        ],
+    );
+    let log_path = dir.join("watch.log");
+    let log = std::fs::File::create(&log_path).expect("log file");
+    let mut child = nitr()
+        .current_dir(dir.as_ref())
+        .args(["test", "--watch"])
+        .env_remove("RUST_LOG")
+        .env("NO_COLOR", "1")
+        .stdout(log)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn nitr test --watch");
+    let read = || std::fs::read_to_string(&log_path).unwrap_or_default();
+    let deadline = |secs| std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let poll = std::time::Duration::from_millis(50);
+
+    let first_done = deadline(30);
+    while !read().contains("watching for changes") {
+        assert!(
+            std::time::Instant::now() < first_done,
+            "first run: {}",
+            read()
+        );
+        std::thread::sleep(poll);
+    }
+    // Re-save inside the loop: one write can be lost on a slow runner.
+    let rerun = deadline(30);
+    let mut saves = 0u32;
+    while read().matches("slow_test.lua\n").count() < 2 {
+        assert!(std::time::Instant::now() < rerun, "no re-run: {}", read());
+        saves += 1;
+        std::fs::write(
+            dir.join("tests/slow_test.lua"),
+            format!("{slow}-- save {saves}\n"),
+        )
+        .expect("re-save");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    super::signal(child.id(), "-INT");
+
+    let stopped = deadline(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break status;
+        }
+        if std::time::Instant::now() >= stopped {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("Ctrl-C during a re-run was lost:\n{}", read());
+        }
+        std::thread::sleep(poll);
+    };
+    assert_eq!(status.code(), Some(0), "{}", read());
+    assert_eq!(
+        read().matches(" passed, ").count(),
+        1,
+        "the interrupted re-run printed no verdict:\n{}",
+        read()
+    );
 }
