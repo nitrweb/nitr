@@ -36,7 +36,10 @@
 //!   implementations of one parse over the same attacker bytes live in
 //!   this repo, so they are run side by side and the *whole map* is
 //!   compared (key set and every value, ordering deliberately not
-//!   asserted, since a Lua table has none). A script reading
+//!   asserted, since a Lua table has none). `query_parse` keeps bytes and
+//!   `form_urlencoded` reads them lossily, so two byte keys can meet as
+//!   one lossy key; there, `form_urlencoded`'s value must be one of
+//!   theirs, since only the query order decides which. A script reading
 //!   `nitr.url.query_parse(req.query_string)` and a script reading
 //!   `req.query` must not see different parameters — that difference is a
 //!   parameter-smuggling primitive, and no unit test compares the two.
@@ -118,16 +121,41 @@ fn map_of(table: &Table, what: &str) -> BTreeMap<Vec<u8>, Vec<u8>> {
     out
 }
 
-/// The same map read as `form_urlencoded` reads bytes: lossy UTF-8.
-fn lossy(map: &BTreeMap<Vec<u8>, Vec<u8>>) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
+/// `query_parse`'s byte map read as `form_urlencoded` reads bytes (lossy
+/// UTF-8), each lossy key with every value it stands for. Distinct byte
+/// keys can read as one lossy key (`%B2` and a literal U+FFFD are both
+/// `�`): `form_urlencoded` then keeps whichever came last in the query,
+/// and a Lua table cannot say which that was.
+fn lossy(map: &BTreeMap<Vec<u8>, Vec<u8>>) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (key, value) in map {
-        out.insert(
-            String::from_utf8_lossy(key).into_owned(),
-            String::from_utf8_lossy(value).into_owned(),
-        );
+        out.entry(String::from_utf8_lossy(key).into_owned())
+            .or_default()
+            .push(String::from_utf8_lossy(value).into_owned());
     }
     out
+}
+
+/// The differential under the lossy reading: the same key set, and each
+/// `form_urlencoded` value one that `query_parse` holds under that key —
+/// the only one, unless distinct byte keys collided.
+fn assert_agrees(ours: &BTreeMap<Vec<u8>, Vec<u8>>, theirs: &BTreeMap<String, String>, query: &str) {
+    let ours = lossy(ours);
+    assert!(
+        ours.keys().eq(theirs.keys()),
+        "nitr.url.query_parse and url::form_urlencoded::parse disagree on the keys of {query:?}: \
+         nitr said {:?}, form_urlencoded (which is what req.query uses) said {:?}",
+        ours.keys().collect::<Vec<_>>(),
+        theirs.keys().collect::<Vec<_>>()
+    );
+    for (key, value) in theirs {
+        let candidates = &ours[key];
+        assert!(
+            candidates.contains(value),
+            "nitr.url.query_parse and url::form_urlencoded::parse disagree on {key:?} in \
+             {query:?}: nitr said {candidates:?}, form_urlencoded said {value:?}"
+        );
+    }
 }
 
 /// The oracle: the same parse as implemented by the `url` crate, folded
@@ -324,11 +352,7 @@ fuzz_target!(|data: &[u8]| {
             let bare_table: Table = query_parse.call(bare).expect("query_parse");
             let ours = map_of(&bare_table, "query_parse");
             let theirs = form_urlencoded_map(bare);
-            assert_eq!(
-                lossy(&ours), theirs,
-                "nitr.url.query_parse and url::form_urlencoded::parse disagree on {bare:?}: \
-                 nitr said {ours:?}, form_urlencoded (which is what req.query uses) said {theirs:?}"
-            );
+            assert_agrees(&ours, &theirs, bare);
             // Exactly one `?` comes off, so the stripped and unstripped
             // forms are the same query.
             assert_eq!(

@@ -102,6 +102,10 @@ a dev box.
 - **Read Lua strings as bytes** (`LuaString`) in an oracle unless the
   contract promises UTF-8; a `String` conversion panics on the first
   non-UTF-8 input the fuzzer makes.
+- **A lossy view can merge distinct inputs.** When an oracle compares
+  through one (lossy UTF-8, case folding, a map keyed on the result),
+  two inputs can collapse into one; accept any of them there, and keep
+  exact equality everywhere else.
 - **Replay a CI crash** from its base64 line: decode it into a file under
   `target/`, then `cargo +nightly fuzz run --target
   x86_64-unknown-linux-gnu <target> <file>`.
