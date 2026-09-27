@@ -11,7 +11,7 @@ use mlua::{Function, Lua, Value};
 use super::Site;
 
 /// The keys a route's trailing options table may carry.
-const ROUTE_OPTION_KEYS: &[&str] = &["on_error", "on_invalid", "input", "doc"];
+const ROUTE_OPTION_KEYS: &[&str] = &["on_error", "on_invalid", "input", "doc", "rate_limit"];
 
 /// What `app:<method>(path, ..., { ... })` may set.
 #[derive(Default)]
@@ -20,6 +20,38 @@ pub(super) struct RouteOptions {
     pub(super) invalid_fn: Option<Function>,
     pub(super) input: Option<mlua::Table>,
     pub(super) doc: Option<mlua::Table>,
+    /// `{ rate_limit = { requests, window } }`: the route's own
+    /// fixed-window limit per client, on top of `[rate_limit]`.
+    pub(super) rate_limit: Option<(u32, std::time::Duration)>,
+}
+
+/// Reads `rate_limit = { requests = N, window = seconds }`.
+fn rate_limit_option(
+    name: &str,
+    path: &str,
+    opts: &mlua::Table,
+) -> mlua::Result<(u32, std::time::Duration)> {
+    let refuse = |what: &str| {
+        mlua::Error::RuntimeError(format!(
+            "app:{name}(\"{path}\", ...): rate_limit {what}; expected {{ requests = N, window = seconds }}, both at least 1"
+        ))
+    };
+    for pair in opts.pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        match key {
+            Value::String(s) if matches!(&*s.to_string_lossy(), "requests" | "window") => {}
+            other => return Err(refuse(&format!("has an unknown key {other:?}"))),
+        }
+    }
+    let requests = opts
+        .get::<Option<u32>>("requests")?
+        .filter(|n| *n >= 1)
+        .ok_or_else(|| refuse("needs `requests`"))?;
+    let window = opts
+        .get::<Option<u64>>("window")?
+        .filter(|n| *n >= 1)
+        .ok_or_else(|| refuse("needs `window`"))?;
+    Ok((requests, std::time::Duration::from_secs(window)))
 }
 
 /// The script frame that called into a registration method, for load-time
@@ -80,5 +112,9 @@ pub(super) fn route_options(
         invalid_fn: opts.get::<Option<Function>>("on_invalid")?,
         input: table("input")?,
         doc: table("doc")?,
+        rate_limit: match table("rate_limit")? {
+            Some(limit) => Some(rate_limit_option(name, path, &limit)?),
+            None => None,
+        },
     })
 }

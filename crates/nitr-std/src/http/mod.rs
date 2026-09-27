@@ -24,7 +24,7 @@ pub(crate) use cookies::{attach_cookie, build_cookie, merge_cookie_opts};
 
 /// Builds the skeleton of a helper response table: status, empty headers,
 /// and an attached [`ResponseCookies`] builder.
-pub(crate) fn response_table(lua: &Lua, status: u16) -> mlua::Result<Table> {
+pub fn response_table(lua: &Lua, status: u16) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     table.set("status", status)?;
     table.set("headers", lua.create_table()?)?;

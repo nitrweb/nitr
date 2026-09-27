@@ -19,17 +19,12 @@ fn suspicious_settings_are_reported_as_warnings() {
     // terminating proxy — the case nothing here can detect. Asserted
     // as a set rather than as "empty" so a *new* warning on the
     // default path is still a visible failure.
+    // Whether a cookie ships without `Secure` is decided by the cookie,
+    // when one is built: the default configuration itself warns of nothing
+    // (a service that never sets a cookie used to be told about them).
     let clean = valid_base();
     let warnings = clean.warnings();
-    assert_eq!(
-        warnings.len(),
-        1,
-        "the default config must carry only the Secure-cookie warning, got: {warnings:?}"
-    );
-    assert!(
-        warnings[0].contains("without the `Secure` attribute"),
-        "got: {warnings:?}"
-    );
+    assert!(warnings.is_empty(), "got: {warnings:?}");
 
     // …and it goes away the moment the deployment says how it
     // terminates TLS, in either direction.
@@ -48,25 +43,25 @@ fn suspicious_settings_are_reported_as_warnings() {
         tls.warnings()
     );
     // `dev_mode` is an explicit "I am developing" switch, so it
-    // suppresses the warning; a loopback bind deliberately does not.
+    // suppresses both warnings; a loopback bind deliberately does not.
     let mut dev = valid_base();
     dev.dev_mode = true;
-    assert!(
-        dev.warnings().is_empty(),
-        "dev_mode suppresses it: {:?}",
-        dev.warnings()
-    );
+    assert!(dev.warnings().is_empty(), "got: {:?}", dev.warnings());
+    assert_eq!(dev.cookie_insecure_warning(), None);
 
-    // The full policy table, row by row. `"never"` on a plaintext
-    // listener is a consistent answer and stays silent; `"never"`
-    // *with* TLS is the contradiction worth naming.
-    for (secure, tls, want_warning) in [
-        (CookieSecure::Auto, true, false),
-        (CookieSecure::Auto, false, true),
-        (CookieSecure::Always, true, false),
-        (CookieSecure::Always, false, false),
-        (CookieSecure::Never, true, true),
-        (CookieSecure::Never, false, false),
+    // The full policy table, row by row: what boot says, and what the
+    // first cookie built without `Secure` says. `"never"` on a plaintext
+    // listener is a consistent answer and stays silent; `"never"` *with*
+    // TLS is the contradiction worth naming at boot; `"auto"` without
+    // TLS cannot see a terminating proxy, so the cookie that ships that
+    // way carries the warning.
+    for (secure, tls, want_boot, want_issuance) in [
+        (CookieSecure::Auto, true, false, false),
+        (CookieSecure::Auto, false, false, true),
+        (CookieSecure::Always, true, false, false),
+        (CookieSecure::Always, false, false, false),
+        (CookieSecure::Never, true, true, false),
+        (CookieSecure::Never, false, false, false),
     ] {
         let mut cfg = valid_base();
         cfg.cookies.secure = secure;
@@ -76,7 +71,12 @@ fn suspicious_settings_are_reported_as_warnings() {
             .iter()
             .any(|w| w.contains("without the `Secure` attribute"));
         assert_eq!(
-            warned, want_warning,
+            warned, want_boot,
+            "[cookies] secure = {secure:?} with [tls] enabled = {tls}"
+        );
+        assert_eq!(
+            cfg.cookie_insecure_warning().is_some(),
+            want_issuance,
             "[cookies] secure = {secure:?} with [tls] enabled = {tls}"
         );
     }
@@ -345,6 +345,58 @@ fn stream_slots_for_every_state_warn() {
         None,
         "the default keeps a state free"
     );
+}
+
+/// `[headers]` values reach every response verbatim, so a name or value
+/// that is not a header is refused at boot, naming the entry.
+#[test]
+fn response_headers_are_validated_at_startup() {
+    let mut cfg = valid_base();
+    cfg.headers.insert("X-Frame-Options".into(), "DENY".into());
+    cfg.validate().expect("a plain header");
+    for (name, value) in [("bad name", "x"), ("X-Ok", "line\nbreak")] {
+        let mut cfg = valid_base();
+        cfg.headers.insert(name.into(), value.into());
+        let err = cfg.validate().expect_err(name).to_string();
+        assert!(err.contains("[headers]") && err.contains(name), "{err}");
+    }
+}
+
+/// `[fetch] private_hosts` names hosts, nothing else.
+#[test]
+fn private_hosts_are_host_names() {
+    let mut cfg = valid_base();
+    cfg.fetch.private_hosts = vec!["payments".into(), "db.internal".into()];
+    cfg.validate().expect("host names");
+    for bad in ["http://payments", "payments/charges", ""] {
+        let mut cfg = valid_base();
+        cfg.fetch.private_hosts = vec![bad.into()];
+        let err = cfg.validate().expect_err(bad).to_string();
+        assert!(err.contains("[fetch] private_hosts"), "{bad}: {err}");
+    }
+}
+
+/// The settings a deployment behind a TLS proxy needs are reachable from
+/// the environment, and a blank value is unset like every other variable.
+#[test]
+fn proxy_settings_have_environment_overrides() {
+    let mut cfg = valid_base();
+    cfg.apply_env_with(&|name| match name {
+        "NITR_COOKIES_SECURE" => Some("always".into()),
+        "NITR_TRUST_REQUEST_ID" => Some("true".into()),
+        "NITR_RATE_LIMIT_TRUST_FORWARDED_FOR" => Some("true".into()),
+        _ => None,
+    })
+    .expect("apply");
+    assert_eq!(cfg.cookies.secure, CookieSecure::Always);
+    assert!(cfg.trust_request_id);
+    assert!(cfg.rate_limit.trust_forwarded_for);
+    let mut cfg = valid_base();
+    let err = cfg
+        .apply_env_with(&|name| (name == "NITR_COOKIES_SECURE").then(|| "maybe".to_string()))
+        .expect_err("not a policy")
+        .to_string();
+    assert!(err.contains("NITR_COOKIES_SECURE"), "{err}");
 }
 
 #[test]

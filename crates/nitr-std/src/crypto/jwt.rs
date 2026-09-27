@@ -58,30 +58,98 @@ fn jwt_reject(lua: &Lua, reason: &str) -> mlua::Result<(Value, Value)> {
     Ok((Value::Nil, Value::String(lua.create_string(reason)?)))
 }
 
+/// The registered claims a caller asks `verify` to compare, read from its
+/// options once so a mistyped option fails the call rather than passing
+/// every token.
+#[derive(Default)]
+struct ClaimPolicy {
+    issuer: Option<String>,
+    audience: Option<String>,
+    subject: Option<String>,
+    require: Vec<String>,
+    max_age: Option<f64>,
+}
+
+impl ClaimPolicy {
+    fn from_opts(opts: &Table) -> mlua::Result<Self> {
+        let max_age = opts.get::<Option<f64>>("max_age")?;
+        if let Some(max_age) = max_age
+            && (!max_age.is_finite() || max_age < 0.0)
+        {
+            return Err(mlua::Error::RuntimeError(format!(
+                "jwt.verify `max_age` must be a finite number of seconds >= 0, got {max_age}"
+            )));
+        }
+        Ok(Self {
+            issuer: opts.get("issuer")?,
+            audience: opts.get("audience")?,
+            subject: opts.get("subject")?,
+            require: opts
+                .get::<Option<Vec<String>>>("require")?
+                .unwrap_or_default(),
+            max_age,
+        })
+    }
+
+    /// The first failed comparison, as the reason `verify` returns.
+    fn check(&self, claims: &serde_json::Value, now: f64, leeway: f64) -> Result<(), String> {
+        let string_claim = |name: &str| claims.get(name).and_then(|v| v.as_str());
+        if let Some(issuer) = &self.issuer
+            && string_claim("iss") != Some(issuer)
+        {
+            return Err("issuer mismatch".into());
+        }
+        if let Some(audience) = &self.audience {
+            let listed = match claims.get("aud") {
+                Some(serde_json::Value::String(aud)) => aud == audience,
+                Some(serde_json::Value::Array(auds)) => {
+                    auds.iter().any(|aud| aud.as_str() == Some(audience))
+                }
+                _ => false,
+            };
+            if !listed {
+                return Err("audience mismatch".into());
+            }
+        }
+        if let Some(subject) = &self.subject
+            && string_claim("sub") != Some(subject)
+        {
+            return Err("subject mismatch".into());
+        }
+        for name in &self.require {
+            if claims.get(name).is_none_or(serde_json::Value::is_null) {
+                return Err(format!("missing claim {name}"));
+            }
+        }
+        if let Some(max_age) = self.max_age {
+            let Some(iat) = claims.get("iat") else {
+                return Err("missing claim iat".into());
+            };
+            let Some(iat) = iat.as_f64() else {
+                return Err("malformed claims".into());
+            };
+            if now > iat + max_age + leeway {
+                return Err("token too old".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Builds `nitr.crypto.jwt`: verification first, signing second.
 ///
-/// # What `verify` does not check
+/// # What `verify` checks
 ///
-/// It enforces the signature, the mandatory `algorithms` allow-list, and
-/// `exp`/`nbf`. It checks **no registered claim beyond those**, and the
-/// omissions are invisible at the call site, so they are written down
-/// here:
+/// Always: the signature, the mandatory `algorithms` allow-list, and
+/// `exp`/`nbf` when the token carries them. On request: `issuer`,
+/// `audience` (against a string or an array `aud`, RFC 7519 §4.1.3),
+/// `subject`, the claims listed in `require`, and `max_age` counted from
+/// `iat`. What is not asked for is not checked:
 ///
-/// - **`iss` and `aud` are never read.** A token minted for another
-///   audience, or by another issuer, verifies here exactly like one minted
-///   for you. Comparing them is the caller's job.
 /// - **`typ` is written on sign and never verified.** `sign` sets
-///   `typ: "JWT"` in the header; `verify` does not look at it. The
-///   asymmetry is the trap: the field's presence suggests a check that
-///   does not exist.
+///   `typ: "JWT"` in the header; `verify` does not look at it.
 /// - **`exp` and `nbf` are checked only when present.** A token carrying
-///   neither never expires. Nothing requires them, so "the signature is
-///   valid" and "the token is still good" are different questions.
-///
-/// Shipping primitives rather than a framework is deliberate — a claim
-/// policy belongs to the application — but an undocumented omission is a
-/// defect regardless of that. The caller compares `iss` and `aud` itself,
-/// remembering that `aud` is a string or an array (RFC 7519 §4.1.3).
+///   neither never expires: `require = { "exp" }` makes one mandatory.
 pub(super) fn create_jwt_table(lua: &Lua) -> mlua::Result<Table> {
     let jwt = lua.create_table()?;
 
@@ -117,8 +185,8 @@ pub(super) fn create_jwt_table(lua: &Lua) -> mlua::Result<Table> {
         )?,
     )?;
 
-    // jwt.verify(token, key, { algorithms = {...}, leeway? }) ->
-    //   claims, nil | nil, reason
+    // jwt.verify(token, key, { algorithms = {...}, leeway?, issuer?,
+    //   audience?, subject?, require?, max_age? }) -> claims, nil | nil, reason
     //
     // The explicit `algorithms` allow-list is required, and the algorithm
     // named by the token's own header is honored only if the list contains
@@ -154,6 +222,7 @@ pub(super) fn create_jwt_table(lua: &Lua) -> mlua::Result<Table> {
                     "jwt.verify `leeway` must be a finite number of seconds >= 0, got {leeway}"
                 )));
             }
+            let policy = ClaimPolicy::from_opts(&opts)?;
 
             let token = token.to_string_lossy().to_string();
             let mut parts = token.split('.');
@@ -218,6 +287,9 @@ pub(super) fn create_jwt_table(lua: &Lua) -> mlua::Result<Table> {
                 && now < nbf - leeway
             {
                 return jwt_reject(lua, "token not yet valid");
+            }
+            if let Err(reason) = policy.check(&claims, now, leeway) {
+                return jwt_reject(lua, &reason);
             }
 
             use mlua::LuaSerdeExt as _;

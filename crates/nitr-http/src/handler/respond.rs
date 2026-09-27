@@ -24,6 +24,59 @@ pub(crate) fn empty_response(status: StatusCode) -> Result<HttpResponse> {
         .body(Empty::<Bytes>::new().boxed())?)
 }
 
+/// Whether the client asked for JSON: a built-in rejection then carries a
+/// body with a stable `code` instead of the bare reason phrase.
+pub(crate) fn wants_json(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|accept| accept.contains("application/json"))
+}
+
+/// A built-in rejection: the status' reason phrase as text, or as JSON
+/// (`{ code, message, retry_after? }`) when the client asked for it. A
+/// `retry_after` also sets the `Retry-After` header.
+pub(crate) fn rejection(
+    status: StatusCode,
+    code: &'static str,
+    retry_after: Option<u64>,
+    wants_json: bool,
+) -> Result<HttpResponse> {
+    let message = status.canonical_reason().unwrap_or("Error");
+    let mut resp = if wants_json {
+        let mut body = serde_json::json!({ "code": code, "message": message });
+        if let Some(secs) = retry_after {
+            body["retry_after"] = serde_json::Value::from(secs);
+        }
+        let bytes = serde_json::to_vec(&body).map_err(|err| Error::Script(err.to_string()))?;
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(bytes)).boxed())?
+    } else {
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Full::new(Bytes::from_static(message.as_bytes())).boxed())?
+    };
+    if let Some(secs) = retry_after
+        && let Ok(value) = header::HeaderValue::from_str(&secs.to_string())
+    {
+        resp.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    Ok(resp)
+}
+
+/// The 429 a rate limit answers with, `Retry-After` included.
+pub(crate) fn rate_limited(retry_after: u64, wants_json: bool) -> Result<HttpResponse> {
+    rejection(
+        StatusCode::TOO_MANY_REQUESTS,
+        "RATE_LIMITED",
+        Some(retry_after),
+        wants_json,
+    )
+}
+
 pub(crate) fn plain_response(status: StatusCode, body: &'static str) -> Result<HttpResponse> {
     Ok(Response::builder()
         .status(status)

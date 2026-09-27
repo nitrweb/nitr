@@ -67,20 +67,19 @@ pub(crate) fn read_appended(exe: &Path) -> anyhow::Result<Option<Vec<u8>>> {
 /// environment, `--dev`, `nitr dev`) has had its say: a production artifact
 /// never sends error details to clients, and a bundle has no sources to
 /// watch.
-pub fn seal(cfg: &mut Config) {
-    if cfg.dev_mode {
-        // stderr, not tracing: this runs while the configuration is being
-        // loaded, before the subscriber can exist (its format comes from
-        // this very configuration).
-        eprintln!("warning: dev_mode is forced off in a bundled build (no sources to watch)");
-    }
+pub fn seal(cfg: &mut Config) -> Option<String> {
+    let warning = cfg
+        .dev_mode
+        .then(|| "dev_mode is forced off in a bundled build (no sources to watch)".to_string());
     cfg.dev_mode = false;
+    warning
 }
 
 /// If this executable carries a bundle, extracts it (once — the directory
 /// is content-addressed and reused) and returns the loaded configuration,
 /// re-anchored to the extraction directory.
-pub fn load() -> anyhow::Result<Option<Config>> {
+pub fn load() -> anyhow::Result<Option<(Config, Vec<String>)>> {
+    let mut warnings = Vec::new();
     let exe = std::env::current_exe().context("cannot locate the running executable")?;
     let Some(tar) = read_appended(&exe)? else {
         return Ok(None);
@@ -130,12 +129,11 @@ pub fn load() -> anyhow::Result<Option<Config>> {
         }
         None => {
             let root = fresh_private_dir(&std::env::temp_dir(), "nitr-app")?;
-            // stderr, not tracing: the subscriber does not exist yet.
-            eprintln!(
-                "warning: no writable cache directory ($XDG_CACHE_HOME or $HOME/.cache); \
+            warnings.push(format!(
+                "no writable cache directory ($XDG_CACHE_HOME or $HOME/.cache); \
                  extracting the bundle to {} for this run only",
                 root.display()
-            );
+            ));
             extract(&tar, &root)?;
             root
         }
@@ -156,13 +154,13 @@ pub fn load() -> anyhow::Result<Option<Config>> {
     // forced off (`seal`), so the setting could never fire; saying so
     // beats a silent no-op.
     if let Some(output) = cfg.openapi.output.take() {
-        eprintln!(
-            "warning: [openapi] output = \"{}\" is ignored in a bundled build (no sources \
-             to follow; use `nitr openapi --output` instead)",
+        warnings.push(format!(
+            "[openapi] output = \"{}\" is ignored in a bundled build (no sources to follow; \
+             use `nitr openapi --output` instead)",
             output.display()
-        );
+        ));
     }
-    Ok(Some(cfg))
+    Ok(Some((cfg, warnings)))
 }
 
 /// Marks a completed extraction.

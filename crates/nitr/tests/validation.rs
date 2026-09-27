@@ -55,6 +55,13 @@ app:post("/strict", function(req)
     return nitr.json({ ok = true })
 end, { input = { body = { a = "string" }, strict = true } })
 
+-- Route middleware may hand the handler more than the request.
+app:post("/extra", function(next)
+    return function(req) return next(req, "bonus") end
+end, function(req, extra)
+    return nitr.json({ extra = extra, a = req.valid.body.a })
+end, { input = { body = { a = "string|required" } } })
+
 app:get("/items/:id", function(req)
     return nitr.json({ id = req.valid.params.id, limit = req.valid.query.limit, tags = req.valid.query.tags })
 end, {
@@ -185,10 +192,13 @@ async fn a_failing_body_answers_422_with_fields_and_rule_codes_before_any_lua() 
     server.stop().await;
 }
 
+/// Middleware runs first: an unauthenticated client learns nothing about a
+/// route's schema, and a request-log middleware sees every request.
+/// Validation then answers before the handler runs.
 #[tokio::test(flavor = "multi_thread")]
-async fn validation_runs_before_middleware_and_only_for_declared_routes() {
+async fn middleware_runs_before_validation_and_only_declared_routes_validate() {
     let mut server = TestServer::builder("validation").handler(APP).spawn().await;
-    // The auth middleware would answer 401, but validation comes first.
+    // The auth middleware answers 401 before the body is looked at.
     let resp = server
         .client()
         .post(server.url("/notes"))
@@ -198,18 +208,18 @@ async fn validation_runs_before_middleware_and_only_for_declared_routes() {
         .send()
         .await
         .expect("post");
-    assert_eq!(resp.status(), 422);
-    // A valid body then meets the middleware.
+    assert_eq!(resp.status(), 401);
+    // Past the middleware, an invalid body is a 422 and the handler never
+    // runs.
     let resp = server
         .client()
         .post(server.url("/notes"))
         .header("content-type", "application/json")
-        .header("x-auth", "deny")
-        .body(r#"{"text":"x"}"#)
+        .body("{}")
         .send()
         .await
         .expect("post");
-    assert_eq!(resp.status(), 401);
+    assert_eq!(resp.status(), 422);
     // A route without `input` has no `req.valid`.
     let json = server.json("/plain").await;
     assert!(json["valid"].is_null());
@@ -1637,4 +1647,25 @@ return app
         }
         server.stop().await;
     }
+}
+
+/// Validation sits between the route middleware and the handler, and
+/// passes along whatever the middleware passed: `next(req, user)` still
+/// reaches `function(req, user)` on a route that declares `input`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_validating_link_forwards_every_argument_to_the_handler() {
+    let mut server = TestServer::builder("validation").handler(APP).spawn().await;
+    let resp = server
+        .client()
+        .post(server.url("/extra"))
+        .header("content-type", "application/json")
+        .body(r#"{"a":"x"}"#)
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(json["extra"], "bonus");
+    assert_eq!(json["a"], "x");
+    server.stop().await;
 }

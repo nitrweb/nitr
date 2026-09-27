@@ -126,6 +126,7 @@ struct Run {
 pub(crate) async fn run(mut cfg: Config, args: &TestArgs) -> anyhow::Result<Report> {
     let started = Instant::now();
     args.validate()?;
+    super::skip_missing_static_dir(&mut cfg);
     cfg.validate_testing()?;
     let tests_dir = cfg.testing.dir.clone();
 
@@ -185,13 +186,17 @@ pub(crate) async fn run(mut cfg: Config, args: &TestArgs) -> anyhow::Result<Repo
             .map(|db| db.pragmas())
             .unwrap_or_default(),
         fetch: cfg.fetch.options(),
-        env: cfg.env_options(),
+        env: nitr::stdlib::EnvOptions {
+            mode: nitr::stdlib::RunMode::Test,
+            ..cfg.env_options()
+        },
         cache: Some(cache.clone()),
         // Resolved the way the server resolves it, not left at the
         // default: `nitr test` boots a real `Server` from this same `cfg`
         // below, so a cookie assertion written in a test file must
         // exercise the policy production will run.
         cookie_secure: cfg.cookies.secure.resolve(cfg.tls.enabled),
+        cookie_insecure_warning: None,
     };
     let opts = cfg.runtime_opts()?;
 
@@ -205,7 +210,7 @@ pub(crate) async fn run(mut cfg: Config, args: &TestArgs) -> anyhow::Result<Repo
             .cache(cache.clone())
             .setup(move |lua| {
                 lua.set_app_data(doubles.clone());
-                Ok(())
+                nitr::stdlib::set_run_mode(lua, nitr::stdlib::RunMode::Test)
             })
             .build()
             .await?

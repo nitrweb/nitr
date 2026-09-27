@@ -127,7 +127,22 @@ pub struct FetchRule {
     /// How many requests it answers before falling through; `None` is
     /// unlimited.
     pub times: Option<u32>,
+    /// A transport failure to raise instead of answering: the request
+    /// fails the way a reset or a timeout would, and is retryable.
+    pub error: Option<String>,
 }
+
+/// The failure a `t.fetch.mock { error = ... }` rule raises.
+#[derive(Debug)]
+pub struct MockedFailure(pub String);
+
+impl std::fmt::Display for MockedFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fetch failed (mocked): {}", self.0)
+    }
+}
+
+impl std::error::Error for MockedFailure {}
 
 /// One outbound call made while the doubles were installed, whether a
 /// rule answered it or not.
@@ -161,6 +176,8 @@ pub struct Canned {
 pub enum FetchAnswer {
     /// A rule matched: answer with this instead of sending.
     Canned(Canned),
+    /// A rule matched and stands for a transport failure.
+    Error(String),
     /// No rule matched and the double is not strict: send it for real,
     /// down the unchanged path, policy and resolver included.
     PassThrough,
@@ -221,11 +238,14 @@ impl FetchMock {
                 if let Some(left) = &mut rule.times {
                     *left -= 1;
                 }
-                FetchAnswer::Canned(Canned {
-                    status: rule.status,
-                    headers: rule.headers.clone(),
-                    body: rule.body.clone(),
-                })
+                match &rule.error {
+                    Some(message) => FetchAnswer::Error(message.clone()),
+                    None => FetchAnswer::Canned(Canned {
+                        status: rule.status,
+                        headers: rule.headers.clone(),
+                        body: rule.body.clone(),
+                    }),
+                }
             }
             None if self.strict => FetchAnswer::Refused,
             None => FetchAnswer::PassThrough,
@@ -239,7 +259,7 @@ impl FetchMock {
             url: url.to_string(),
             headers,
             body,
-            mocked: matches!(answer, FetchAnswer::Canned(_)),
+            mocked: matches!(answer, FetchAnswer::Canned(_) | FetchAnswer::Error(_)),
         });
         answer
     }
@@ -274,6 +294,7 @@ mod tests {
             headers: vec![("content-type".into(), "text/plain".into())],
             body: b"canned".to_vec(),
             times,
+            error: None,
         }
     }
 

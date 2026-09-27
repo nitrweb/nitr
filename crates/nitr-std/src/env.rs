@@ -10,10 +10,19 @@
 //! discover what else is there. `NITR_*` variables are hidden
 //! unconditionally (they configure the server, not the application), and
 //! the operator can narrow the readable set further with `[env] allow`.
+//!
+//! An empty value reads as unset everywhere: a Compose file or a unit file
+//! passes an optional variable through as `""`, and `NITR_*` already
+//! treats that as absent.
 
 use mlua::{Lua, Table, Value};
 
-use crate::config::EnvOptions;
+use crate::config::{EnvOptions, RunMode};
+
+/// The shortest secret `nitr.env.secret` accepts without a `min_len`: the
+/// session and CSRF keys need 16 bytes, and 32 leaves room for a hex or
+/// base64 spelling of that.
+const DEFAULT_SECRET_MIN_LEN: usize = 32;
 
 /// Builds the `nitr.env` table.
 pub(crate) fn create_env_table(lua: &Lua, opts: &EnvOptions) -> mlua::Result<Table> {
@@ -63,11 +72,76 @@ pub(crate) fn create_env_table(lua: &Lua, opts: &EnvOptions) -> mlua::Result<Tab
         })?,
     )?;
 
+    let policy = opts.clone();
+    env.set(
+        "secret",
+        lua.create_function(move |lua, (name, opts): (String, Option<Table>)| {
+            let (min_len, dev) = match opts {
+                Some(opts) => (
+                    opts.get::<Option<usize>>("min_len")?,
+                    opts.get::<Option<String>>("dev")?,
+                ),
+                None => (None, None),
+            };
+            let min_len = min_len.unwrap_or(DEFAULT_SECRET_MIN_LEN);
+            let value = match read(lua, &policy, &name) {
+                Some(value) => value,
+                // The fallback is for a laptop, never for a service: under
+                // `run` a missing secret stays an error, or a deployment
+                // that forgot the variable would sign with a known key.
+                None if run_mode(lua, &policy) != RunMode::Run => match dev {
+                    Some(fallback) => fallback,
+                    None => return Err(missing_secret(&name)),
+                },
+                None => return Err(missing_secret(&name)),
+            };
+            if value.len() < min_len {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "the secret in {name} is {} bytes long, at least {min_len} are required",
+                    value.len()
+                )));
+            }
+            lua.create_string(value)
+        })?,
+    )?;
+
+    env.set("mode", opts.mode.as_str())?;
+
     Ok(env)
 }
 
+/// The mode this state runs under: what [`set_run_mode`] installed, else
+/// the policy's.
+fn run_mode(lua: &Lua, opts: &EnvOptions) -> RunMode {
+    lua.app_data_ref::<RunMode>()
+        .map_or(opts.mode, |mode| *mode)
+}
+
+/// Overrides the mode of a state whose builtins are already registered:
+/// the test runner boots a real server from the same configuration, and
+/// its states must answer `test` too, or a config script's `dev` fallback
+/// would not apply under `nitr test`.
+///
+/// # Errors
+///
+/// Only when the `nitr` namespace table cannot be read.
+pub fn set_run_mode(lua: &Lua, mode: RunMode) -> mlua::Result<()> {
+    lua.set_app_data(mode);
+    let nitr = nitr_core::nitr_table(lua).map_err(mlua::Error::external)?;
+    if let Some(env) = nitr.get::<Option<Table>>("env")? {
+        env.set("mode", mode.as_str())?;
+    }
+    Ok(())
+}
+
+fn missing_secret(name: &str) -> mlua::Error {
+    mlua::Error::RuntimeError(format!(
+        "the environment variable {name} is required and has no value"
+    ))
+}
+
 /// Reads one variable under the policy; `None` for unset *and* for hidden,
-/// so callers cannot distinguish the two.
+/// so callers cannot distinguish the two, and for an empty value.
 ///
 /// A test's override (`nitr.test.env`, installed as
 /// [`Doubles`](crate::testing::Doubles) app data) is consulted only
@@ -77,12 +151,11 @@ fn read(lua: &Lua, opts: &EnvOptions, name: &str) -> Option<String> {
     if !visible(opts, name) {
         return None;
     }
-    if let Some(doubles) = crate::testing::installed(lua)
-        && let Some(overridden) = doubles.env_override(name)
-    {
-        return overridden;
-    }
-    std::env::var(name).ok()
+    let value = match crate::testing::installed(lua).and_then(|d| d.env_override(name)) {
+        Some(overridden) => overridden,
+        None => std::env::var(name).ok(),
+    };
+    value.filter(|value| !value.is_empty())
 }
 
 /// Whether the policy lets scripts see this name.
@@ -130,6 +203,7 @@ mod tests {
     fn the_allow_list_matches_prefixes_and_exact_names() {
         let opts = EnvOptions {
             allow: Some(vec!["APP_".into(), "API_TOKEN".into()]),
+            mode: RunMode::Run,
         };
         assert!(visible(&opts, "APP_NAME"));
         assert!(visible(&opts, "API_TOKEN"));
@@ -139,6 +213,7 @@ mod tests {
         // The unconditional rule wins over any allow entry.
         let opts = EnvOptions {
             allow: Some(vec!["NITR_".into()]),
+            mode: RunMode::Run,
         };
         assert!(!visible(&opts, "NITR_LISTEN"));
     }
@@ -176,6 +251,113 @@ mod tests {
         assert!(d);
     }
 
+    /// An empty variable is an unset one, everywhere: Compose passes an
+    /// optional variable through as `""`, and `NITR_*` already reads it
+    /// as absent.
+    #[test]
+    fn an_empty_variable_reads_as_unset() {
+        let lua = mlua::Lua::new();
+        let doubles = crate::testing::Doubles::new();
+        lua.set_app_data(doubles.clone());
+        let table = create_env_table(&lua, &EnvOptions::default()).expect("table");
+        lua.globals().set("env", table).expect("set");
+        doubles.set_env("APP_EMPTY", Some(String::new()));
+        let (value, has, number, flag): (String, bool, f64, bool) = lua
+            .load(
+                r#"return env.get("APP_EMPTY", "d"), env.has("APP_EMPTY"),
+                          env.number("APP_EMPTY", 7), env.bool("APP_EMPTY", true)"#,
+            )
+            .eval()
+            .expect("eval");
+        assert_eq!((value.as_str(), has, number, flag), ("d", false, 7.0, true));
+    }
+
+    /// `secret` fails closed: unset, empty or short is an error naming the
+    /// variable, and a development fallback applies only under `dev` or
+    /// `test`. `mode` says which of the three the process is.
+    #[test]
+    fn secret_fails_closed_and_the_fallback_is_for_development_only() {
+        for (mode, fallback_ok) in [
+            (RunMode::Run, false),
+            (RunMode::Dev, true),
+            (RunMode::Test, true),
+        ] {
+            let lua = mlua::Lua::new();
+            let doubles = crate::testing::Doubles::new();
+            lua.set_app_data(doubles.clone());
+            let opts = EnvOptions { allow: None, mode };
+            let table = create_env_table(&lua, &opts).expect("table");
+            lua.globals().set("env", table).expect("set");
+            let got: String = lua.load("return env.mode").eval().expect("mode");
+            assert_eq!(got, mode.as_str());
+            let mode = mode.as_str();
+
+            let err = lua
+                .load(r#"return env.secret("APP_KEY")"#)
+                .eval::<String>()
+                .expect_err("unset")
+                .to_string();
+            assert!(
+                err.contains("APP_KEY") && err.contains("required"),
+                "{mode}: {err}"
+            );
+
+            let fallback = lua
+                .load(
+                    r#"return env.secret("APP_KEY", { dev = "dev-only-key-0123456789abcdef012" })"#,
+                )
+                .eval::<String>();
+            if fallback_ok {
+                assert_eq!(fallback.expect(mode), "dev-only-key-0123456789abcdef012");
+            } else {
+                let err = fallback.expect_err(mode).to_string();
+                assert!(err.contains("APP_KEY"), "{mode}: {err}");
+            }
+
+            doubles.set_env("APP_KEY", Some("short".into()));
+            let err = lua
+                .load(r#"return env.secret("APP_KEY")"#)
+                .eval::<String>()
+                .expect_err("short")
+                .to_string();
+            assert!(
+                err.contains("32") && err.contains("APP_KEY"),
+                "{mode}: {err}"
+            );
+            let ok: String = lua
+                .load(r#"return env.secret("APP_KEY", { min_len = 5 })"#)
+                .eval()
+                .expect("min_len");
+            assert_eq!(ok, "short");
+            doubles.set_env("APP_KEY", Some("x".repeat(32)));
+            let ok: String = lua
+                .load(r#"return env.secret("APP_KEY")"#)
+                .eval()
+                .expect("set");
+            assert_eq!(ok.len(), 32);
+        }
+    }
+
+    /// The runner flips a registered state to `test`: the field and the
+    /// fallback follow.
+    #[test]
+    fn the_run_mode_can_be_set_after_registration() {
+        let lua = mlua::Lua::new();
+        let doubles = crate::testing::Doubles::new();
+        lua.set_app_data(doubles);
+        let nitr = nitr_core::nitr_table(&lua).expect("nitr");
+        let table = create_env_table(&lua, &EnvOptions::default()).expect("table");
+        nitr.set("env", table).expect("set");
+        lua.globals().set("nitr", nitr).expect("set");
+        let run =
+            r#"return nitr.env.mode, pcall(nitr.env.secret, "APP_KEY", { dev = ("k"):rep(32) })"#;
+        let (mode, ok): (String, bool) = lua.load(run).eval().expect("run");
+        assert_eq!((mode.as_str(), ok), ("run", false));
+        set_run_mode(&lua, RunMode::Test).expect("set mode");
+        let (mode, ok): (String, bool) = lua.load(run).eval().expect("test");
+        assert_eq!((mode.as_str(), ok), ("test", true));
+    }
+
     /// `nan` and `inf` parse as floats but are not numbers a setting can
     /// mean: they read as unparseable, so the default answers.
     #[test]
@@ -211,6 +393,7 @@ mod tests {
         lua.set_app_data(doubles.clone());
         let opts = EnvOptions {
             allow: Some(vec!["APP_".into(), "PATH".into()]),
+            mode: RunMode::Run,
         };
         let table = create_env_table(&lua, &opts).expect("table");
         lua.globals().set("env", table).expect("set");

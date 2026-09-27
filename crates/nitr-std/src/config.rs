@@ -26,6 +26,11 @@ pub struct FetchOptions {
     /// Allow requests to loopback/private/link-local addresses. Off by
     /// default; enable for trusted internal aggregation.
     pub allow_private_networks: bool,
+    /// Host names that may resolve to a private address while
+    /// `allow_private_networks` stays off: the sidecar or the service next
+    /// door, compared case-insensitively against the URL's host and
+    /// applied to every redirect hop.
+    pub private_hosts: Vec<String>,
     /// Maximum response body size accumulated by `resp:text()` /
     /// `resp:json()`, in bytes.
     pub max_response_bytes: u64,
@@ -56,6 +61,7 @@ impl Default for FetchOptions {
         Self {
             allowed_hosts: None,
             allow_private_networks: false,
+            private_hosts: Vec::new(),
             max_response_bytes: 8 * 1024 * 1024, // 8 MiB
             max_concurrent: 8,
             max_per_request: 32,
@@ -80,6 +86,33 @@ pub struct EnvOptions {
     /// Names scripts may read: exact names, or prefixes written with a
     /// trailing `_` (`"APP_"`). `None` allows every non-`NITR_*` variable.
     pub allow: Option<Vec<String>>,
+    /// What the process is doing, as `nitr.env.mode` reports it and as
+    /// `nitr.env.secret` decides whether a development fallback applies.
+    pub mode: RunMode,
+}
+
+/// What a process is running as, decided by the server (`dev_mode`) or
+/// the test runner and never by a script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RunMode {
+    /// Serving, `dev_mode = false`: a secret without a value is an error.
+    #[default]
+    Run,
+    /// Serving with `dev_mode = true`.
+    Dev,
+    /// Under `nitr test`.
+    Test,
+}
+
+impl RunMode {
+    /// The word `nitr.env.mode` holds.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Dev => "dev",
+            Self::Test => "test",
+        }
+    }
 }
 
 /// The pragma set applied to a connection when it is opened.

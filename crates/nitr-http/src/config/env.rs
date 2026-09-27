@@ -48,7 +48,8 @@ impl Config {
     ///
     /// Top-level keys keep their plain names: `NITR_LISTEN`,
     /// `NITR_HANDLER_SCRIPT`, `NITR_CONFIG_SCRIPT`, `NITR_WORKERS`,
-    /// `NITR_MAX_STREAMS`, `NITR_DEV_MODE`, `NITR_PIDFILE`. A sectioned
+    /// `NITR_MAX_STREAMS`, `NITR_DEV_MODE`, `NITR_PIDFILE`,
+    /// `NITR_TRUST_REQUEST_ID`. A sectioned
     /// option is named `NITR_<SECTION>_<OPTION>`: `NITR_DATABASE_PATH`,
     /// `NITR_TEMPLATING_DIR`, `NITR_TESTING_DIR`, `NITR_TESTING_DATABASE`,
     /// `NITR_ENV_FILE`, `NITR_LUA_MEMORY_LIMIT`,
@@ -57,7 +58,8 @@ impl Config {
     /// `NITR_TLS_ENABLED`, `NITR_TLS_CERT`, `NITR_TLS_KEY`,
     /// `NITR_TLS_MIN_VERSION`, `NITR_LOG_FORMAT`, `NITR_LOG_LEVEL`,
     /// `NITR_OPENAPI_ENABLED`, `NITR_OPENAPI_PATH`, `NITR_SWAGGER_ENABLED`,
-    /// `NITR_SWAGGER_PATH`.
+    /// `NITR_SWAGGER_PATH`, `NITR_COOKIES_SECURE`,
+    /// `NITR_RATE_LIMIT_TRUST_FORWARDED_FOR`.
     pub fn apply_env(&mut self) -> Result {
         self.apply_env_with(&|name| std::env::var(name).ok())
     }
@@ -123,6 +125,16 @@ impl Config {
         }
         if let Some(v) = env_var("NITR_DEV_MODE") {
             self.dev_mode = parse_env("NITR_DEV_MODE", &v)?;
+        }
+        if let Some(v) = env_var("NITR_TRUST_REQUEST_ID") {
+            self.trust_request_id = parse_env("NITR_TRUST_REQUEST_ID", &v)?;
+        }
+        if let Some(v) = env_var("NITR_RATE_LIMIT_TRUST_FORWARDED_FOR") {
+            self.rate_limit.trust_forwarded_for =
+                parse_env("NITR_RATE_LIMIT_TRUST_FORWARDED_FOR", &v)?;
+        }
+        if let Some(v) = env_var("NITR_COOKIES_SECURE") {
+            self.cookies.secure = parse_env("NITR_COOKIES_SECURE", &v)?;
         }
         if let Some(v) = env_var("NITR_LUA_MEMORY_LIMIT") {
             self.lua.memory_limit = parse_env("NITR_LUA_MEMORY_LIMIT", &v)?;

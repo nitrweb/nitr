@@ -218,6 +218,14 @@ pub(crate) const RULE_CODES: &[&str] = &[
 
 /// The built-in sentence for a rule, given its parameters and the kind of
 /// value it applied to (a few rules read differently per kind).
+/// `1 character`, `2 characters`: a message shown to a person.
+fn characters(count: &str) -> String {
+    match count {
+        "1" => "1 character".into(),
+        n => format!("{n} characters"),
+    }
+}
+
 pub(crate) fn default_message(rule: &str, kind: &str, params: &BTreeMap<&str, Param>) -> String {
     let p = |name: &str| params.get(name).map(Param::render).unwrap_or_default();
     match rule {
@@ -233,9 +241,9 @@ pub(crate) fn default_message(rule: &str, kind: &str, params: &BTreeMap<&str, Pa
             _ => format!("must be a {kind}"),
         },
         "required" => "is required".into(),
-        "min_len" => format!("must be at least {} characters", p("min")),
-        "max_len" => format!("must be at most {} characters", p("max")),
-        "len" => format!("must be exactly {} characters", p("len")),
+        "min_len" => format!("must be at least {}", characters(&p("min"))),
+        "max_len" => format!("must be at most {}", characters(&p("max"))),
+        "len" => format!("must be exactly {}", characters(&p("len"))),
         "min" => format!("must be at least {}", p("min")),
         "max" => format!("must be at most {}", p("max")),
         "exclusive_min" => format!("must be greater than {}", p("min")),

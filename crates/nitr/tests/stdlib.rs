@@ -158,8 +158,8 @@ return app
 /// The CSRF middleware: safe methods pass and get a token cookie, unsafe
 /// methods need the token back (header or form field), and the comparison
 /// rejects a missing or wrong token with 403.
-/// A partial `cookie_opts` **extends** the CSRF defaults; it used to
-/// replace them, so `cookie_opts = { path = "/admin" }` shipped the token
+/// A partial `cookie` table **extends** the CSRF defaults; it used to
+/// replace them, so `cookie = { path = "/admin" }` shipped the token
 /// cookie with no `HttpOnly` and no `SameSite`, silently — on the more
 /// security-sensitive of the two cookie modules, while sessions merged
 /// correctly for the same job.
@@ -176,7 +176,7 @@ local app = nitr.app()
 -- Partial on purpose: only `path`. Everything else must survive.
 app:use(nitr.csrf({
     secret = "csrf-secret-0123456789",
-    cookie_opts = { path = "/admin" },
+    cookie = { path = "/admin" },
 }))
 
 app:get("/form", function(req)
@@ -208,7 +208,7 @@ return app
     for kept in ["HttpOnly", "SameSite=Lax"] {
         assert!(
             set_cookie.contains(kept),
-            "a partial cookie_opts must keep `{kept}`: {set_cookie}"
+            "a partial cookie table must keep `{kept}`: {set_cookie}"
         );
     }
 

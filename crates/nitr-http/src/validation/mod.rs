@@ -89,6 +89,11 @@ pub(crate) struct InputEnv {
     /// the configuration key that claimed it: a route there is a
     /// compile-time error naming the key.
     pub(crate) reserved: Vec<(String, &'static str)>,
+    /// `[rate_limit] trust_forwarded_for`, for a route's own limit.
+    pub(crate) trust_forwarded_for: bool,
+    /// A missing `app:static` directory is skipped with a warning instead
+    /// of refusing the load (`Config::static_dirs_optional`).
+    pub(crate) static_dirs_optional: bool,
 }
 
 /// A route's compiled input declaration.

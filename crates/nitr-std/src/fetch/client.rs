@@ -48,17 +48,18 @@ impl RequestSpec {
     /// Whether repeating this request is safe.
     ///
     /// Retrying a `POST` is how a customer gets charged twice, so only the
-    /// methods HTTP defines as idempotent are ever repeated — regardless of
-    /// what the caller asked for.
+    /// methods HTTP defines as idempotent are repeated, unless the caller
+    /// vouches for the request with `retry = { idempotent = true }`.
     fn is_idempotent(&self) -> bool {
-        matches!(
-            self.method,
-            HttpMethod::GET
-                | HttpMethod::HEAD
-                | HttpMethod::PUT
-                | HttpMethod::DELETE
-                | HttpMethod::OPTIONS
-        )
+        self.retry.is_some_and(|retry| retry.idempotent)
+            || matches!(
+                self.method,
+                HttpMethod::GET
+                    | HttpMethod::HEAD
+                    | HttpMethod::PUT
+                    | HttpMethod::DELETE
+                    | HttpMethod::OPTIONS
+            )
     }
 }
 
@@ -127,6 +128,11 @@ fn mocked(
             return Err(mlua::Error::RuntimeError(format!(
                 "no fetch mock matched {} {} (nitr.test.fetch.strict is on)",
                 spec.method, spec.url
+            )));
+        }
+        FetchAnswer::Error(message) => {
+            return Err(mlua::Error::external(crate::testing::MockedFailure(
+                message,
             )));
         }
         FetchAnswer::Canned(canned) => canned,
@@ -202,6 +208,9 @@ fn is_transient(err: &mlua::Error) -> bool {
     }
     // `check_url`'s own lookup: DNS failing is a network failure too.
     err.downcast_ref::<std::io::Error>().is_some()
+        || err
+            .downcast_ref::<crate::testing::MockedFailure>()
+            .is_some()
 }
 
 /// The guarded resolver's refusal reaches reqwest as a connect error.
@@ -364,6 +373,7 @@ fn client_for(opts: &FetchOptions) -> mlua::Result<Arc<HttpClient>> {
         // The resolution the connector uses is the one that gets filtered.
         .dns_resolver(Arc::new(GuardedResolver::new(
             policy.allow_private_networks,
+            policy.private_hosts.clone(),
         )));
 
     if policy.no_proxy {
@@ -640,7 +650,42 @@ mod tests {
                 !spec(unsafe_method).is_idempotent(),
                 "{unsafe_method} must never be repeated automatically"
             );
+            let mut vouched = spec(unsafe_method);
+            vouched.retry = Some(Retry {
+                attempts: 2,
+                exponential: true,
+                idempotent: true,
+            });
+            assert!(
+                vouched.is_idempotent(),
+                "{unsafe_method} may be repeated when the caller vouches for it"
+            );
         }
+    }
+
+    /// A mocked transport failure is the failure it stands for: a network
+    /// error, so a handler's retry and error path see what production
+    /// would show them.
+    #[test]
+    fn a_mocked_error_fails_like_the_network() {
+        let doubles = crate::testing::Doubles::new();
+        doubles
+            .fetch()
+            .expect("lock")
+            .add(crate::testing::FetchRule {
+                method: None,
+                url: crate::testing::UrlMatch::Exact("https://example.com/".into()),
+                status: 200,
+                headers: Vec::new(),
+                body: Vec::new(),
+                times: None,
+                error: Some("connection reset".into()),
+            });
+        let Err(err) = mocked(&doubles, &spec("GET"), &FetchOptions::default()) else {
+            panic!("the mocked error must fail the call");
+        };
+        assert!(err.to_string().contains("connection reset"), "{err}");
+        assert!(is_transient(&err), "a mocked failure is retryable");
     }
 
     /// The security boundary is the resolver wired *into* the client, not

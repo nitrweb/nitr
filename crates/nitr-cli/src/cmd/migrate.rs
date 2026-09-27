@@ -14,9 +14,10 @@ use anyhow::bail;
 
 /// Applies pending migrations, or reports their state with `--status`.
 ///
-/// Deliberately separate from `nitr run`: applying schema changes at boot
+/// Separate from `nitr run` by default: applying schema changes at boot
 /// means a rolling deployment has two instances racing to change the same
-/// schema, each believing it is alone.
+/// schema, each believing it is alone. `nitr run --migrate` opts a single
+/// instance in.
 #[cfg(not(feature = "db"))]
 pub(crate) fn migrate(_cfg: &Config, _status_only: bool) -> anyhow::Result<()> {
     bail!(
@@ -68,6 +69,13 @@ pub(crate) fn migrate(cfg: &Config, status_only: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // A first deployment has no `data/` yet, and SQLite's "unable to open
+    // database file" names nothing.
+    if let Some(parent) = db.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("cannot create the database directory {}", parent.display())
+        })?;
+    }
     let conn = nitr::stdlib::db_open(&db.path, &db.pragmas())?;
     let applied = nitr::stdlib::migrate::run(&conn, &dir)?;
     if applied.is_empty() {

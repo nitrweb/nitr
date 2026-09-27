@@ -5,6 +5,7 @@
 
 //! Server configuration (`nitr.toml`), defaults, and environment overrides.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -73,6 +74,10 @@ pub struct Config {
     pub compression: CompressionConfig,
     /// Cross-origin resource sharing (`[cors]` section).
     pub cors: CorsConfig,
+    /// Headers added to every response (`[headers]` section): the static
+    /// files, the built-in rejections and the SPA page included. A header
+    /// the handler itself set wins.
+    pub headers: BTreeMap<String, String>,
     /// Inbound TLS termination (`[tls]` section).
     pub tls: TlsConfig,
     /// The shared `nitr.cache` (`[cache]` section).
@@ -94,6 +99,12 @@ pub struct Config {
     pub lua: LuaConfig,
     /// Health and readiness endpoints (`[health]` section).
     pub health: HealthConfig,
+    /// Set by a tool that proves the application without serving it
+    /// (`nitr check`, `nitr test`): a static directory that does not exist
+    /// yet is skipped with a warning rather than refused, because the
+    /// front-end build that fills it runs later. Never read from a file.
+    #[serde(skip)]
+    pub static_dirs_optional: bool,
     /// The generated OpenAPI document (`[openapi]` section).
     pub openapi: OpenApiConfig,
     /// The Swagger UI page (`[swagger]` section).
@@ -124,6 +135,7 @@ impl Default for Config {
             shutdown: ShutdownConfig::default(),
             compression: CompressionConfig::default(),
             cors: CorsConfig::default(),
+            headers: BTreeMap::new(),
             tls: TlsConfig::default(),
             cache: CacheConfig::default(),
             static_files: StaticConfig::default(),
@@ -134,6 +146,7 @@ impl Default for Config {
             env: EnvConfig::default(),
             lua: LuaConfig::default(),
             health: HealthConfig::default(),
+            static_dirs_optional: false,
             openapi: OpenApiConfig::default(),
             swagger: SwaggerConfig::default(),
             log: LogConfig::default(),
@@ -186,7 +199,28 @@ impl Config {
     pub fn env_options(&self) -> nitr_std::EnvOptions {
         nitr_std::EnvOptions {
             allow: self.env.allow.clone(),
+            mode: if self.dev_mode {
+                nitr_std::RunMode::Dev
+            } else {
+                nitr_std::RunMode::Run
+            },
         }
+    }
+
+    /// Why a cookie built without `Secure` deserves a warning, for the
+    /// first such cookie to log. `"auto"` cannot see a proxy terminating
+    /// TLS in front of a plaintext bind, the most common deployment, so
+    /// it says so once a cookie actually ships that way; `dev_mode` and an
+    /// explicit `"never"` are the operator's answer and stay silent.
+    pub fn cookie_insecure_warning(&self) -> Option<String> {
+        let auto_insecure = self.cookies.secure == CookieSecure::Auto && !self.tls.enabled;
+        (auto_insecure && !self.dev_mode).then(|| {
+            "a cookie was sent without the `Secure` attribute: [tls] enabled = false, and \
+             [cookies] secure = \"auto\" follows it. If TLS is terminated by a proxy in front \
+             of this process, set [cookies] secure = \"always\"; nothing here can detect that \
+             proxy."
+                .into()
+        })
     }
 
     /// Limits for the shared `nitr.cache`.

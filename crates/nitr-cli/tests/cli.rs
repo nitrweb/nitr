@@ -471,6 +471,14 @@ fn build_produces_a_self_contained_artifact() {
             stdout.contains("dev_mode = false"),
             "{args:?} {env:?}: {stdout}"
         );
+        // Said through the log, at WARN, not as a bare line on stderr
+        // that a log pipeline never sees.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let all = format!("{stdout}{stderr}");
+        let warned = all
+            .lines()
+            .any(|line| line.contains("WARN") && line.contains("dev_mode is forced off"));
+        assert!(warned, "{args:?} {env:?}: {all}");
     }
 
     // A bundle carries its own configuration: a `--config` it would have
@@ -566,6 +574,106 @@ fn migrate_status_applies_and_creates_nothing() {
         .modified()
         .expect("mtime");
     assert_eq!(before, after, "--status must not write to the database");
+}
+
+/// `nitr migrate` creates the database's directory: a first deployment
+/// has no `data/` yet, and "unable to open database file" names nothing.
+#[cfg(all(feature = "db", feature = "template"))]
+#[test]
+fn migrate_creates_the_database_directory() {
+    require_runnable_binary!();
+    let dir = scaffold("migrate-mkdir", false);
+    std::fs::remove_dir_all(dir.join("data")).expect("remove data/");
+    let out = nitr()
+        .current_dir(&dir)
+        .arg("migrate")
+        .output()
+        .expect("run migrate");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dir.join("data/app.db").is_file());
+}
+
+/// `nitr run --migrate` applies what is pending and then serves, so one
+/// container command replaces `nitr migrate && nitr run`.
+#[cfg(all(feature = "db", feature = "template"))]
+#[test]
+fn run_migrate_applies_pending_migrations_before_listening() {
+    require_runnable_binary!();
+    let dir = scaffold("run-migrate", false);
+    let log = std::fs::File::create(dir.join("server.log")).expect("log file");
+    let mut child = nitr()
+        .current_dir(&dir)
+        .env("NITR_LISTEN", "127.0.0.1:0")
+        .args(["run", "--migrate"])
+        .stdout(log)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn nitr run --migrate");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let logged = std::fs::read_to_string(dir.join("server.log")).unwrap_or_default();
+        if logged.contains("listening on") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "server never started listening; log so far: {logged}"
+        );
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "server exited early; log: {logged}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    child.kill().expect("kill");
+    let _ = child.wait();
+    let out = nitr()
+        .current_dir(&dir)
+        .args(["migrate", "--status"])
+        .output()
+        .expect("run migrate --status");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("0 pending"), "got: {stdout}");
+}
+
+/// A `[static] dir` that is not there yet (the SPA build runs later, in
+/// CI) does not stop `nitr check` from proving the rest: it warns and
+/// goes on. Serving still refuses it.
+#[test]
+fn check_tolerates_a_missing_static_dir_but_run_refuses_it() {
+    require_runnable_binary!();
+    let dir = scaffold("check-static", true);
+    std::fs::write(
+        dir.join("nitr.toml"),
+        "listen = \"127.0.0.1:0\"\nhandler_script = \"app.lua\"\n[static]\ndir = \"dist\"\n",
+    )
+    .expect("write config");
+    let out = nitr()
+        .current_dir(&dir)
+        .arg("check")
+        .output()
+        .expect("run check");
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "check must pass: {all}");
+    assert!(
+        all.contains("WARN") && all.contains("[static] dir") && all.contains("dist"),
+        "got: {all}"
+    );
+    let out = nitr().current_dir(&dir).arg("run").output().expect("run");
+    assert!(
+        !out.status.success(),
+        "serving a missing directory is refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("[static] dir"), "got: {stderr}");
 }
 
 /// `nitr run` writes the configured pidfile, `nitr reload` signals through

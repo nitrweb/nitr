@@ -156,10 +156,15 @@ pub(crate) fn attach_cookie(resp: &Table, cookie: String) -> mlua::Result<()> {
 /// be threading the flag into every `ResponseCookies` construction site.
 /// Absent means not secure, matching `BuiltinsEnv`'s derived `Default`, so
 /// an embedder who never sets one keeps today's behaviour.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CookieDefaults {
     /// Whether cookies carry `Secure` when the caller's options do not say.
     pub secure: bool,
+    /// Why a cookie built without `Secure` deserves a warning, when the
+    /// server could not tell whether a proxy terminates TLS in front of
+    /// it. Logged once per process, the first time such a cookie is
+    /// built: a service that never sets one is never told about them.
+    pub insecure_warning: Option<String>,
 }
 
 /// The resolved `Secure` default for this state; `false` when nothing
@@ -167,6 +172,23 @@ pub struct CookieDefaults {
 fn secure_default(lua: &Lua) -> bool {
     lua.app_data_ref::<CookieDefaults>()
         .is_some_and(|defaults| defaults.secure)
+}
+
+/// Logs the configured warning the first time a cookie ships without
+/// `Secure` by default; reports whether this call was the one to log it.
+fn warn_insecure_once(lua: &Lua) -> bool {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some(why) = lua
+        .app_data_ref::<CookieDefaults>()
+        .and_then(|defaults| defaults.insecure_warning.clone())
+    else {
+        return false;
+    };
+    if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    tracing::warn!("{why}");
+    true
 }
 
 /// Merges caller-supplied cookie options over a module's defaults and
@@ -224,8 +246,13 @@ pub(crate) fn build_cookie(
         Some(opts) => opts.get::<Option<bool>>("secure")?,
         None => None,
     };
-    if explicit_secure.unwrap_or_else(|| secure_default(lua)) {
-        builder = builder.secure(true);
+    match explicit_secure {
+        Some(true) => builder = builder.secure(true),
+        Some(false) => {}
+        None if secure_default(lua) => builder = builder.secure(true),
+        None => {
+            warn_insecure_once(lua);
+        }
     }
     if let Some(opts) = opts {
         if opts.get::<Option<bool>>("http_only")?.unwrap_or(false) {
@@ -421,7 +448,10 @@ mod tests {
         ] {
             let lua = mlua::Lua::new();
             if let Some(secure) = default_secure {
-                lua.set_app_data(CookieDefaults { secure });
+                lua.set_app_data(CookieDefaults {
+                    secure,
+                    insecure_warning: None,
+                });
             }
             let opts = match explicit {
                 Some(value) => {
@@ -438,6 +468,34 @@ mod tests {
                 "default={default_secure:?} explicit={explicit:?} gave `{cookie}`"
             );
         }
+    }
+
+    /// The warning about cookies without `Secure` belongs to the first
+    /// cookie built that way, once: an explicit `secure = false` is the
+    /// caller's decision and says nothing.
+    #[test]
+    fn the_insecure_warning_fires_once_on_the_first_cookie_built_without_secure() {
+        let lua = mlua::Lua::new();
+        assert!(
+            !warn_insecure_once(&lua),
+            "nothing registered, nothing to say"
+        );
+        lua.set_app_data(CookieDefaults {
+            secure: false,
+            insecure_warning: Some("[tls] enabled = false".into()),
+        });
+        let opts = lua.create_table().expect("table");
+        opts.set("secure", false).expect("set");
+        build_cookie(&lua, "a", "1", Some(&opts)).expect("cookie");
+        assert!(
+            warn_insecure_once(&lua),
+            "an explicit false must not have spent the warning"
+        );
+        build_cookie(&lua, "b", "2", None).expect("cookie");
+        assert!(
+            !warn_insecure_once(&lua),
+            "spent by the cookie built without Secure"
+        );
     }
 
     /// A caller's options extend the module defaults rather than replacing

@@ -20,6 +20,10 @@ pub struct FetchConfig {
     pub allowed_hosts: Option<Vec<String>>,
     /// Allow requests to private/loopback/link-local addresses.
     pub allow_private_networks: bool,
+    /// Host names that may resolve to a private address while
+    /// `allow_private_networks` stays off: the service next door, named,
+    /// rather than every address on the network.
+    pub private_hosts: Vec<String>,
     /// Maximum response body accumulated by `resp:text()`/`resp:json()`.
     pub max_response_bytes: u64,
     /// Maximum concurrent requests per `await_all(...)` call.
@@ -56,6 +60,7 @@ impl Default for FetchConfig {
         Self {
             allowed_hosts: defaults.allowed_hosts,
             allow_private_networks: defaults.allow_private_networks,
+            private_hosts: defaults.private_hosts,
             max_response_bytes: defaults.max_response_bytes,
             max_concurrent: defaults.max_concurrent,
             max_per_request: defaults.max_per_request,
@@ -76,6 +81,7 @@ impl FetchConfig {
         nitr_std::FetchOptions {
             allowed_hosts: self.allowed_hosts.clone(),
             allow_private_networks: self.allow_private_networks,
+            private_hosts: self.private_hosts.clone(),
             max_response_bytes: self.max_response_bytes,
             max_concurrent: self.max_concurrent.max(1),
             max_per_request: self.max_per_request,
@@ -132,14 +138,30 @@ pub struct TemplatingConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CookieSecure {
-    /// `Secure` when `[tls] enabled = true`. Warns at boot when it
-    /// resolves to *not* secure, since this cannot see a proxy in front.
+    /// `Secure` when `[tls] enabled = true`. The first cookie built
+    /// without `Secure` logs a warning, since this cannot see a proxy in
+    /// front.
     #[default]
     Auto,
     /// Always `Secure`: TLS is terminated in front of this process.
     Always,
     /// Never `Secure`: plain-HTTP development.
     Never,
+}
+
+impl std::str::FromStr for CookieSecure {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "always" => Ok(Self::Always),
+            "never" => Ok(Self::Never),
+            other => Err(format!(
+                "`{other}` is not a cookie policy: expected \"auto\", \"always\" or \"never\""
+            )),
+        }
+    }
 }
 
 impl CookieSecure {

@@ -294,7 +294,10 @@ fn operation(
             .entry("415".to_string())
             .or_insert_with(|| json!({ "$ref": "#/components/responses/UnsupportedMediaType" }));
     }
-    if responses.is_empty() {
+    // Every operation answers something on success; an operation that
+    // documents only its failures still gets its 200, so a generated client
+    // has a success shape to work with.
+    if !responses.keys().any(|code| code.starts_with('2')) {
         responses.insert("200".into(), json!({ "description": "OK" }));
     }
     op.insert("responses".into(), Json::Object(responses));

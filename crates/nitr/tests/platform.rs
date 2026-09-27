@@ -143,10 +143,26 @@ return app
     let resp = server.get("/api/ping").await;
     assert_eq!(resp.headers()["content-type"], "application/json");
 
-    // SPA fallback serves the index for unknown paths under its mount.
-    let resp = server.get("/spa/some/client/route").await;
+    // SPA fallback serves the index to a browser navigation: an unknown
+    // path under the mount, asked for as HTML. An API client asking for
+    // JSON gets the 404 it can act on, not a page.
+    let resp = server
+        .client()
+        .get(server.url("/spa/some/client/route"))
+        .header("accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8")
+        .send()
+        .await
+        .expect("navigation");
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.expect("spa body"), "<div id=app></div>");
+    let resp = server
+        .client()
+        .get(server.url("/spa/some/client/route"))
+        .header("accept", "application/json")
+        .send()
+        .await
+        .expect("api client");
+    assert_eq!(resp.status(), 404);
 
     // Unknown path outside any mount is still a 404.
     let resp = server.get("/missing.txt").await;

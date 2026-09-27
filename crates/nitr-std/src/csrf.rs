@@ -38,20 +38,13 @@ struct CsrfSlot {
 /// factory runs (at app compile time, not per request).
 struct Config {
     secret: String,
-    /// The cookie's **name** (default `_csrf`) — a string, not a table.
-    ///
-    /// This is the trap in the option set, so it is named here: the
-    /// attributes live under `cookie_opts`, while `nitr.session` spells
-    /// the same idea `cookie` and takes a *table* there. A caller who
-    /// copies the session spelling and writes
-    /// `nitr.csrf({ secret = …, cookie = { path = "/admin" } })` is
-    /// passing a table where a name goes, and gets a conversion error
-    /// rather than options — see the factory's doc comment.
+    /// The cookie's name: the `name` option, default `_csrf`, spelled as
+    /// `nitr.session` spells it.
     cookie: String,
     header: String,
     field: String,
-    /// The cookie's attributes, **extending** the defaults rather than
-    /// replacing them. See [`cookie_opts`].
+    /// The `cookie` option: the cookie's attributes, **extending** the
+    /// defaults rather than replacing them. See [`cookie_opts`].
     cookie_opts: Option<Table>,
     /// Whether an unsafe request a browser marks `Sec-Fetch-Site:
     /// cross-site` is refused outright. On unless the token cookie is
@@ -91,8 +84,8 @@ fn new_token() -> mlua::Result<String> {
 /// (scripts get the token from `nitr.csrf.token`, not the cookie) and
 /// SameSite=Lax as a second layer of defense.
 ///
-/// A caller's `cookie_opts` **extends** these rather than replacing them.
-/// It used to replace: `nitr.csrf({ secret = …, cookie_opts = { path =
+/// A caller's `cookie` table **extends** these rather than replacing them.
+/// It used to replace: `nitr.csrf({ secret = …, cookie = { path =
 /// "/admin" } })` issued its token cookie with no `HttpOnly` and no
 /// `SameSite`, silently — on the more security-sensitive of the two cookie
 /// modules, while sessions merged correctly for the same job.
@@ -190,9 +183,26 @@ async fn handle(lua: Lua, config: Arc<Config>, next: Function, req: Value) -> ml
             next.call_async::<Value>(&req).await?
         } else {
             let resp = http::response_table(&lua, 403)?;
-            resp.get::<Table>("headers")?
-                .set("Content-Type", "text/plain; charset=utf-8")?;
-            resp.set("body", "Forbidden: missing or invalid CSRF token")?;
+            let headers = resp.get::<Table>("headers")?;
+            // A client asking for JSON gets a `code` it can branch on, like
+            // the server's own rejections.
+            let wants_json = match &req {
+                Value::UserData(ud) => ud
+                    .get::<Table>("headers")?
+                    .get::<Option<String>>("accept")?
+                    .is_some_and(|accept| accept.contains("application/json")),
+                _ => false,
+            };
+            if wants_json {
+                headers.set("Content-Type", "application/json")?;
+                resp.set(
+                    "body",
+                    r#"{"code":"CSRF_INVALID","message":"missing or invalid CSRF token"}"#,
+                )?;
+            } else {
+                headers.set("Content-Type", "text/plain; charset=utf-8")?;
+                resp.set("body", "Forbidden: missing or invalid CSRF token")?;
+            }
             Value::Table(resp)
         }
     };
@@ -213,20 +223,12 @@ async fn handle(lua: Lua, config: Arc<Config>, next: Function, req: Value) -> ml
 /// Builds `nitr.csrf`: callable as `nitr.csrf(opts)` (the middleware
 /// factory) with `nitr.csrf.token(req)` alongside.
 ///
-/// Options: `secret` (required, 16+ bytes), `cookie` (the cookie *name*,
+/// Options: `secret` (required, 16+ bytes), `name` (the cookie's name,
 /// default `_csrf`), `header` (default `x-csrf-token`), `field` (the form
-/// field, default `_csrf`), and `cookie_opts` (the cookie's *attributes*).
+/// field, default `_csrf`), and `cookie` (the cookie's *attributes*), the
+/// spellings `nitr.session` uses too.
 ///
-/// **`cookie` is a name here, not a table.** `nitr.session` uses `cookie`
-/// for the attribute table and has no separate name/options split, so a
-/// caller moving between the two naturally writes
-/// `nitr.csrf({ secret = …, cookie = { path = "/admin" } })` — which
-/// passes a table where a string belongs. That fails loudly (a conversion
-/// error) rather than silently ignoring the options, but the error names
-/// neither option, so the mapping is spelled out here: the CSRF spelling
-/// is `cookie_opts`.
-///
-/// `cookie_opts` **extends** the defaults (`path = "/"`, `HttpOnly`,
+/// `cookie` **extends** the defaults (`path = "/"`, `HttpOnly`,
 /// `SameSite=Lax`); it does not replace them, and `http_only` cannot be
 /// un-set.
 pub(crate) fn create_csrf_table(lua: &Lua) -> mlua::Result<Table> {
@@ -272,10 +274,32 @@ fn create_call_metatable(lua: &Lua) -> mlua::Result<Table> {
                     "nitr.csrf `secret` must be at least 16 bytes".into(),
                 ));
             }
+            // The same two spellings as `nitr.session`: `name` for the
+            // cookie's name, `cookie` for its attributes. The old pair
+            // (`cookie` the name, `cookie_opts` the attributes) is refused
+            // by name rather than read another way.
+            if opts.contains_key("cookie_opts")? {
+                return Err(mlua::Error::RuntimeError(
+                    "nitr.csrf: `cookie_opts` is now `cookie` (the attribute table), and the \
+                     cookie's name is `name`, as in nitr.session"
+                        .into(),
+                ));
+            }
+            let cookie_attrs = match opts.get::<Value>("cookie")? {
+                Value::Nil => None,
+                Value::Table(attrs) => Some(attrs),
+                other => {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "nitr.csrf: `cookie` is the attribute table (`{{ path = ..., same_site = \
+                         ... }}`); the cookie's name is `name`, got {}",
+                        other.type_name()
+                    )));
+                }
+            };
             let config = Arc::new(Config {
                 secret,
                 cookie: opts
-                    .get::<Option<String>>("cookie")?
+                    .get::<Option<String>>("name")?
                     .unwrap_or_else(|| "_csrf".into()),
                 // Request header names reach Lua lowercased; a caller who
                 // writes the option in canonical case must still match.
@@ -286,10 +310,8 @@ fn create_call_metatable(lua: &Lua) -> mlua::Result<Table> {
                 field: opts
                     .get::<Option<String>>("field")?
                     .unwrap_or_else(|| "_csrf".into()),
-                refuse_cross_site: refuses_cross_site(
-                    opts.get::<Option<Table>>("cookie_opts")?.as_ref(),
-                )?,
-                cookie_opts: opts.get("cookie_opts")?,
+                refuse_cross_site: refuses_cross_site(cookie_attrs.as_ref())?,
+                cookie_opts: cookie_attrs,
             });
 
             // The factory the router composes: factory(next) -> handler.
@@ -319,6 +341,37 @@ mod tests {
             a.chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         );
+    }
+
+    /// The option names are `nitr.session`'s: the old pair is refused by
+    /// name, and a string where the attribute table goes names `name`.
+    #[test]
+    fn the_factory_refuses_the_old_cookie_spellings() {
+        let lua = Lua::new();
+        let csrf = create_csrf_table(&lua).expect("table");
+        for (opts, expected) in [
+            (
+                r#"{ secret = "csrf-secret-0123456789", cookie_opts = { path = "/" } }"#,
+                "`cookie_opts` is now `cookie`",
+            ),
+            (
+                r#"{ secret = "csrf-secret-0123456789", cookie = "_token" }"#,
+                "the cookie's name is `name`",
+            ),
+        ] {
+            let opts: Table = lua.load(opts).eval().expect("opts");
+            let err = csrf
+                .call::<mlua::Function>(opts)
+                .expect_err("refused")
+                .to_string();
+            assert!(err.contains(expected), "{err}");
+        }
+        let opts: Table = lua
+            .load(r#"{ secret = "csrf-secret-0123456789", name = "_token", cookie = { path = "/" } }"#)
+            .eval()
+            .expect("opts");
+        csrf.call::<mlua::Function>(opts)
+            .expect("the new spellings");
     }
 
     #[test]

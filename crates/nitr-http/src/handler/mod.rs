@@ -39,7 +39,8 @@ enum Target {
         error_fn: Option<Function>,
         /// The route's `input` declaration, when it has one.
         input: Option<(Arc<crate::validation::InputSchemas>, AnyUserData)>,
-        invalid_fn: Option<Function>,
+        /// The route's own rate limit, when the state routed the request.
+        rate: Option<Arc<crate::protect::RateLimiter>>,
     },
     NotFound,
     /// An `OPTIONS` on a known path with no `options` route: answered with
@@ -99,6 +100,7 @@ pub(crate) async fn handle(
     if let Some(cors) = protection.cors() {
         cors.apply(head.origin.as_ref(), resp.headers_mut());
     }
+    protection.apply_headers(resp.headers_mut());
     // Negotiated only when on-the-fly compression can act on the answer:
     // with `[compression] enabled = false` (the default) the parse was
     // pure waste on every request that carried the header. The static
@@ -200,35 +202,48 @@ async fn handle_inner(
     // counted — and their arrival clocked — as the handler reads them.
     let guards = req.guard_body(protection.max_body_bytes(), protection.body_read_timeout());
     req.limits = protection.form_limits();
+    let wants_json = wants_json(req.req.headers());
 
     // Routed before a state is checked out: a static file, a 404, a 405 or
-    // an `OPTIONS` answer never waits for one.
+    // an `OPTIONS` answer never waits for one, and a route's own rate
+    // limit is spent without one.
     let routed = match pool.companion::<app::Routing>() {
         Some(routing) => match routing.lookup(req.req.method(), req.req.uri().path()) {
-            app::Lookup::Route { index, params } => Some((routing, index, params)),
+            app::Lookup::Route { index, params } => {
+                if let Some(limit) = routing.limits.get(index).and_then(Option::as_ref)
+                    && let Err(retry_after) = limit.check(&req)
+                {
+                    tracing::debug!(peer = %req.peer_addr, "request rate limited by its route");
+                    return rate_limited(retry_after, wants_json);
+                }
+                Some((routing, index, params))
+            }
             app::Lookup::Options(allowed) => return options_response(&allowed),
             app::Lookup::MethodNotAllowed(allowed) => {
-                let fallback = || method_not_allowed(&allowed);
+                let fallback = || method_not_allowed(&allowed, wants_json);
                 return static_file_or(&routing.statics, &req, protection.compression(), fallback)
                     .await;
             }
             app::Lookup::NotFound => {
-                return static_or(&routing.statics, &req, protection.compression(), not_found)
-                    .await;
+                let fallback = || not_found(wants_json);
+                return static_or(&routing.statics, &req, protection.compression(), fallback).await;
             }
         },
         None => None,
     };
+    let routed_in_rust = routed.is_some();
 
     // Bounded wait for a state: past the budget the request is shed rather
     // than queued behind an overloaded pool. Nothing Lua-side has run yet,
     // so shedding is cheap.
     let Some(mut rt) = pool.get_timeout(protection.pool_wait()).await else {
         tracing::warn!("request shed: no Lua state available within the pool wait budget");
-        let mut resp = plain_response(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable")?;
-        resp.headers_mut()
-            .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
-        return Ok(resp);
+        return rejection(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SERVICE_UNAVAILABLE",
+            Some(1),
+            wants_json,
+        );
     };
     // Dev-mode hot reload happens in the serve loop (a notify watcher
     // driving the pool rebuild), not here: the request path stays free of
@@ -263,16 +278,24 @@ async fn handle_inner(
 
     match target {
         Target::Static(resp) => resp,
-        Target::NotFound => not_found(),
+        Target::NotFound => not_found(wants_json),
         Target::Options(allowed) => options_response(&allowed),
-        Target::MethodNotAllowed(allowed) => method_not_allowed(&allowed),
+        Target::MethodNotAllowed(allowed) => method_not_allowed(&allowed, wants_json),
         Target::Chain {
             chain,
             params,
             error_fn,
             input,
-            invalid_fn,
+            rate,
         } => {
+            // The routed path spent the route's limit before checkout.
+            if !routed_in_rust
+                && let Some(limit) = rate
+                && let Err(retry_after) = limit.check(&req)
+            {
+                tracing::debug!(peer = %req.peer_addr, "request rate limited by its route");
+                return rate_limited(retry_after, wants_json);
+            }
             req.params = params;
             // Read before the request moves into Lua: the dev error page
             // honors `Accept` (a curl user does not want markup).
@@ -305,75 +328,26 @@ async fn handle_inner(
             // The request becomes a Lua value up front so the error handler
             // can receive the same object the handler saw.
             let req_ud = rt.lua().create_userdata(req)?;
-            // Validation first, under the same budget as the handler; a
-            // failure answers here, through `on_invalid` when there is one.
-            let validated = match &input {
-                Some((_, holder)) => {
-                    let validate = app::validate_fn(rt.lua())?;
-                    rt.call_function::<LuaValue>(validate, (holder, &req_ud))
-                        .await
-                }
-                None => Ok(LuaValue::Nil),
-            };
-            let called = match validated {
-                Ok(LuaValue::Nil) => {
-                    // The `lua_handler` span: how long the script itself
-                    // ran, with any `nitr.log` lines it emits nested
-                    // inside. DEBUG so the decomposition is opt-in via the
-                    // level filter.
-                    let span =
-                        tracing::debug_span!("lua_handler", elapsed_ms = tracing::field::Empty);
-                    // The clock is read only when the span is enabled; a
-                    // disabled span records nothing.
-                    let started = (!span.is_disabled()).then(std::time::Instant::now);
-                    let called = rt
-                        .call_function::<LuaTable>(chain, &req_ud)
-                        .instrument(span.clone())
-                        .await;
-                    if let Some(started) = started {
-                        span.record("elapsed_ms", started.elapsed().as_millis() as u64);
-                    }
-                    called
-                }
-                Ok(LuaValue::Table(failure)) => {
-                    tracing::debug!("request rejected: input validation failed");
-                    let hooked = match invalid_fn {
-                        Some(hook) => {
-                            match rt
-                                .call_function::<LuaTable>(hook, (failure.clone(), &req_ud))
-                                .await
-                            {
-                                Ok(lua_resp) => match to_response(lua_resp) {
-                                    Ok(resp) => Some(resp),
-                                    Err(err) => {
-                                        tracing::error!("invalid on_invalid response: {err}");
-                                        None
-                                    }
-                                },
-                                Err(err) => {
-                                    tracing::error!("the on_invalid handler failed: {err}");
-                                    None
-                                }
-                            }
-                        }
-                        None => None,
-                    };
-                    discard_body(&req_ud);
-                    return match hooked {
-                        Some(resp) => Ok(resp),
-                        None => unprocessable(rt.lua(), failure),
-                    };
-                }
-                Ok(other) => Err(Error::Script(format!(
-                    "input validation returned {}, expected nil or a table",
-                    other.type_name()
-                ))),
-                Err(err) => Err(err),
-            };
+            // The `lua_handler` span: how long the script itself ran, with
+            // any `nitr.log` lines it emits nested inside. DEBUG so the
+            // decomposition is opt-in via the level filter.
+            let span = tracing::debug_span!("lua_handler", elapsed_ms = tracing::field::Empty);
+            // The clock is read only when the span is enabled; a disabled
+            // span records nothing.
+            let started = (!span.is_disabled()).then(std::time::Instant::now);
+            let called = rt
+                .call_function::<LuaTable>(chain, &req_ud)
+                .instrument(span.clone())
+                .await;
+            if let Some(started) = started {
+                span.record("elapsed_ms", started.elapsed().as_millis() as u64);
+            }
             let err = match called {
                 // `finish` releases the body itself: a streaming body may
                 // still be reading from the request.
-                Ok(lua_resp) => return finish(rt, lua_resp, &streams, dev_mode, &req_ud),
+                Ok(lua_resp) => {
+                    return finish(rt, lua_resp, &streams, dev_mode, &req_ud, wants_json);
+                }
                 Err(err) => err,
             };
 
@@ -383,7 +357,12 @@ async fn handle_inner(
             if guards.oversized() {
                 tracing::debug!("request rejected: body exceeded max_body_bytes");
                 discard_body(&req_ud);
-                return plain_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large");
+                return rejection(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "PAYLOAD_TOO_LARGE",
+                    None,
+                    wants_json,
+                );
             }
             // A stalled body likewise: the client is the culprit, and the
             // connection is closed with the response — keep-alive would
@@ -391,7 +370,12 @@ async fn handle_inner(
             if guards.stalled() {
                 tracing::warn!("request rejected: body read stalled beyond [limits] body_read_ms");
                 discard_body(&req_ud);
-                let mut resp = plain_response(StatusCode::REQUEST_TIMEOUT, "Request Timeout")?;
+                let mut resp = rejection(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "REQUEST_TIMEOUT",
+                    None,
+                    wants_json,
+                )?;
                 resp.headers_mut().insert(
                     header::CONNECTION,
                     header::HeaderValue::from_static("close"),
@@ -405,7 +389,12 @@ async fn handle_inner(
             {
                 tracing::debug!("request rejected: {limit}");
                 discard_body(&req_ud);
-                return plain_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large");
+                return rejection(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "PAYLOAD_TOO_LARGE",
+                    None,
+                    wants_json,
+                );
             }
 
             // Classified once, on the error path only; the structured
@@ -467,13 +456,6 @@ fn unsupported_media_type(accepted: &str) -> Result<HttpResponse> {
     Ok(resp)
 }
 
-/// The default 422: the validation failure table as JSON.
-fn unprocessable(lua: &mlua::Lua, failure: LuaTable) -> Result<HttpResponse> {
-    use mlua::LuaSerdeExt as _;
-    let body: serde_json::Value = lua.from_value(LuaValue::Table(failure))?;
-    json_response(StatusCode::UNPROCESSABLE_ENTITY, &body)
-}
-
 fn json_response(status: StatusCode, body: &serde_json::Value) -> Result<HttpResponse> {
     use http_body_util::Full;
     let bytes = serde_json::to_vec(body).map_err(|err| Error::Script(err.to_string()))?;
@@ -503,6 +485,7 @@ fn finish(
     streams: &Arc<Semaphore>,
     dev_mode: bool,
     req_ud: &AnyUserData,
+    wants_json: bool,
 ) -> Result<HttpResponse> {
     match lua_resp.raw_get::<LuaValue>("body") {
         // The streaming producer keeps running after this returns and may
@@ -512,7 +495,12 @@ fn finish(
                 Ok(permit) => permit,
                 Err(_) => {
                     tracing::warn!("streaming response rejected: max_streams reached");
-                    return plain_response(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable");
+                    return rejection(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "SERVICE_UNAVAILABLE",
+                        None,
+                        wants_json,
+                    );
                 }
             };
             match stream::stream_response(rt, &lua_resp, body_fn, permit) {
@@ -542,12 +530,17 @@ fn finish(
     }
 }
 
-fn not_found() -> Result<HttpResponse> {
-    plain_response(StatusCode::NOT_FOUND, "Not Found")
+fn not_found(wants_json: bool) -> Result<HttpResponse> {
+    rejection(StatusCode::NOT_FOUND, "NOT_FOUND", None, wants_json)
 }
 
-fn method_not_allowed(allowed: &[Method]) -> Result<HttpResponse> {
-    let mut resp = plain_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed")?;
+fn method_not_allowed(allowed: &[Method], wants_json: bool) -> Result<HttpResponse> {
+    let mut resp = rejection(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "METHOD_NOT_ALLOWED",
+        None,
+        wants_json,
+    )?;
     resp.headers_mut()
         .insert(header::ALLOW, crate::cors::allow_header(allowed));
     Ok(resp)
@@ -571,7 +564,8 @@ async fn static_or(
     compression: &crate::compress::Compression,
     fallback: impl FnOnce() -> Result<HttpResponse>,
 ) -> Result<HttpResponse> {
-    match static_files::try_serve(statics, req, compression, true).await {
+    match static_files::try_serve(statics, req, compression, accepts_html(req.req.headers())).await
+    {
         Some(resp) => resp,
         None => fallback(),
     }
@@ -601,7 +595,7 @@ fn chain_target(chain: &app::Chain, params: Vec<(String, String)>) -> Target {
         // app-wide one as fallback.
         error_fn: chain.error_fn.clone(),
         input: chain.input.clone(),
-        invalid_fn: chain.invalid_fn.clone(),
+        rate: chain.rate.clone(),
     }
 }
 
@@ -630,8 +624,10 @@ async fn resolve(
         (target, state.statics.clone())
     };
 
+    // The SPA page answers a browser navigation, never an API client
+    // asking for JSON, which needs the 404.
     let spa_fallback = match target {
-        Target::NotFound => true,
+        Target::NotFound => accepts_html(req.req.headers()),
         Target::MethodNotAllowed(_) => false,
         other => return Ok(other),
     };
@@ -650,4 +646,6 @@ mod tests;
 
 use error_page::{accepts_html, error_page_with_source, error_response, with_failure};
 use respond::to_response;
-pub(crate) use respond::{build_response, empty_response, plain_response};
+pub(crate) use respond::{
+    build_response, empty_response, plain_response, rate_limited, rejection, wants_json,
+};

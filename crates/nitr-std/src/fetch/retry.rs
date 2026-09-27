@@ -24,6 +24,10 @@ const RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 pub(super) struct Retry {
     pub(super) attempts: u32,
     pub(super) exponential: bool,
+    /// The caller vouches that repeating the request is safe (a `POST`
+    /// carrying an idempotency key), so a method HTTP does not call
+    /// idempotent may be retried too.
+    pub(super) idempotent: bool,
 }
 
 /// Statuses worth trying again: the upstream is saying "not now" rather
@@ -72,12 +76,27 @@ pub(super) fn parse_retry(table: &Table) -> mlua::Result<Retry> {
     Ok(Retry {
         attempts,
         exponential,
+        idempotent: table.get::<Option<bool>>("idempotent")?.unwrap_or(false),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `idempotent = true` is the caller vouching for a request HTTP does
+    /// not call idempotent (a `POST` carrying an idempotency key).
+    #[test]
+    fn retry_options_parse_the_idempotent_flag() {
+        let lua = mlua::Lua::new();
+        let table: Table = lua.load("{ attempts = 2 }").eval().expect("table");
+        assert!(!parse_retry(&table).expect("retry").idempotent);
+        let table: Table = lua
+            .load("{ attempts = 2, idempotent = true }")
+            .eval()
+            .expect("table");
+        assert!(parse_retry(&table).expect("retry").idempotent);
+    }
 
     #[test]
     fn backoff_grows_and_stays_jittered_within_bounds() {

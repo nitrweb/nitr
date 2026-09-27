@@ -27,6 +27,7 @@ use crate::config::FetchOptions;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ConnectPolicy {
     pub(crate) allow_private_networks: bool,
+    pub(crate) private_hosts: Vec<String>,
     pub(crate) connect_timeout: Duration,
     pub(crate) timeout: Duration,
     pub(crate) pool_max_idle_per_host: usize,
@@ -38,6 +39,7 @@ impl FetchOptions {
     pub(crate) fn connect_policy(&self) -> ConnectPolicy {
         ConnectPolicy {
             allow_private_networks: self.allow_private_networks,
+            private_hosts: self.private_hosts.clone(),
             connect_timeout: self.connect_timeout,
             timeout: self.timeout,
             pool_max_idle_per_host: self.pool_max_idle_per_host,
@@ -59,20 +61,28 @@ impl FetchOptions {
 #[derive(Debug)]
 pub(crate) struct GuardedResolver {
     allow_private_networks: bool,
+    private_hosts: Vec<String>,
 }
 
 impl GuardedResolver {
-    pub(crate) fn new(allow_private_networks: bool) -> Self {
+    pub(crate) fn new(allow_private_networks: bool, private_hosts: Vec<String>) -> Self {
         Self {
             allow_private_networks,
+            private_hosts,
         }
     }
 }
 
+/// Whether `host` is one the operator named as living on a private address.
+fn is_private_host(private_hosts: &[String], host: &str) -> bool {
+    private_hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
+}
+
 impl reqwest::dns::Resolve for GuardedResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let allow_private = self.allow_private_networks;
         let host = name.as_str().to_string();
+        let allow_private =
+            self.allow_private_networks || is_private_host(&self.private_hosts, &host);
         Box::pin(async move {
             // Port 0: the connector substitutes the real one. Only the
             // address matters for the policy.
@@ -103,8 +113,8 @@ fn no_address(host: &str) -> BoxError {
 
 fn forbidden(host: &str) -> BoxError {
     Box::new(Refused(format!(
-        "fetch host `{host}` resolves to a private or local address \
-         (set fetch.allow_private_networks to permit this)"
+        "fetch host `{host}` resolves to a private or local address: name it in \
+         [fetch] private_hosts, or set allow_private_networks = true to permit every one"
     )))
 }
 
@@ -145,7 +155,9 @@ pub(crate) async fn check_url(url: &Url, opts: &FetchOptions) -> mlua::Result<()
         }
     }
 
-    if opts.allow_private_networks {
+    if opts.allow_private_networks
+        || is_private_host(&opts.private_hosts, url.host_str().unwrap_or_default())
+    {
         return Ok(());
     }
 
@@ -173,8 +185,8 @@ pub(crate) async fn check_url(url: &Url, opts: &FetchOptions) -> mlua::Result<()
     }
     if ips.iter().any(|ip| is_forbidden_ip(*ip)) {
         return Err(mlua::Error::RuntimeError(format!(
-            "fetch host `{}` resolves to a private or local address \
-             (set fetch.allow_private_networks to permit this)",
+            "fetch host `{}` resolves to a private or local address: name it in \
+             [fetch] private_hosts, or set allow_private_networks = true to permit every one",
             url.host_str().unwrap_or_default()
         )));
     }
@@ -311,7 +323,7 @@ mod tests {
     async fn the_resolver_refuses_to_hand_over_a_forbidden_address() {
         use reqwest::dns::Resolve as _;
 
-        let guarded = GuardedResolver::new(false);
+        let guarded = GuardedResolver::new(false, Vec::new());
         let name: reqwest::dns::Name = "localhost".parse().expect("name");
         let err = guarded
             .resolve(name)
@@ -322,10 +334,36 @@ mod tests {
 
         // The same name is fine once private networks are allowed, which
         // proves the refusal came from the policy and not from resolution.
-        let open = GuardedResolver::new(true);
+        let open = GuardedResolver::new(true, Vec::new());
         let name: reqwest::dns::Name = "localhost".parse().expect("name");
         let addrs = open.resolve(name).await.expect("allowed");
         assert!(addrs.count() > 0);
+    }
+
+    /// One internal host may live on a private address without opening the
+    /// private ranges to every other host, at the first look and at the
+    /// resolver.
+    #[tokio::test]
+    async fn private_hosts_are_allowed_by_name_only() {
+        let opts = FetchOptions {
+            private_hosts: vec!["localhost".into()],
+            ..Default::default()
+        };
+        let url: Url = "http://localhost:1/x".parse().expect("url");
+        check_url(&url, &opts).await.expect("named host");
+        let other: Url = "http://127.0.0.1:1/x".parse().expect("url");
+        assert!(check_url(&other, &opts).await.is_err(), "not named");
+
+        use std::str::FromStr as _;
+
+        use reqwest::dns::{Name, Resolve as _};
+        let resolver = GuardedResolver::new(false, opts.private_hosts.clone());
+        let name = Name::from_str("localhost").expect("name");
+        let addrs = resolver.resolve(name).await.expect("named host resolves");
+        assert!(addrs.count() > 0);
+        let strict = GuardedResolver::new(false, Vec::new());
+        let name = Name::from_str("localhost").expect("name");
+        assert!(strict.resolve(name).await.is_err());
     }
 
     #[tokio::test]

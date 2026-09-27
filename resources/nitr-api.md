@@ -9,10 +9,11 @@ with a *std feature* need that name in `[std] features`.
 
 ### `nitr.json(value, status) -> nitr.Response` (std feature: `json`)
 
-As a function: a JSON response (`nitr.json({ ok = true })`). Also the codec: `nitr.json:encode(v)` / `nitr.json:decode(s)`. A table whose keys are `1..n` (holes as `null`) is an array; one mixing list items and named keys has no JSON shape and raises, here and wherever a value is serialized (cache, session, JWT, templates).
+As a function: a JSON response (`nitr.json({ ok = true })`). Also the codec: `nitr.json:encode(v)` / `nitr.json:decode(s)`. A table whose keys are `1..n` (holes as `null`) is an array; one mixing list items and named keys has no JSON shape and raises, here and wherever a value is serialized (cache, session, JWT, templates). An empty table is `{}` unless marked with `nitr.json.array`; `nitr.json.null` is the `null` a table can hold (`nil` erases the key), and what `decode` produces for one.
 
 - `nitr.json:encode(value) -> string` — Encodes a value as JSON.
-- `nitr.json:decode(s) -> any` — Decodes JSON; errors on invalid input.
+- `nitr.json:decode(s) -> any` — Decodes JSON; errors on invalid input. `[]` decodes to an array-marked table, `null` to `nitr.json.null`.
+- `nitr.json.array(t) -> table` — Marks a table as a JSON array, so an empty one encodes as `[]`. `nitr.db:query` marks its result sets.
 
 ### `nitr.text(body, status) -> nitr.Response` (std feature: `http`)
 
@@ -48,13 +49,13 @@ A well-formed entity tag for whatever identifies the resource (a row version, an
 
 ### `nitr.csrf(opts) -> fun` (std feature: `http`)
 
-As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field of an urlencoded form; a multipart form or a JSON body sends the header). Options: `secret` (required), `cookie` (the cookie NAME, default `_csrf`), `header`, `field`, and `cookie_opts` (the cookie ATTRIBUTES, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set). Note `nitr.session` spells its attribute table `cookie` — here that key is the name. Unsafe requests a browser marks `Sec-Fetch-Site: cross-site` are refused before the token is checked, unless `cookie_opts.same_site = "None"` (the setting that means to accept cross-site posts).
+As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field of an urlencoded form; a multipart form or a JSON body sends the header). Options: `secret` (required), `name` (the cookie name, default `_csrf`), `header`, `field`, and `cookie` (the cookie attributes, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set), the same spellings as `nitr.session`. A refusal is a 403: plain text, or `{ code = "CSRF_INVALID" }` when the request accepts `application/json`. Unsafe requests a browser marks `Sec-Fetch-Site: cross-site` are refused before the token is checked, unless `cookie.same_site = "None"` (the setting that means to accept cross-site posts).
 
 - `nitr.csrf.token(req) -> string` — The request's token, for a form or meta tag. Requires the middleware.
 
 ### `nitr.session(req, opts) -> nitr.Session` (std feature: `http`)
 
-Loads (or starts) the stateless signed-cookie session. Options: `secret` (required), `name` (the cookie name), `max_age`, and `cookie` (the cookie ATTRIBUTES table, which extends the HttpOnly/SameSite=Lax defaults; `http_only` cannot be un-set). Note `nitr.csrf` spells the attribute table `cookie_opts` and uses `cookie` for the name.
+Loads (or starts) the stateless signed-cookie session. Options: `secret` (required), `name` (the cookie name), `max_age`, and `cookie` (the cookie ATTRIBUTES table, which extends the HttpOnly/SameSite=Lax defaults; `http_only` cannot be un-set), the same spellings as `nitr.csrf`.
 
 ### `nitr.app() -> nitr.App`
 
@@ -70,7 +71,7 @@ Debug-prints a value (structure included) to the log; returns it unchanged.
 
 ### `nitr.fetch(method, url, opts) -> nitr.FetchHandle` (std feature: `fetch`)
 
-An outbound HTTP request (SSRF-guarded, redirect-checked). Options: `headers`, `query`, `json`, `body`, `timeout`, `retry`. Returns an unsent handle. `retry = { attempts, backoff }` repeats an idempotent request after a network failure or a retryable status, never after a refusal by the `[fetch]` policy.
+An outbound HTTP request (SSRF-guarded, redirect-checked). Options: `headers`, `query`, `json`, `body`, `timeout`, `retry`. Returns an unsent handle. `retry = { attempts, backoff, idempotent? }` repeats an idempotent request after a network failure or a retryable status, never after a refusal by the `[fetch]` policy; `idempotent = true` vouches for a `POST` (one carrying an idempotency key) so it may be retried too.
 
 ### `nitr.await_all(...) -> ...` (std feature: `fetch`)
 
@@ -93,10 +94,10 @@ The minijinja template engine, loading from `[templating] dir`.
 The SQLite database (`database` in nitr.toml): WAL, busy timeout, foreign keys on. A row is a column→value table, so a query whose result columns share a name raises (alias one with `AS`).
 
 - `nitr.db:execute(sql, params) -> integer` — Runs a statement.
-- `nitr.db:query(sql, params) -> table[]` — All rows, each a column→value table. A result larger than `[database] max_rows` (default 10000) raises rather than truncating.
+- `nitr.db:query(sql, params) -> table[]` — All rows, each a column→value table, as a list marked for JSON (an empty result encodes as `[]`). A result larger than `[database] max_rows` (default 10000) raises rather than truncating.
 - `nitr.db:query_row(sql, params) -> table|nil` — The first row as a column→value table, or nil when the query returns no rows.
 - `nitr.db:query_one(sql, params) -> table` — The row of a query that must return exactly one row (a column→value table); raises when it returns none or more than one.
-- `nitr.db:transaction(fn) -> any` — Runs `fn` atomically; rolls back on error. Nestable (savepoints). Use `tx`, not the outer `nitr.db`.
+- `nitr.db:transaction(fn) -> ...any` — Runs `fn` atomically: commits when it returns, rolls back when it raises and re-raises the very value it raised (`error({ code = "OUT_OF_STOCK" })` reaches the caller's `pcall` as that table). Nestable (savepoints). Use `tx`, not the outer `nitr.db`.
 - `nitr.db:query_async(sql, params, kind) -> table` — An unsent query to run alongside fetches.
 
 ### `nitr.log` (std feature: `log`)
@@ -125,10 +126,10 @@ Crypto primitives (RustCrypto): compose them; never reimplement them in Lua.
 
 ### `nitr.crypto.jwt` (std feature: `crypto`)
 
-HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list and checks `exp`/`nbf` when present. It does NOT check `iss`, `aud` or `typ` — those are the caller's job — and a token with no `exp` never expires.
+HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list, checks `exp`/`nbf` when present, and compares the registered claims it is asked to (`issuer`, `audience`, `subject`, `require`, `max_age`). `typ` is never checked, and a token with no `exp` never expires unless `require` names it.
 
 - `nitr.crypto.jwt.sign(claims, key, opts) -> string` — Signs a token.
-- `nitr.crypto.jwt.verify(token, key, opts) -> table|nil, string|nil` — Verifies the signature, the `alg` against the allow-list, and `exp`/`nbf` if the token carries them. Checks no other claim: compare `iss`/`aud` yourself, and require `exp` if your tokens must expire (`aud` may be a string or an array).
+- `nitr.crypto.jwt.verify(token, key, opts) -> table|nil, string|nil` — Verifies the signature, the `alg` against the allow-list, `exp`/`nbf` if the token carries them, and the claims the options name. What is not asked for is not checked.
 
 ### `nitr.auth` (std feature: `crypto`)
 
@@ -210,12 +211,14 @@ Percent-encoding, query strings, and a lexical URL splitter.
 
 ### `nitr.env` (std feature: `env`)
 
-Read-only environment variable access. Opt-in; reads are filtered by `[env] allow`, and `NITR_*` internals are never visible. Getters only: no setter, no enumeration.
+Read-only environment variable access. Opt-in; reads are filtered by `[env] allow`, and `NITR_*` internals are never visible. Getters only: no setter, no enumeration. An empty value reads as unset everywhere (Compose passes an optional variable through as `""`).
 
+- `nitr.env.secret(name, opts) -> string` — A secret that fails closed: unset (or empty) raises an error naming the variable, so does one shorter than `min_len`; the `dev` fallback never applies under `run`. Read it in config.lua, once.
 - `nitr.env.get(name, default) -> string|nil` — Reads one variable.
 - `nitr.env.has(name) -> boolean` — Whether the variable is set and readable; a policy-hidden name reports false.
 - `nitr.env.number(name, default) -> number|nil` — Reads and parses a number; unset or unparseable answers the default.
 - `nitr.env.bool(name, default) -> boolean|nil` — Reads a flag: 1/true/yes/on and 0/false/no/off (any case); empty means false, anything else answers the default.
+- `nitr.env.mode: string` — `"run"`, `"dev"` (`dev_mode = true`) or `"test"` (under `nitr test`): what the process is doing, decided by the server, never by a script.
 
 ### `nitr.cookie` (std feature: `http`)
 
@@ -346,7 +349,7 @@ Builder for `Set-Cookie` headers on a response.
 
 The application: routes, middleware, error handling, static mounts. Return it from the handler script.
 
-- `:get(path, ...)` — Registers a GET route: `middleware..., handler` plus an optional trailing options table `{ input = {...}, doc = {...}, on_invalid = fn, on_error = fn }`. `doc` describes the operation in the OpenAPI document (`summary`, `description`, `tags`, `operation_id`, `responses = { [code] = { description, schema?, content? } }` where `schema` is documentation only, `security = { name }`, `deprecated`, `hidden`); request schemas live under `input`, never `doc`. `input` declares schemas for `body` (a schema, or `{ schema = S, content = { "json", "form", "multipart" } }`, or `{ file = R, content = { "raw" } }`), `query`, `params` and `headers`, enforced in Rust before the handler and exposed as `req.valid`; a failure answers a JSON 422 unless `on_invalid` says otherwise. Paths take `:name` parameters and a trailing `*` catch-all.
+- `:get(path, ...)` — Registers a GET route: `middleware..., handler` plus an optional trailing options table `{ input = {...}, doc = {...}, on_invalid = fn, on_error = fn, rate_limit = { requests, window } }`. `rate_limit` is the route's own fixed window per client (seconds), on top of `[rate_limit]`, spent before a Lua state is taken; the refusal is a 429 with `Retry-After`. The chain runs app middleware, then group middleware, then route middleware, then `input` validation, then the handler. `doc` describes the operation in the OpenAPI document (`summary`, `description`, `tags`, `operation_id`, `responses = { [code] = { description, schema?, content? } }` where `schema` is documentation only, `security = { name }`, `deprecated`, `hidden`); request schemas live under `input`, never `doc`. `input` declares schemas for `body` (a schema, or `{ schema = S, content = { "json", "form", "multipart" } }`, or `{ file = R, content = { "raw" } }`), `query`, `params` and `headers`, enforced in Rust before the handler and exposed as `req.valid`; a failure answers a JSON 422 unless `on_invalid` says otherwise. Paths take `:name` parameters and a trailing `*` catch-all.
 - `:post(path, ...)` — Registers a POST route (see `get`).
 - `:put(path, ...)` — Registers a PUT route (see `get`).
 - `:delete(path, ...)` — Registers a DELETE route (see `get`).
@@ -354,10 +357,11 @@ The application: routes, middleware, error handling, static mounts. Return it fr
 - `:head(path, ...)` — Registers a HEAD route (see `get`). Without one, HEAD reuses the GET route with the body stripped.
 - `:options(path, ...)` — Registers an OPTIONS route (see `get`). Without one, OPTIONS answers 204 with `Allow`.
 - `:doc(info)` — Document-level information for the generated OpenAPI document, once per app: `title`, `version`, `description`, `terms_of_service`, `contact`, `license`, `tags = { { name, description } }`, `security = { name = scheme }` (schemes as OpenAPI security scheme objects, referenced by name from a route's `doc.security`), `external_docs`. Unknown keys fail at load. Needs the `openapi` Cargo feature and `[openapi] enabled = true` to be served; `nitr openapi` generates it regardless.
-- `:on_invalid(fn)` — The app-wide answer to a request that failed its route's `input` declaration: `function(err, req)` returning a response, where `err = { code, message, fields, errors }` (`fields` maps each path such as `body.email` to its message; `errors` lists `{ path, part, field, rule, message, params?, label? }`). A route-level `on_invalid` option wins over it.
-- `:use(mw)` — Adds app-wide middleware: a factory `fn(next) -> fn(req)`. Must be called before any route.
+- `:on_invalid(fn)` — The app-wide answer to a request that failed its route's `input` declaration: `function(err, req)` returning a response, where `err = { code, message, fields, errors }` (`fields` maps each path such as `body.email` or `body.items[1].sku` (list indexes are 1-based, as in Lua) to its message; `errors` lists `{ path, part, field, rule, message, params?, label? }`). A route-level `on_invalid` option wins over it.
+- `:use(mw)` — Adds app-wide middleware: a factory `fn(next) -> fn(req)`. Must be called before any route. Middleware runs before a route's `input` validation, so an auth middleware answers before a schema error would.
+- `:group(prefix, fn) -> nitr.App` — Routes under a common prefix with their own middleware: `app:group("/api", function(g) g:use(auth) g:get("/items", list) g:group("/v2", ...) end)`. The group has the same route methods as the app plus `use` (before its routes and nested groups) and `group`; its middleware runs after the app's and before the route's own. `g:get("/")` is the prefix itself. Returns the group, so `local g = app:group("/admin")` works without a body.
 - `:on_error(handler)` — Sets the app-wide error handler: `fn(err, req)` where `err` is the structured error (`kind`, `message`, `source`, `line`, `traceback`, ...).
-- `:static(mount, dir, opts)` — Mounts a static directory, served in Rust without a Lua state. Routes win: the mount answers a GET or HEAD for a path no route serves with that method. Options: `{ spa = boolean, cache_control = string, dotfiles = boolean }` — dotfiles are hidden unless `dotfiles = true` (`.well-known/` is always served).
+- `:static(mount, dir, opts)` — Mounts a static directory, served in Rust without a Lua state. A relative `dir` is resolved against the handler script's directory (so a bundle serves the same files from anywhere), and a directory that does not exist fails the load. Routes win: the mount answers a GET or HEAD for a path no route serves with that method. Options: `{ spa = boolean, cache_control = string, dotfiles = boolean }` — with `spa = true` an unknown path under the mount is answered with `index.html` only when the request's `Accept` header names `text/html` (an API client asking for JSON, or `*/*`, gets the 404); dotfiles are hidden unless `dotfiles = true` (`.well-known/` is always served).
 
 ### `nitr.Part`
 
@@ -461,7 +465,7 @@ A client's cookie jar.
 
 ### `nitr.test.App`
 
-The application compiled into the test state (`t.app()`), for unit tests. `dispatch` runs the composed middleware chain only: route `input` validation, `on_invalid`, `on_error` and the protection layer are what `t.request` exercises.
+The application compiled into the test state (`t.app()`), for unit tests. `dispatch` runs the composed chain: the middleware and, on a route that declares `input`, its validation (and `on_invalid`) between the middleware and the handler; `on_error` and the protection layer are what `t.request` exercises.
 
 - `:handler(method, path) -> fun(req: nitr.Request): table` — A route's own handler function, without its middleware: by the pattern as registered (`"/notes/:id"`) or a path the router matches.
 - `:dispatch(method, path, req) -> table` — The server's router lookup (params filled into `req`, `HEAD` falling back to `GET`) and the composed middleware chain; a `404`/`405`/`OPTIONS` answer for what the router does not match.

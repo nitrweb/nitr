@@ -13,7 +13,20 @@ use serde_json::Value as SerdeValue;
 pub(crate) struct LuaJson;
 
 impl UserData for LuaJson {
+    fn add_fields<F: mlua::UserDataFields<Self>>(fields: &mut F) {
+        // `nil` erases a key, so a `null` a table can hold is a value of
+        // its own: the one `decode` already produces.
+        fields.add_field("null", Value::NULL);
+    }
+
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        // `nitr.json.array(t)`: an empty table encodes as `[]` (no marker
+        // means `{}`); a filled one is a list already.
+        methods.add_function("array", |lua, table: Table| {
+            table.set_metatable(Some(lua.array_metatable()))?;
+            Ok(table)
+        });
+
         methods.add_method("encode", |lua, _, input: Value| {
             // The bounds are enforced inside the one serialization pass.
             let s = crate::bounded::to_json_string(&input).into_lua_err()?;
@@ -79,6 +92,38 @@ mod tests {
             .call((lua.create_table().expect("t"), 201))
             .expect("call");
         assert_eq!(resp.get::<u16>("status").expect("status"), 201);
+    }
+
+    /// An empty table is `{}` unless marked: `nitr.json.array` marks it
+    /// (a decoded `[]` already is), and `nitr.json.null` is a `null` a
+    /// table can hold, where `nil` would erase the key.
+    #[test]
+    fn markers_settle_the_shapes_lua_cannot_express() {
+        let lua = Lua::new();
+        let json = create_json_fn(&lua).expect("json");
+        lua.globals().set("json", json).expect("set");
+        let encoded: String = lua
+            .load(
+                r#"return json:encode({
+                    empty = {},
+                    items = json.array({}),
+                    list = json.array({ 1, 2 }),
+                    gone = json.null,
+                    again = json:decode("[]"),
+                })"#,
+            )
+            .eval()
+            .expect("encode");
+        let value: SerdeValue = serde_json::from_str(&encoded).expect("parse");
+        assert_eq!(
+            value,
+            serde_json::json!({ "empty": {}, "items": [], "list": [1, 2], "gone": null, "again": [] })
+        );
+        let (is_null, is_nil): (bool, bool) = lua
+            .load(r#"local t = json:decode('{"a":null}') return t.a == json.null, t.a == nil"#)
+            .eval()
+            .expect("decode null");
+        assert!(is_null && !is_nil, "a decoded null is the marker, not nil");
     }
 
     /// A JSON tree without the shapes Lua cannot represent faithfully:

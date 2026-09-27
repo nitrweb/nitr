@@ -8,6 +8,7 @@
 //! own connection, and requests are serialized per state, so a transaction
 //! never interleaves with other statements.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -15,7 +16,7 @@ use mlua::{AnyUserData, Function, Lua, Table, UserData, UserDataMethods, Value};
 use rusqlite::Connection;
 use tracing::Instrument as _;
 
-use crate::db::types::{Conn, Db, SqlValue, params_from_table, row_to_lua};
+use crate::db::types::{Conn, Db, SqlValue, params_from_table, row_to_lua, rows_to_lua};
 use nitr_core::Result;
 
 pub(crate) mod execute;
@@ -297,11 +298,7 @@ where
             let (sql, params) = args;
             let params = params_from_table(params.as_ref())?;
             let rows = run_blocking(conn?, "query", sql, params, outer, query::call).await?;
-            let table = lua.create_table()?;
-            for (i, row) in rows.into_iter().enumerate() {
-                table.raw_set(i + 1, row_to_lua(&lua, row)?)?;
-            }
-            Ok(table)
+            rows_to_lua(&lua, rows)
         }
     });
 }
@@ -376,11 +373,7 @@ impl PendingQuery {
             }
             QueryKind::Query => {
                 let rows = run_blocking(conn, "query", sql, params, outer, query::call).await?;
-                let table = lua.create_table()?;
-                for (i, row) in rows.into_iter().enumerate() {
-                    table.raw_set(i + 1, row_to_lua(lua, row)?)?;
-                }
-                Ok(Value::Table(table))
+                rows_to_lua(lua, rows).map(Value::Table)
             }
         }
     }
@@ -482,6 +475,133 @@ impl Drop for ScopeEnd {
 /// disk) leaves SQLite's transaction open; it is rolled back here so the
 /// connection is in autocommit mode again when the error reaches Lua,
 /// instead of every later statement quietly joining a doomed transaction.
+/// The Lua half of `transaction`, built once per state around the Rust
+/// `run` (which begins, calls the body and commits or rolls back) and an
+/// `unpack`. The body runs under Lua's `pcall`, so its error value never
+/// crosses into Rust, where mlua would flatten a table to a string; the
+/// wrapper re-raises it at level 0, so a handler's `pcall` receives exactly
+/// what the body threw, and every value the body returned comes back.
+const TRANSACTION_WRAPPER: &str = r#"
+local run, unpack = ...
+return function(self, f)
+    local packed = run(self, f)
+    if packed[1] then
+        return unpack(packed, 2, packed.n)
+    end
+    error(packed[2], 0)
+end
+"#;
+
+/// Calls the body under `pcall` and packs `(ok, ...)` into a table with
+/// `n`, so a trailing `nil` survives the trip.
+const TRANSACTION_BODY: &str = r#"
+local pack = ...
+return function(f, scope) return pack(pcall(f, scope)) end
+"#;
+
+const TRANSACTION_BODY_KEY: &str = "nitr::db::transaction_body";
+const TRANSACTION_OUTER_KEY: &str = "nitr::db::transaction";
+const TRANSACTION_SAVEPOINT_KEY: &str = "nitr::db::savepoint";
+
+/// The `transaction` method of a handle: the wrapper cached under `key`,
+/// built on first use around `run`.
+fn transaction_method<R>(
+    lua: &Lua,
+    key: &str,
+    run: fn(Lua, (AnyUserData, Function)) -> R,
+) -> mlua::Result<Function>
+where
+    R: Future<Output = mlua::Result<Table>> + mlua::MaybeSend + 'static,
+{
+    if let Ok(wrapper) = lua.named_registry_value::<Function>(key) {
+        return Ok(wrapper);
+    }
+    let run = lua.create_async_function(run)?;
+    let unpack = lua.create_function(|_, (packed, from, to): (Table, usize, usize)| {
+        let mut values = mlua::MultiValue::with_capacity(to.saturating_sub(from) + 1);
+        for index in from..=to {
+            values.push_back(packed.raw_get::<Value>(index)?);
+        }
+        Ok(values)
+    })?;
+    let wrapper = lua
+        .load(TRANSACTION_WRAPPER)
+        .set_name("=nitr.db")
+        .call::<Function>((run, unpack))?;
+    lua.set_named_registry_value(key, wrapper.clone())?;
+    Ok(wrapper)
+}
+
+/// The `pcall` runner of [`TRANSACTION_BODY`], built once per state.
+fn transaction_body(lua: &Lua) -> mlua::Result<Function> {
+    if let Ok(body) = lua.named_registry_value::<Function>(TRANSACTION_BODY_KEY) {
+        return Ok(body);
+    }
+    let pack = lua.create_function(|lua, args: mlua::MultiValue| {
+        let packed = lua.create_table_with_capacity(args.len(), 1)?;
+        packed.raw_set("n", args.len())?;
+        for (index, value) in args.into_iter().enumerate() {
+            packed.raw_set(index + 1, value)?;
+        }
+        Ok(packed)
+    })?;
+    let body = lua
+        .load(TRANSACTION_BODY)
+        .set_name("=nitr.db")
+        .call::<Function>(pack)?;
+    lua.set_named_registry_value(TRANSACTION_BODY_KEY, body.clone())?;
+    Ok(body)
+}
+
+/// `db:transaction(fn)`: refused while one is open on the connection.
+async fn run_outer_transaction(lua: Lua, (db, f): (AnyUserData, Function)) -> mlua::Result<Table> {
+    let (conn, flag) = {
+        let db = db.borrow::<LuaDatabase>()?;
+        (db.conn.clone(), db.in_transaction.clone())
+    };
+    if flag.swap(true, Ordering::AcqRel) {
+        return Err(mlua::Error::RuntimeError(
+            "a transaction is already open on this connection; nest with \
+             tx:transaction(...) instead"
+                .into(),
+        ));
+    }
+    let _guard = TxGuard(flag);
+    run_transaction(
+        &lua,
+        conn,
+        f,
+        "BEGIN".into(),
+        "COMMIT".into(),
+        "ROLLBACK".into(),
+        true,
+    )
+    .await
+}
+
+/// `tx:transaction(fn)`: a savepoint, so rolling back the inner scope
+/// keeps the outer transaction alive.
+async fn run_savepoint(lua: Lua, (tx, f): (AnyUserData, Function)) -> mlua::Result<Table> {
+    let (conn, n) = {
+        let tx = tx.borrow::<LuaTransaction>()?;
+        (tx_conn(&tx)?, tx.savepoints.fetch_add(1, Ordering::Relaxed))
+    };
+    let name = format!("nitr_sp_{n}");
+    run_transaction(
+        &lua,
+        conn,
+        f,
+        format!("SAVEPOINT {name}"),
+        format!("RELEASE {name}"),
+        format!("ROLLBACK TO {name}; RELEASE {name}"),
+        false,
+    )
+    .await
+}
+
+/// Begins, runs the body under `pcall`, then commits on `ok` and rolls
+/// back otherwise. The packed `(ok, ...)` goes back to the wrapper, which
+/// returns the values or re-raises the error.
 async fn run_transaction(
     lua: &Lua,
     conn: Conn,
@@ -490,7 +610,8 @@ async fn run_transaction(
     commit: String,
     rollback: String,
     outer: bool,
-) -> mlua::Result<Value> {
+) -> mlua::Result<Table> {
+    let body = transaction_body(lua)?;
     exec_batch(conn.clone(), begin, outer).await?;
     let alive = Arc::new(AtomicBool::new(true));
     let _scope_end = ScopeEnd(alive.clone());
@@ -499,7 +620,7 @@ async fn run_transaction(
         savepoints: AtomicUsize::new(0),
         alive,
     })?;
-    let result = f.call_async::<Value>(&scope).await;
+    let result = body.call_async::<Table>((f, &scope)).await;
     // A savepoint's rollback must run even when the outer transaction is
     // open (it always is), so only the top-level one is conditional.
     let roll_back = |conn: Conn| async move {
@@ -509,23 +630,23 @@ async fn run_transaction(
             exec_batch(conn, rollback, false).await
         }
     };
-    match result {
-        Ok(value) => {
-            if let Err(commit_err) = exec_batch(conn.clone(), commit, false).await {
-                if let Err(rollback_err) = roll_back(conn).await {
-                    tracing::error!("rollback after a failed commit failed: {rollback_err}");
-                }
-                return Err(commit_err);
-            }
-            Ok(value)
-        }
-        Err(err) => {
+    let ok = match &result {
+        Ok(packed) => packed.raw_get::<bool>(1)?,
+        // Only what `pcall` does not catch: the guarded `pcall` re-raises
+        // a spent budget.
+        Err(_) => false,
+    };
+    if ok {
+        if let Err(commit_err) = exec_batch(conn.clone(), commit, false).await {
             if let Err(rollback_err) = roll_back(conn).await {
-                tracing::error!("transaction rollback failed: {rollback_err}");
+                tracing::error!("rollback after a failed commit failed: {rollback_err}");
             }
-            Err(err)
+            return Err(commit_err);
         }
+    } else if let Err(rollback_err) = roll_back(conn).await {
+        tracing::error!("transaction rollback failed: {rollback_err}");
     }
+    result
 }
 
 /// Holds `in_transaction` for the lifetime of one `db:transaction` call.
@@ -579,32 +700,13 @@ impl UserData for LuaDatabase {
                 QueryOrigin::Outer(db.in_transaction.clone()),
             ))
         });
+    }
 
+    fn add_fields<F: mlua::UserDataFields<Self>>(fields: &mut F) {
         // db:transaction(function(tx) ... end): commits when the function
         // returns, rolls back (and re-raises) when it errors.
-        methods.add_async_method("transaction", |lua, db, f: Function| {
-            let conn = db.conn.clone();
-            let flag = db.in_transaction.clone();
-            async move {
-                if flag.swap(true, Ordering::AcqRel) {
-                    return Err(mlua::Error::RuntimeError(
-                        "a transaction is already open on this connection; nest with \
-                         tx:transaction(...) instead"
-                            .into(),
-                    ));
-                }
-                let _guard = TxGuard(flag);
-                run_transaction(
-                    &lua,
-                    conn,
-                    f,
-                    "BEGIN".into(),
-                    "COMMIT".into(),
-                    "ROLLBACK".into(),
-                    true,
-                )
-                .await
-            }
+        fields.add_field_method_get("transaction", |lua, _| {
+            transaction_method(lua, TRANSACTION_OUTER_KEY, run_outer_transaction)
         });
     }
 }
@@ -615,25 +717,11 @@ impl UserData for LuaTransaction {
         add_async_query_method(methods, |tx: &LuaTransaction| {
             Ok((tx_conn(tx)?, QueryOrigin::Inner(tx.alive.clone())))
         });
+    }
 
-        // Nested transactions become savepoints: rolling back the inner
-        // scope keeps the outer transaction alive.
-        methods.add_async_method("transaction", |lua, tx, f: Function| {
-            let conn = tx_conn(&tx);
-            let n = tx.savepoints.fetch_add(1, Ordering::Relaxed);
-            async move {
-                let name = format!("nitr_sp_{n}");
-                run_transaction(
-                    &lua,
-                    conn?,
-                    f,
-                    format!("SAVEPOINT {name}"),
-                    format!("RELEASE {name}"),
-                    format!("ROLLBACK TO {name}; RELEASE {name}"),
-                    false,
-                )
-                .await
-            }
+    fn add_fields<F: mlua::UserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("transaction", |lua, _| {
+            transaction_method(lua, TRANSACTION_SAVEPOINT_KEY, run_savepoint)
         });
     }
 }
@@ -697,6 +785,73 @@ mod tests {
             .eval_async()
             .await
             .expect("count")
+    }
+
+    /// The body's own error reaches the caller unchanged, table and all,
+    /// and every value it returns comes back: a handler branches on
+    /// `err.code`, and a body returning `id, created` is ordinary Lua.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transaction_returns_every_value_and_reraises_the_original_error() {
+        let (lua, dir) = db_state("txvalues").await;
+        let (a, b, c): (i64, Option<i64>, i64) = lua
+            .load("return nitr.db:transaction(function(tx) return 1, nil, 3 end)")
+            .eval_async()
+            .await
+            .expect("values");
+        assert_eq!((a, b, c), (1, None, 3));
+        let (is_table, code, rolled_back): (bool, String, bool) = lua
+            .load(
+                r#"
+                local ok, err = pcall(nitr.db.transaction, nitr.db, function(tx)
+                    tx:execute("INSERT INTO t VALUES (1)")
+                    tx:transaction(function(sp)
+                        sp:execute("INSERT INTO t VALUES (2)")
+                    end)
+                    error({ code = "OUT_OF_STOCK", item = 7 })
+                end)
+                local n = nitr.db:query_row("SELECT COUNT(*) AS n FROM t").n
+                return type(err) == "table", err.code, n == 0
+                "#,
+            )
+            .eval_async()
+            .await
+            .expect("pcall");
+        assert!(is_table, "the error value must stay a table");
+        assert_eq!(code, "OUT_OF_STOCK");
+        assert!(rolled_back);
+        // A savepoint's error is the inner body's value too, and only the
+        // savepoint is rolled back.
+        let (code, n): (String, i64) = lua
+            .load(
+                r#"
+                return nitr.db:transaction(function(tx)
+                    tx:execute("INSERT INTO t VALUES (1)")
+                    local ok, err = pcall(tx.transaction, tx, function(sp)
+                        sp:execute("INSERT INTO t VALUES (2)")
+                        error({ code = "INNER" })
+                    end)
+                    return err.code, tx:query_row("SELECT COUNT(*) AS n FROM t").n
+                end)
+                "#,
+            )
+            .eval_async()
+            .await
+            .expect("savepoint");
+        assert_eq!((code.as_str(), n), ("INNER", 1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A result set is a list, so an empty one encodes as `[]`, not `{}`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_result_set_is_a_list() {
+        let (lua, dir) = db_state("emptyrows").await;
+        let rows: Value = lua
+            .load("return nitr.db:query('SELECT x FROM t WHERE x = 42')")
+            .eval_async()
+            .await
+            .expect("query");
+        assert_eq!(crate::bounded::to_json_string(&rows).expect("json"), "[]");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test(flavor = "multi_thread")]

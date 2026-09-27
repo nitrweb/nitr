@@ -92,7 +92,7 @@ function ResponseCookies:set_signed(name, value, secret, opts) end
 ---@class nitr.App
 local App = {}
 
----Registers a GET route: `middleware..., handler` plus an optional trailing options table `{ input = {...}, doc = {...}, on_invalid = fn, on_error = fn }`. `doc` describes the operation in the OpenAPI document (`summary`, `description`, `tags`, `operation_id`, `responses = { [code] = { description, schema?, content? } }` where `schema` is documentation only, `security = { name }`, `deprecated`, `hidden`); request schemas live under `input`, never `doc`. `input` declares schemas for `body` (a schema, or `{ schema = S, content = { "json", "form", "multipart" } }`, or `{ file = R, content = { "raw" } }`), `query`, `params` and `headers`, enforced in Rust before the handler and exposed as `req.valid`; a failure answers a JSON 422 unless `on_invalid` says otherwise. Paths take `:name` parameters and a trailing `*` catch-all.
+---Registers a GET route: `middleware..., handler` plus an optional trailing options table `{ input = {...}, doc = {...}, on_invalid = fn, on_error = fn, rate_limit = { requests, window } }`. `rate_limit` is the route's own fixed window per client (seconds), on top of `[rate_limit]`, spent before a Lua state is taken; the refusal is a 429 with `Retry-After`. The chain runs app middleware, then group middleware, then route middleware, then `input` validation, then the handler. `doc` describes the operation in the OpenAPI document (`summary`, `description`, `tags`, `operation_id`, `responses = { [code] = { description, schema?, content? } }` where `schema` is documentation only, `security = { name }`, `deprecated`, `hidden`); request schemas live under `input`, never `doc`. `input` declares schemas for `body` (a schema, or `{ schema = S, content = { "json", "form", "multipart" } }`, or `{ file = R, content = { "raw" } }`), `query`, `params` and `headers`, enforced in Rust before the handler and exposed as `req.valid`; a failure answers a JSON 422 unless `on_invalid` says otherwise. Paths take `:name` parameters and a trailing `*` catch-all.
 ---@param path string
 ---@param ... fun(req: nitr.Request): nitr.Response|table
 function App:get(path, ...) end
@@ -131,19 +131,25 @@ function App:options(path, ...) end
 ---@param info table
 function App:doc(info) end
 
----The app-wide answer to a request that failed its route's `input` declaration: `function(err, req)` returning a response, where `err = { code, message, fields, errors }` (`fields` maps each path such as `body.email` to its message; `errors` lists `{ path, part, field, rule, message, params?, label? }`). A route-level `on_invalid` option wins over it.
+---The app-wide answer to a request that failed its route's `input` declaration: `function(err, req)` returning a response, where `err = { code, message, fields, errors }` (`fields` maps each path such as `body.email` or `body.items[1].sku` (list indexes are 1-based, as in Lua) to its message; `errors` lists `{ path, part, field, rule, message, params?, label? }`). A route-level `on_invalid` option wins over it.
 ---@param fn fun(err: table, req: nitr.Request): nitr.Response|table
 function App:on_invalid(fn) end
 
----Adds app-wide middleware: a factory `fn(next) -> fn(req)`. Must be called before any route.
+---Adds app-wide middleware: a factory `fn(next) -> fn(req)`. Must be called before any route. Middleware runs before a route's `input` validation, so an auth middleware answers before a schema error would.
 ---@param mw fun(next: fun): fun(req: nitr.Request): any
 function App:use(mw) end
+
+---Routes under a common prefix with their own middleware: `app:group("/api", function(g) g:use(auth) g:get("/items", list) g:group("/v2", ...) end)`. The group has the same route methods as the app plus `use` (before its routes and nested groups) and `group`; its middleware runs after the app's and before the route's own. `g:get("/")` is the prefix itself. Returns the group, so `local g = app:group("/admin")` works without a body.
+---@param prefix string
+---@param fn? fun(g: nitr.App)
+---@return nitr.App
+function App:group(prefix, fn) end
 
 ---Sets the app-wide error handler: `fn(err, req)` where `err` is the structured error (`kind`, `message`, `source`, `line`, `traceback`, ...).
 ---@param handler fun(err: table, req: nitr.Request): nitr.Response|table
 function App:on_error(handler) end
 
----Mounts a static directory, served in Rust without a Lua state. Routes win: the mount answers a GET or HEAD for a path no route serves with that method. Options: `{ spa = boolean, cache_control = string, dotfiles = boolean }` — dotfiles are hidden unless `dotfiles = true` (`.well-known/` is always served).
+---Mounts a static directory, served in Rust without a Lua state. A relative `dir` is resolved against the handler script's directory (so a bundle serves the same files from anywhere), and a directory that does not exist fails the load. Routes win: the mount answers a GET or HEAD for a path no route serves with that method. Options: `{ spa = boolean, cache_control = string, dotfiles = boolean }` — with `spa = true` an unknown path under the mount is answered with `index.html` only when the request's `Accept` header names `text/html` (an API client asking for JSON, or `*/*`, gets the 404); dotfiles are hidden unless `dotfiles = true` (`.well-known/` is always served).
 ---@param mount string
 ---@param dir string
 ---@param opts? table
@@ -336,7 +342,7 @@ function Jar:set(name, value, opts) end
 ---Forgets every cookie.
 function Jar:clear() end
 
----The application compiled into the test state (`t.app()`), for unit tests. `dispatch` runs the composed middleware chain only: route `input` validation, `on_invalid`, `on_error` and the protection layer are what `t.request` exercises.
+---The application compiled into the test state (`t.app()`), for unit tests. `dispatch` runs the composed chain: the middleware and, on a route that declares `input`, its validation (and `on_invalid`) between the middleware and the handler; `on_error` and the protection layer are what `t.request` exercises.
 ---@class nitr.test.App
 local App = {}
 
@@ -357,7 +363,7 @@ function App:dispatch(method, path, req) end
 ---@return table[]
 function App:routes() end
 
----As a function: a JSON response (`nitr.json({ ok = true })`). Also the codec: `nitr.json:encode(v)` / `nitr.json:decode(s)`. A table whose keys are `1..n` (holes as `null`) is an array; one mixing list items and named keys has no JSON shape and raises, here and wherever a value is serialized (cache, session, JWT, templates). (std feature: `json`)
+---As a function: a JSON response (`nitr.json({ ok = true })`). Also the codec: `nitr.json:encode(v)` / `nitr.json:decode(s)`. A table whose keys are `1..n` (holes as `null`) is an array; one mixing list items and named keys has no JSON shape and raises, here and wherever a value is serialized (cache, session, JWT, templates). An empty table is `{}` unless marked with `nitr.json.array`; `nitr.json.null` is the `null` a table can hold (`nil` erases the key), and what `decode` produces for one. (std feature: `json`)
 ---@class nitr.json
 ---@overload fun(value: any, status: integer?): nitr.Response
 nitr.json = {}
@@ -367,10 +373,15 @@ nitr.json = {}
 ---@return string
 function nitr.json:encode(value) end
 
----Decodes JSON; errors on invalid input.
+---Decodes JSON; errors on invalid input. `[]` decodes to an array-marked table, `null` to `nitr.json.null`.
 ---@param s string
 ---@return any
 function nitr.json:decode(s) end
+
+---Marks a table as a JSON array, so an empty one encodes as `[]`. `nitr.db:query` marks its result sets.
+---@param t table
+---@return table _ The same table.
+function nitr.json.array(t) end
 
 ---A `text/plain` response. (std feature: `http`)
 ---@param body string
@@ -418,7 +429,7 @@ function nitr.error(code, body) end
 ---@return string
 function nitr.etag(value, weak) end
 
----As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field of an urlencoded form; a multipart form or a JSON body sends the header). Options: `secret` (required), `cookie` (the cookie NAME, default `_csrf`), `header`, `field`, and `cookie_opts` (the cookie ATTRIBUTES, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set). Note `nitr.session` spells its attribute table `cookie` — here that key is the name. Unsafe requests a browser marks `Sec-Fetch-Site: cross-site` are refused before the token is checked, unless `cookie_opts.same_site = "None"` (the setting that means to accept cross-site posts). (std feature: `http`)
+---As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field of an urlencoded form; a multipart form or a JSON body sends the header). Options: `secret` (required), `name` (the cookie name, default `_csrf`), `header`, `field`, and `cookie` (the cookie attributes, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set), the same spellings as `nitr.session`. A refusal is a 403: plain text, or `{ code = "CSRF_INVALID" }` when the request accepts `application/json`. Unsafe requests a browser marks `Sec-Fetch-Site: cross-site` are refused before the token is checked, unless `cookie.same_site = "None"` (the setting that means to accept cross-site posts). (std feature: `http`)
 ---@class nitr.csrf
 ---@overload fun(opts: table): fun
 nitr.csrf = {}
@@ -428,7 +439,7 @@ nitr.csrf = {}
 ---@return string
 function nitr.csrf.token(req) end
 
----Loads (or starts) the stateless signed-cookie session. Options: `secret` (required), `name` (the cookie name), `max_age`, and `cookie` (the cookie ATTRIBUTES table, which extends the HttpOnly/SameSite=Lax defaults; `http_only` cannot be un-set). Note `nitr.csrf` spells the attribute table `cookie_opts` and uses `cookie` for the name. (std feature: `http`)
+---Loads (or starts) the stateless signed-cookie session. Options: `secret` (required), `name` (the cookie name), `max_age`, and `cookie` (the cookie ATTRIBUTES table, which extends the HttpOnly/SameSite=Lax defaults; `http_only` cannot be un-set), the same spellings as `nitr.csrf`. (std feature: `http`)
 ---@param req nitr.Request
 ---@param opts table
 ---@return nitr.Session
@@ -448,7 +459,7 @@ function nitr.errinfo(caught) end
 ---@return any
 function nitr.dbg(value) end
 
----An outbound HTTP request (SSRF-guarded, redirect-checked). Options: `headers`, `query`, `json`, `body`, `timeout`, `retry`. Returns an unsent handle. `retry = { attempts, backoff }` repeats an idempotent request after a network failure or a retryable status, never after a refusal by the `[fetch]` policy. (std feature: `fetch`)
+---An outbound HTTP request (SSRF-guarded, redirect-checked). Options: `headers`, `query`, `json`, `body`, `timeout`, `retry`. Returns an unsent handle. `retry = { attempts, backoff, idempotent? }` repeats an idempotent request after a network failure or a retryable status, never after a refusal by the `[fetch]` policy; `idempotent = true` vouches for a `POST` (one carrying an idempotency key) so it may be retried too. (std feature: `fetch`)
 ---@param method string
 ---@param url string
 ---@param opts? table
@@ -486,7 +497,7 @@ nitr.db = {}
 ---@return integer _ Affected row count.
 function nitr.db:execute(sql, params) end
 
----All rows, each a column→value table. A result larger than `[database] max_rows` (default 10000) raises rather than truncating.
+---All rows, each a column→value table, as a list marked for JSON (an empty result encodes as `[]`). A result larger than `[database] max_rows` (default 10000) raises rather than truncating.
 ---@param sql string
 ---@param params? table
 ---@return table[]
@@ -504,9 +515,9 @@ function nitr.db:query_row(sql, params) end
 ---@return table
 function nitr.db:query_one(sql, params) end
 
----Runs `fn` atomically; rolls back on error. Nestable (savepoints). Use `tx`, not the outer `nitr.db`.
----@param fn fun(tx: nitr.Tx): any
----@return any
+---Runs `fn` atomically: commits when it returns, rolls back when it raises and re-raises the very value it raised (`error({ code = "OUT_OF_STOCK" })` reaches the caller's `pcall` as that table). Nestable (savepoints). Use `tx`, not the outer `nitr.db`.
+---@param fn fun(tx: nitr.Tx): ...any
+---@return ...any _ Every value `fn` returned.
 function nitr.db:transaction(fn) end
 
 ---An unsent query to run alongside fetches.
@@ -599,7 +610,7 @@ function nitr.crypto.seal(key, plaintext, aad) end
 ---@return string|nil
 function nitr.crypto.open(key, sealed, aad) end
 
----HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list and checks `exp`/`nbf` when present. It does NOT check `iss`, `aud` or `typ` — those are the caller's job — and a token with no `exp` never expires. (std feature: `crypto`)
+---HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list, checks `exp`/`nbf` when present, and compares the registered claims it is asked to (`issuer`, `audience`, `subject`, `require`, `max_age`). `typ` is never checked, and a token with no `exp` never expires unless `require` names it. (std feature: `crypto`)
 nitr.crypto.jwt = {}
 
 ---Signs a token.
@@ -609,12 +620,12 @@ nitr.crypto.jwt = {}
 ---@return string
 function nitr.crypto.jwt.sign(claims, key, opts) end
 
----Verifies the signature, the `alg` against the allow-list, and `exp`/`nbf` if the token carries them. Checks no other claim: compare `iss`/`aud` yourself, and require `exp` if your tokens must expire (`aud` may be a string or an array).
+---Verifies the signature, the `alg` against the allow-list, `exp`/`nbf` if the token carries them, and the claims the options name. What is not asked for is not checked.
 ---@param token string
 ---@param key string
----@param opts table `{ algorithms = {...}, leeway? }` — the allow-list is required.
+---@param opts table `{ algorithms = {...}, leeway?, issuer?, audience?, subject?, require?, max_age? }` — the allow-list is required; `issuer`/`audience`/`subject` must equal `iss`/`aud`/`sub` (`aud` may be a string or an array); `require` lists claims that must be present (`{ "exp", "jti" }`); `max_age` bounds the seconds since `iat`.
 ---@return table|nil _ The claims.
----@return string|nil _ The rejection reason.
+---@return string|nil _ The rejection reason: `malformed token`, `invalid signature`, `algorithm not allowed`, `token expired`, `token not yet valid`, `issuer mismatch`, `audience mismatch`, `subject mismatch`, `missing claim <name>`, `token too old`, ...
 function nitr.crypto.jwt.verify(token, key, opts) end
 
 ---`Authorization` header parsing. (std feature: `crypto`)
@@ -857,8 +868,18 @@ function nitr.url.query_build(params) end
 ---@return string|nil _ Reason when nil.
 function nitr.url.parse(value) end
 
----Read-only environment variable access. Opt-in; reads are filtered by `[env] allow`, and `NITR_*` internals are never visible. Getters only: no setter, no enumeration. (std feature: `env`)
+---Read-only environment variable access. Opt-in; reads are filtered by `[env] allow`, and `NITR_*` internals are never visible. Getters only: no setter, no enumeration. An empty value reads as unset everywhere (Compose passes an optional variable through as `""`). (std feature: `env`)
 nitr.env = {}
+
+---`"run"`, `"dev"` (`dev_mode = true`) or `"test"` (under `nitr test`): what the process is doing, decided by the server, never by a script.
+---@type string
+nitr.env.mode = nil
+
+---A secret that fails closed: unset (or empty) raises an error naming the variable, so does one shorter than `min_len`; the `dev` fallback never applies under `run`. Read it in config.lua, once.
+---@param name string
+---@param opts? table `{ min_len = 32, dev = "fallback" }`: the shortest value accepted, and a value used only under `dev` or `test` when the variable is unset.
+---@return string
+function nitr.env.secret(name, opts) end
 
 ---Reads one variable.
 ---@param name string
@@ -1030,7 +1051,7 @@ function nitr.test.session_cookie(data, opts) end
 nitr.test.fetch = {}
 
 ---Adds rules; the first one that matches (method, URL, uses left) answers.
----@param ... table `{ url, method?, status?, headers?, json? | body?, times? }`: `url` exact, or a prefix written with a trailing `*`; `json` sets `content-type`; `times` spends the rule.
+---@param ... table `{ url, method?, status?, headers?, json? | body?, times?, error? }`: `url` exact, or a prefix written with a trailing `*`; `json` sets `content-type`; `times` spends the rule; `error = "connection reset"` makes the request fail like the network would instead of answering (mocks answer before retries run, so it is not retried).
 function nitr.test.fetch.mock(...) end
 
 ---With strict on (the default argument), a request no rule matches raises `no fetch mock matched ...` instead of going out.

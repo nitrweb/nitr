@@ -47,9 +47,18 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Start the server (the default when no command is given).
-    Run,
+    Run {
+        /// Apply pending migrations first, then serve: one command for a
+        /// container's entrypoint.
+        #[arg(long)]
+        migrate: bool,
+    },
     /// Start the server in development mode (hot reload).
-    Dev,
+    Dev {
+        /// Apply pending migrations first, then serve.
+        #[arg(long)]
+        migrate: bool,
+    },
     /// Load the configuration and scripts, then exit.
     Check {
         /// Print the effective configuration after file, environment, and
@@ -125,7 +134,10 @@ enum Command {
     HashPassword,
 }
 
-fn load_config(cli: &Cli) -> anyhow::Result<Config> {
+/// The configuration, plus the warnings met while loading it: the
+/// subscriber does not exist yet (its format comes from this very
+/// configuration), so they are logged once it does.
+fn load_config(cli: &Cli) -> anyhow::Result<(Config, Vec<String>)> {
     // A bundled executable carries its own application; the config file
     // and every path in it come from the extracted archive.
     // Where a relative `env_file` (and the implicit `.env`) resolves: next
@@ -141,8 +153,12 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
              accepted (values that must differ per deployment come from the environment)"
         );
     }
+    let mut warnings = Vec::new();
     let mut cfg = match bundled {
-        Some(cfg) => cfg,
+        Some((cfg, bundle_warnings)) => {
+            warnings = bundle_warnings;
+            cfg
+        }
         None => match &cli.config {
             Some(path) => {
                 if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -164,13 +180,13 @@ fn load_config(cli: &Cli) -> anyhow::Result<Config> {
     // real process environment still wins (the file never overwrites it).
     cfg.load_env_file(&env_base)?;
     cfg.apply_env()?;
-    if cli.dev || matches!(cli.command, Some(Command::Dev)) {
+    if cli.dev || matches!(cli.command, Some(Command::Dev { .. })) {
         cfg.dev_mode = true;
     }
     if is_bundle {
-        bundle::seal(&mut cfg);
+        warnings.extend(bundle::seal(&mut cfg));
     }
-    Ok(cfg)
+    Ok((cfg, warnings))
 }
 
 /// Installs the tracing subscriber per the `[log]` configuration.
@@ -579,13 +595,16 @@ async fn run_main() -> anyhow::Result<()> {
     }
 
     let cfg = match load_config(&cli) {
-        Ok(cfg) => {
+        Ok((cfg, warnings)) => {
             init_logging(
                 Some(&cfg),
                 cli.dev,
                 logs_to_stderr(&cli.command),
                 test_logs(&cli.command, &cfg),
             )?;
+            for warning in warnings {
+                tracing::warn!("{warning}");
+            }
             cfg
         }
         Err(err) => {
@@ -594,14 +613,17 @@ async fn run_main() -> anyhow::Result<()> {
         }
     };
 
-    match cli.command.unwrap_or(Command::Run) {
+    match cli.command.unwrap_or(Command::Run { migrate: false }) {
         // Invariant: both commands returned early above — `Init` before
         // the config load (it *creates* the config), `HashPassword` right
         // after it (it must work without one) — so neither can reach this
         // match. The arm exists only to keep the match exhaustive.
         #[allow(clippy::unreachable)]
         Command::Init { .. } | Command::HashPassword => unreachable!("handled above"),
-        Command::Run | Command::Dev => {
+        Command::Run { migrate } | Command::Dev { migrate } => {
+            if migrate {
+                cmd::migrate::migrate(&cfg, false)?;
+            }
             let pidfile_path = cfg.pidfile.clone();
             let server = Server::builder().config(cfg).build().await?;
             // Written only once the build succeeded: a pid that never

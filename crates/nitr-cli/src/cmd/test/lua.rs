@@ -349,6 +349,14 @@ fn fetch_rule(rule: &Table) -> mlua::Result<FetchRule> {
             runtime_error(format!("t.fetch.mock: `times` must be a count, got {n}"))
         })?),
     };
+    let error = rule.get::<Option<String>>("error")?;
+    if error.is_some()
+        && (rule.contains_key("status")? || rule.contains_key("body")? || !json.is_nil())
+    {
+        return Err(runtime_error(
+            "t.fetch.mock: `error` stands for a failed request and takes no `status`, `body` or `json`",
+        ));
+    }
     Ok(FetchRule {
         method: rule
             .get::<Option<String>>("method")?
@@ -358,6 +366,7 @@ fn fetch_rule(rule: &Table) -> mlua::Result<FetchRule> {
         headers,
         body,
         times,
+        error,
     })
 }
 

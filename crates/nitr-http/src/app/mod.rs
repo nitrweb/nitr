@@ -38,9 +38,6 @@ use options::{caller_site, route_options};
 /// Named registry slot holding each state's compiled [`AppState`].
 const APP_STATE_KEY: &str = "nitr::app_state";
 
-/// Named registry slot holding the budgeted validation function.
-const VALIDATE_FN_KEY: &str = "nitr::validate_fn";
-
 /// Route-registration methods exposed on the app object, each name paired
 /// with its `Method` so the mapping is total by construction — no lookup
 /// that could miss, nothing to declare unreachable.
@@ -83,6 +80,8 @@ struct RouteDef {
     /// The `{ doc = {...} }` table, parsed in [`compile`] once `app:doc`
     /// is known (its security scheme names are checked against it).
     doc: Option<mlua::Table>,
+    /// The route's own `{ rate_limit = { requests, window } }`.
+    rate_limit: Option<(u32, std::time::Duration)>,
     /// Where the script registered this route, captured at registration
     /// so a duplicate can name both sites.
     site: Site,
@@ -100,8 +99,181 @@ struct AppDef {
     api_doc: Option<(mlua::Table, Site)>,
 }
 
-/// The `nitr.app()` userdata handed to the handler script.
-pub(crate) struct LuaApp(Mutex<AppDef>);
+/// The `nitr.app()` userdata handed to the handler script. The definition
+/// is shared with the groups registered through it.
+pub(crate) struct LuaApp(Arc<Mutex<AppDef>>);
+
+/// `app:group(prefix)`: a registrar whose routes carry the prefix and the
+/// group's middleware, layered after the app's and before the route's own.
+pub(crate) struct LuaGroup {
+    def: Arc<Mutex<AppDef>>,
+    prefix: String,
+    state: Mutex<GroupState>,
+}
+
+#[derive(Default)]
+struct GroupState {
+    middleware: Vec<Function>,
+    /// Set once a route or a nested group took the middleware list: a
+    /// later `use` would silently miss them, so it is refused.
+    sealed: bool,
+}
+
+/// Registers one route: `middleware..., handler` optionally followed by an
+/// options table (`app:get(path, handler, { on_error = fn })`). A group
+/// supplies its prefix and its middleware, which precede the route's own.
+#[allow(clippy::too_many_arguments)]
+fn register_route(
+    lua: &Lua,
+    def: &Mutex<AppDef>,
+    name: &str,
+    method: &Method,
+    prefix: &str,
+    group_middleware: &[Function],
+    path: String,
+    mut args: Variadic<Value>,
+) -> mlua::Result<()> {
+    let options = match args.last() {
+        Some(Value::Table(opts)) => {
+            let parsed = route_options(name, &path, opts)?;
+            args.pop();
+            parsed
+        }
+        _ => options::RouteOptions::default(),
+    };
+    let route_fns = args
+        .into_iter()
+        .map(|value| match value {
+            Value::Function(f) => Ok(f),
+            other => Err(mlua::Error::RuntimeError(format!(
+                "app:{name}(\"{path}\", ...) takes handler functions \
+                 and an optional trailing options table, got {}",
+                other.type_name()
+            ))),
+        })
+        .collect::<mlua::Result<Vec<Function>>>()?;
+    if route_fns.is_empty() {
+        return Err(mlua::Error::RuntimeError(format!(
+            "app:{name}(\"{path}\", ...) requires a handler function"
+        )));
+    }
+    if !path.starts_with('/') {
+        return Err(mlua::Error::RuntimeError(format!(
+            "route path `{path}` must start with `/`"
+        )));
+    }
+    let mut fns = group_middleware.to_vec();
+    fns.extend(route_fns);
+    let site = caller_site(lua);
+    lock(def)?.routes.push(RouteDef {
+        method: method.clone(),
+        path: join_prefix(prefix, &path),
+        fns,
+        error_fn: options.error_fn,
+        invalid_fn: options.invalid_fn,
+        input: options.input,
+        doc: options.doc,
+        rate_limit: options.rate_limit,
+        site,
+    });
+    Ok(())
+}
+
+/// A group prefix as stored: starting with `/`, without a trailing one,
+/// and `/` itself as the empty prefix.
+fn group_prefix(parent: &str, prefix: &str) -> mlua::Result<String> {
+    if !prefix.starts_with('/') {
+        return Err(mlua::Error::RuntimeError(format!(
+            "group prefix `{prefix}` must start with `/`"
+        )));
+    }
+    Ok(join_prefix(parent, prefix.trim_end_matches('/')))
+}
+
+/// `prefix` plus `path`, where `/` under a prefix is the prefix itself.
+fn join_prefix(prefix: &str, path: &str) -> String {
+    match path {
+        "/" if !prefix.is_empty() => prefix.to_string(),
+        _ => format!("{prefix}{path}"),
+    }
+}
+
+/// `group(prefix, fn?)` on an app or a group: the child, after `fn` (when
+/// given) has registered through it.
+fn make_group(
+    lua: &Lua,
+    def: &Arc<Mutex<AppDef>>,
+    parent_prefix: &str,
+    middleware: Vec<Function>,
+    (prefix, body): (String, Option<Function>),
+) -> mlua::Result<AnyUserData> {
+    let group = lua.create_userdata(LuaGroup {
+        def: def.clone(),
+        prefix: group_prefix(parent_prefix, &prefix)?,
+        state: Mutex::new(GroupState {
+            middleware,
+            sealed: false,
+        }),
+    })?;
+    if let Some(body) = body {
+        body.call::<()>(&group)?;
+    }
+    Ok(group)
+}
+
+impl UserData for LuaGroup {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        for (name, method) in METHOD_NAMES {
+            let method = method.clone();
+            methods.add_method(
+                *name,
+                move |lua, this, (path, args): (String, Variadic<Value>)| {
+                    let middleware = {
+                        let mut state = lock_group(&this.state)?;
+                        state.sealed = true;
+                        state.middleware.clone()
+                    };
+                    register_route(
+                        lua,
+                        &this.def,
+                        name,
+                        &method,
+                        &this.prefix,
+                        &middleware,
+                        path,
+                        args,
+                    )
+                },
+            );
+        }
+
+        methods.add_method("use", |_, this, mw: Function| {
+            let mut state = lock_group(&this.state)?;
+            if state.sealed {
+                return Err(mlua::Error::RuntimeError(
+                    "group:use() must be called before registering routes or nested groups".into(),
+                ));
+            }
+            state.middleware.push(mw);
+            Ok(())
+        });
+
+        methods.add_method("group", |lua, this, args: (String, Option<Function>)| {
+            let middleware = {
+                let mut state = lock_group(&this.state)?;
+                state.sealed = true;
+                state.middleware.clone()
+            };
+            make_group(lua, &this.def, &this.prefix, middleware, args)
+        });
+    }
+}
+
+fn lock_group(state: &Mutex<GroupState>) -> mlua::Result<std::sync::MutexGuard<'_, GroupState>> {
+    state
+        .lock()
+        .map_err(|_| mlua::Error::RuntimeError("the group definition lock is poisoned".into()))
+}
 
 impl UserData for LuaApp {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
@@ -109,53 +281,18 @@ impl UserData for LuaApp {
             let method = method.clone();
             methods.add_method(
                 *name,
-                // `middleware..., handler` optionally followed by an options
-                // table: `app:get(path, handler, { on_error = fn })`.
-                move |lua, this, (path, mut args): (String, Variadic<Value>)| {
-                    let options = match args.last() {
-                        Some(Value::Table(opts)) => {
-                            let parsed = route_options(name, &path, opts)?;
-                            args.pop();
-                            parsed
-                        }
-                        _ => options::RouteOptions::default(),
-                    };
-                    let fns: Vec<Function> = args
-                        .into_iter()
-                        .map(|value| match value {
-                            Value::Function(f) => Ok(f),
-                            other => Err(mlua::Error::RuntimeError(format!(
-                                "app:{name}(\"{path}\", ...) takes handler functions \
-                                 and an optional trailing options table, got {}",
-                                other.type_name()
-                            ))),
-                        })
-                        .collect::<mlua::Result<_>>()?;
-                    if fns.is_empty() {
-                        return Err(mlua::Error::RuntimeError(format!(
-                            "app:{name}(\"{path}\", ...) requires a handler function"
-                        )));
-                    }
-                    if !path.starts_with('/') {
-                        return Err(mlua::Error::RuntimeError(format!(
-                            "route path `{path}` must start with `/`"
-                        )));
-                    }
-                    let site = caller_site(lua);
-                    lock(&this.0)?.routes.push(RouteDef {
-                        method: method.clone(),
-                        path,
-                        fns,
-                        error_fn: options.error_fn,
-                        invalid_fn: options.invalid_fn,
-                        input: options.input,
-                        doc: options.doc,
-                        site,
-                    });
-                    Ok(())
+                move |lua, this, (path, args): (String, Variadic<Value>)| {
+                    register_route(lua, &this.0, name, &method, "", &[], path, args)
                 },
             );
         }
+
+        // app:group(prefix, fn?): routes under a common prefix with their
+        // own middleware; `fn(g)` registers through the group, which is
+        // also returned.
+        methods.add_method("group", |lua, this, args: (String, Option<Function>)| {
+            make_group(lua, &this.0, "", Vec::new(), args)
+        });
 
         // app:on_invalid(fn): the app-wide answer to a request that failed
         // its route's `input` declaration, `function(err, req)` returning a
@@ -243,10 +380,10 @@ pub(crate) struct Chain {
     pub(crate) site: Site,
     pub(crate) error_fn: Option<Function>,
     /// The route's compiled `input` declaration, plus the userdata the
-    /// budgeted validation function receives it through.
+    /// validating link receives it through.
     pub(crate) input: Option<(Arc<InputSchemas>, AnyUserData)>,
-    /// The resolved `on_invalid` (route-level first, app-wide fallback).
-    pub(crate) invalid_fn: Option<Function>,
+    /// The route's own rate limit, checked before its chain runs.
+    pub(crate) rate: Option<Arc<crate::protect::RateLimiter>>,
 }
 
 /// The Rust-side router plus the per-route composed Lua chains.
@@ -287,6 +424,8 @@ pub(crate) struct Routing {
     /// routes itself.
     fingerprint: u64,
     pub(crate) statics: Arc<Vec<crate::static_files::StaticMount>>,
+    /// Each chain's own rate limit, by index, checked before checkout.
+    pub(crate) limits: Vec<Option<Arc<crate::protect::RateLimiter>>>,
 }
 
 impl Routing {
@@ -304,6 +443,7 @@ pub(crate) fn routing(lua: &Lua) -> Result<Routing> {
         router: app.router.clone(),
         fingerprint: state.fingerprint,
         statics: state.statics.clone(),
+        limits: app.chains.iter().map(|chain| chain.rate.clone()).collect(),
     })
 }
 
@@ -399,19 +539,9 @@ pub(crate) fn register_nitr_app(lua: &Lua) -> Result<()> {
     let nitr = nitr_core::nitr_table(lua)?;
     nitr.set(
         "app",
-        lua.create_function(|_, ()| Ok(LuaApp(Mutex::new(AppDef::default()))))?,
+        lua.create_function(|_, ()| Ok(LuaApp(Arc::new(Mutex::new(AppDef::default())))))?,
     )?;
-    // A Rust async function called through the runtime's budgeted
-    // `call_function`, so a custom check spends the request's allowance.
-    let validate = lua.create_async_function(crate::validation::run::validate)?;
-    lua.set_named_registry_value(VALIDATE_FN_KEY, validate)?;
     Ok(())
-}
-
-/// The budgeted validation function registered by [`register_nitr_app`].
-pub(crate) fn validate_fn(lua: &Lua) -> Result<Function> {
-    lua.named_registry_value::<Function>(VALIDATE_FN_KEY)
-        .map_err(|_| Error::Script("the validation function is not registered".into()))
 }
 
 /// Evaluates the handler script and stores its compiled [`AppState`] in the
@@ -435,6 +565,39 @@ pub(crate) fn load(
     // fixed from here, so no request can change another's wording.
     nitr_std::validation::freeze_messages(lua);
     let mut statics = compiled.statics;
+    // A relative directory is the script's, not the working directory's:
+    // a bundle runs from anywhere, and a mount that pointed at the cwd
+    // served whatever sat there. Missing is refused here, where the
+    // message can name the mount, rather than answering 404 forever.
+    let script_dir = script.parent().unwrap_or_else(|| Path::new("."));
+    for mount in &mut statics {
+        if mount.dir.is_relative() {
+            mount.dir = script_dir.join(&mount.dir);
+        }
+    }
+    if input_env.static_dirs_optional {
+        // Once per process, not once per pooled state.
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        statics.retain(|mount| {
+            let exists = mount.dir.is_dir();
+            if !exists && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    "app:static(\"{}\", ...): directory {} does not exist yet: the mount is \
+                     skipped by this command, and `nitr run` refuses it",
+                    mount.mount,
+                    mount.dir.display()
+                );
+            }
+            exists
+        });
+    } else if let Some(mount) = statics.iter().find(|mount| !mount.dir.is_dir()) {
+        return Err(Error::Script(format!(
+            "app:static(\"{}\", ...): directory {} does not exist; a relative \
+             directory is resolved against the handler script's",
+            mount.mount,
+            mount.dir.display()
+        )));
+    }
     statics.extend_from_slice(base_statics);
     // Longest mount prefix first, once: the static path used to collect
     // and sort the candidates on every request. Stable, so mounts of equal
@@ -469,6 +632,8 @@ mod tests {
         let env = InputEnv {
             upload_root: None,
             reserved: Vec::new(),
+            trust_forwarded_for: false,
+            static_dirs_optional: false,
         };
         load(&lua, &path.0, &[], &env).expect("load");
         (lua, path)

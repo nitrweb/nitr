@@ -98,7 +98,7 @@ async fn a_compiled_schema_nests_as_a_table_rule() {
         r#"{ user = { name = "" }, users = { { name = "x", email = "bad" } } }"#,
     )
     .await;
-    assert_eq!(field(&err, "user.name"), "must be at least 1 characters");
+    assert_eq!(field(&err, "user.name"), "must be at least 1 character");
     assert_eq!(field(&err, "user.email"), "is required");
     assert_eq!(field(&err, "users[1].email"), "must be an email address");
 }

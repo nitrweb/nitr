@@ -64,7 +64,8 @@ pub fn init(dir: &Path, minimal: bool) -> anyhow::Result<()> {
     match minimal {
         true => println!("\nNext steps:\n  nitr check\n  nitr test\n  nitr dev"),
         false => println!(
-            "\nNext steps:\n  nitr migrate\n  nitr check\n  nitr test\n  nitr dev   # then open http://127.0.0.1:3000/docs"
+            "\nNext steps:\n  nitr migrate\n  nitr check\n  nitr test\n  nitr dev   # then open http://127.0.0.1:3000/hello/you\n\
+             API docs: set [openapi] enabled = true and [swagger] enabled = true, then open /docs"
         ),
     }
     Ok(())
@@ -126,20 +127,14 @@ app:doc({
     tags = { { name = "notes", description = "Notes" } },
 })
 
--- App-wide middleware: a factory `fn(next) -> fn(req)`, composed once at
--- load time. Must come before the routes.
-app:use(function(next)
-    return function(req)
-        local started = nitr.time.monotonic()
-        local resp = next(req)
-        nitr.log.info("request", {
-            path = req.path,
-            status = type(resp) == "table" and resp.status or 200,
-            ms = math.floor((nitr.time.monotonic() - started) * 1000),
-        })
-        return resp
-    end
-end)
+-- App-wide middleware is a factory `fn(next) -> fn(req)`, composed once
+-- at load time and registered before the routes:
+--
+--   app:use(function(next)
+--       return function(req) return next(req) end
+--   end)
+--
+-- Nitr already logs every request with its id, status and timing.
 
 -- Routes live in their own files; wiring them here keeps the app's shape
 -- visible in one place.
@@ -152,14 +147,10 @@ app:get("/hello/:name", function(req)
     }))
 end)
 
--- The app-wide error handler receives the structured error: kind
--- ("lua"|"nitr"|"module"|"timeout"|"memory"|"panic"), message, source,
--- line, traceback, cause.
+-- The app-wide error handler shapes the answer; Nitr has already logged
+-- the failure (kind, message, source, line, traceback) with the request id.
 app:on_error(function(err, req)
-    nitr.log.error("handler failed", {
-        error = err.message, kind = err.kind, source = err.source, line = err.line,
-    })
-    return nitr.error(500, { code = "INTERNAL" })
+    return nitr.error(500, { code = "INTERNAL", request_id = req.id })
 end)
 
 return app

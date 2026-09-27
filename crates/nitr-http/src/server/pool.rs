@@ -77,6 +77,8 @@ pub(crate) fn input_env(cfg: &Config) -> crate::validation::InputEnv {
     crate::validation::InputEnv {
         upload_root: cfg.multipart.upload_dir.clone().map(Arc::new),
         reserved,
+        trust_forwarded_for: cfg.rate_limit.trust_forwarded_for,
+        static_dirs_optional: cfg.static_dirs_optional,
     }
 }
 
@@ -232,6 +234,7 @@ fn new_runtime(
         env: cfg.env_options(),
         cache: cache.cloned(),
         cookie_secure: cfg.cookies.secure.resolve(cfg.tls.enabled),
+        cookie_insecure_warning: cfg.cookie_insecure_warning(),
     };
     nitr_std::register_builtins(rt.lua(), builtins, &env)?;
     app::register_nitr_app(rt.lua())?;

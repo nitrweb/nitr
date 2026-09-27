@@ -135,6 +135,18 @@ pub(crate) fn row_to_lua(lua: &Lua, row: SqlRow) -> mlua::Result<Table> {
     Ok(table)
 }
 
+/// The rows of a result set as a Lua list, marked as one so an empty
+/// result encodes as `[]` rather than `{}`.
+pub(crate) fn rows_to_lua(lua: &Lua, rows: Vec<SqlRow>) -> mlua::Result<Table> {
+    use mlua::LuaSerdeExt as _;
+    let table = lua.create_table_with_capacity(rows.len(), 0)?;
+    table.set_metatable(Some(lua.array_metatable()))?;
+    for (i, row) in rows.into_iter().enumerate() {
+        table.raw_set(i + 1, row_to_lua(lua, row)?)?;
+    }
+    Ok(table)
+}
+
 /// `SQLITE_MAX_VARIABLE_NUMBER` in the bundled SQLite (`sqlite3.c`): no
 /// statement binds more, and walking to a larger index would allocate one
 /// NULL per missing slot.

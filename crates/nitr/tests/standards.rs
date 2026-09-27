@@ -933,7 +933,13 @@ return app
     let resp = srv.get("/data.txt").await;
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.expect("body"), "static bytes");
-    let resp = srv.get("/missing").await;
+    let resp = srv
+        .client()
+        .get(srv.url("/missing"))
+        .header("accept", "text/html")
+        .send()
+        .await
+        .expect("navigation");
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.expect("body"), "<p>spa</p>");
     let resp = srv.get("/slow").await;
@@ -1270,5 +1276,165 @@ async fn http_correctness_audit() {
     );
     drop(sock);
 
+    srv.stop().await;
+}
+
+/// A relative `app:static` directory is the script's, not the working
+/// directory's: a bundle runs from anywhere, and a mount that pointed at
+/// the cwd served whatever sat there. A directory that does not exist
+/// fails the load, naming the mount.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relative_static_mount_resolves_against_the_script_and_must_exist() {
+    let b = TestServer::builder("standards-static-relative")
+        .upload_dir()
+        .handler(
+            r#"
+local app = nitr.app()
+app:get("/hello", function() return nitr.text("hi") end)
+app:static("/assets", "public/assets", { cache_control = "public, max-age=31536000, immutable" })
+return app
+"#,
+        );
+    b.dir()
+        .write("scripts/public/assets/app.js", "console.log('bundled')");
+    let mut srv = b.spawn().await;
+    let resp = srv.get("/assets/app.js").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()["cache-control"],
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(resp.text().await.expect("body"), "console.log('bundled')");
+    srv.stop().await;
+
+    let mut missing = TestServer::builder("standards-static-missing").handler(
+        r#"
+local app = nitr.app()
+app:static("/assets", "nowhere/assets")
+return app
+"#,
+    );
+    let err = missing
+        .try_build()
+        .await
+        .expect_err("a missing mount directory must not load")
+        .to_string();
+    assert!(
+        err.contains("app:static") && err.contains("nowhere/assets"),
+        "{err}"
+    );
+}
+
+/// `[headers]` reaches every response: a static file, the SPA page, a
+/// built-in 404 and a handler's JSON. A header the handler set wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_headers_reach_every_response() {
+    let b = builder()
+        .config(|cfg| {
+            cfg.headers.insert("X-Frame-Options".into(), "DENY".into());
+            cfg.headers
+                .insert("Referrer-Policy".into(), "same-origin".into());
+        })
+        .handler(
+            r#"
+local app = nitr.app()
+app:get("/json", function()
+    local resp = nitr.json({ ok = true })
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    return resp
+end)
+return app
+"#,
+        );
+    let dir = static_dir(&b);
+    let mut srv = b
+        .config(move |cfg| cfg.static_files.dir = Some(dir))
+        .spawn()
+        .await;
+    for path in ["/data.txt", "/missing", "/json"] {
+        let resp = srv.get(path).await;
+        assert_eq!(resp.headers()["x-frame-options"], "DENY", "{path}");
+        let referrer = if path == "/json" {
+            "no-referrer"
+        } else {
+            "same-origin"
+        };
+        assert_eq!(resp.headers()["referrer-policy"], referrer, "{path}");
+    }
+    srv.stop().await;
+}
+
+/// A client that asks for JSON gets every built-in rejection as JSON, with
+/// a stable `code`: a 404, a 405, a 413, a rate limit with its
+/// `retry_after`, and a CSRF refusal. Everyone else keeps the plain text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn built_in_rejections_answer_json_when_asked() {
+    let mut srv = builder()
+        .config(|cfg| {
+            cfg.rate_limit.enabled = true;
+            cfg.rate_limit.requests = 4;
+            cfg.rate_limit.window = 60;
+            cfg.limits.max_body_bytes = 64;
+        })
+        .handler(
+            r#"
+local app = nitr.app()
+app:use(nitr.csrf({ secret = "csrf-secret-0123456789" }))
+app:get("/ok", function() return nitr.text("ok") end)
+app:post("/submit", function() return nitr.text("ok") end)
+return app
+"#,
+        )
+        .spawn()
+        .await;
+    let ask = |srv: &TestServer, method: &str, path: &str, body: Option<String>| {
+        let mut req = srv
+            .client()
+            .request(method.parse().expect("method"), srv.url(path))
+            .header("accept", "application/json");
+        if let Some(body) = body {
+            req = req.body(body);
+        }
+        req.send()
+    };
+    let cases = [
+        ("GET", "/missing", None, 404, "NOT_FOUND"),
+        ("POST", "/ok", None, 405, "METHOD_NOT_ALLOWED"),
+        (
+            "POST",
+            "/submit",
+            Some("x".repeat(100)),
+            413,
+            "PAYLOAD_TOO_LARGE",
+        ),
+        ("POST", "/submit", Some("a=1".into()), 403, "CSRF_INVALID"),
+    ];
+    for (method, path, body, status, code) in cases {
+        let resp = ask(&srv, method, path, body).await.expect(path);
+        assert_eq!(resp.status(), status, "{method} {path}");
+        assert_eq!(
+            resp.headers()["content-type"],
+            "application/json",
+            "{method} {path}"
+        );
+        let json: serde_json::Value = resp.json().await.expect(path);
+        assert_eq!(json["code"], code, "{method} {path}");
+        assert!(json["message"].is_string(), "{method} {path}: {json}");
+    }
+    // The window holds four requests; the four above spent it.
+    let resp = ask(&srv, "GET", "/ok", None).await.expect("limited");
+    assert_eq!(resp.status(), 429);
+    let retry_after: u64 = resp.headers()["retry-after"]
+        .to_str()
+        .expect("ascii")
+        .parse()
+        .expect("seconds");
+    let json: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(json["code"], "RATE_LIMITED");
+    assert_eq!(json["retry_after"], retry_after);
+    // Without `application/json` in `Accept`, the plain text stays.
+    let resp = srv.get("/missing").await;
+    assert_eq!(resp.status(), 429, "still limited");
+    assert_eq!(resp.headers()["content-type"], "text/plain; charset=utf-8");
     srv.stop().await;
 }

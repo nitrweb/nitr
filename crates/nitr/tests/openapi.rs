@@ -52,6 +52,12 @@ end, {
     doc = { responses = { [201] = { schema = Note } } },
 })
 
+-- Documents its failure only: the success answer is still an operation
+-- response.
+app:get("/api/notes/:id", function(req)
+    return nitr.json({ id = req.params.id })
+end, { doc = { responses = { [404] = { description = "No such note" } } } })
+
 app:get("/internal/metrics", function(req)
     return nitr.json({ n = 0 })
 end, { doc = { hidden = true } })
@@ -96,6 +102,11 @@ async fn the_document_is_served_with_a_validator_and_answers_304() {
     );
     assert!(spec["paths"]["/api/notes"]["get"]["parameters"].is_array());
     assert!(spec["paths"].get("/internal/metrics").is_none(), "hidden");
+    // An operation that documents only a failure still gets its 200, so
+    // a generated client has a success shape.
+    let by_id = &spec["paths"]["/api/notes/{id}"]["get"]["responses"];
+    assert_eq!(by_id["404"]["description"], "No such note");
+    assert_eq!(by_id["200"]["description"], "OK");
     assert_eq!(
         spec["components"]["schemas"]["NoteInput"]["properties"]["text"]["x-nitr-enforced"],
         "custom"

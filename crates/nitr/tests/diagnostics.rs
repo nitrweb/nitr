@@ -496,3 +496,38 @@ async fn static_fs_errors_log_at_debug_with_the_path_escaped() {
         );
     }
 }
+
+/// The warning about cookies shipped without `Secure` is raised by the
+/// first cookie built that way, not by the configuration: a service that
+/// never sets one is never told about them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_insecure_cookie_warning_is_logged_when_a_cookie_ships_without_secure() {
+    logcap::install();
+    let mut server = start(
+        r#"
+local app = nitr.app()
+app:get("/plain", function() return nitr.text("no cookie") end)
+app:get("/cookie", function()
+    local resp = nitr.text("cookie")
+    resp.cookies:set("lang", "en")
+    return resp
+end)
+return app
+"#,
+        false,
+        |_| {},
+    )
+    .await;
+    let insecure_warnings = || {
+        logcap::events()
+            .into_iter()
+            .filter(|e| e.level == tracing::Level::WARN && e.text.contains("without the `Secure`"))
+            .count()
+    };
+    assert_eq!(server.get("/plain").await.status(), 200);
+    assert_eq!(insecure_warnings(), 0, "no cookie was built yet");
+    assert_eq!(server.get("/cookie").await.status(), 200);
+    assert_eq!(server.get("/cookie").await.status(), 200);
+    assert_eq!(insecure_warnings(), 1, "once, on the first cookie");
+    server.stop().await;
+}

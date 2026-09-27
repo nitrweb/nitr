@@ -133,7 +133,7 @@ desc = "The application: routes, middleware, error handling, static mounts. Retu
 
 [[fn]]
 name = "nitr.App:get"
-desc = "Registers a GET route: `middleware..., handler` plus an optional trailing options table `{ input = {...}, doc = {...}, on_invalid = fn, on_error = fn }`. `doc` describes the operation in the OpenAPI document (`summary`, `description`, `tags`, `operation_id`, `responses = { [code] = { description, schema?, content? } }` where `schema` is documentation only, `security = { name }`, `deprecated`, `hidden`); request schemas live under `input`, never `doc`. `input` declares schemas for `body` (a schema, or `{ schema = S, content = { \"json\", \"form\", \"multipart\" } }`, or `{ file = R, content = { \"raw\" } }`), `query`, `params` and `headers`, enforced in Rust before the handler and exposed as `req.valid`; a failure answers a JSON 422 unless `on_invalid` says otherwise. Paths take `:name` parameters and a trailing `*` catch-all."
+desc = "Registers a GET route: `middleware..., handler` plus an optional trailing options table `{ input = {...}, doc = {...}, on_invalid = fn, on_error = fn, rate_limit = { requests, window } }`. `rate_limit` is the route's own fixed window per client (seconds), on top of `[rate_limit]`, spent before a Lua state is taken; the refusal is a 429 with `Retry-After`. The chain runs app middleware, then group middleware, then route middleware, then `input` validation, then the handler. `doc` describes the operation in the OpenAPI document (`summary`, `description`, `tags`, `operation_id`, `responses = { [code] = { description, schema?, content? } }` where `schema` is documentation only, `security = { name }`, `deprecated`, `hidden`); request schemas live under `input`, never `doc`. `input` declares schemas for `body` (a schema, or `{ schema = S, content = { \"json\", \"form\", \"multipart\" } }`, or `{ file = R, content = { \"raw\" } }`), `query`, `params` and `headers`, enforced in Rust before the handler and exposed as `req.valid`; a failure answers a JSON 422 unless `on_invalid` says otherwise. Paths take `:name` parameters and a trailing `*` catch-all."
 params = [
   { name = "path", type = "string" },
   { name = "...", type = "fun(req: nitr.Request): nitr.Response|table" },
@@ -194,13 +194,22 @@ params = [{ name = "info", type = "table" }]
 
 [[fn]]
 name = "nitr.App:on_invalid"
-desc = "The app-wide answer to a request that failed its route's `input` declaration: `function(err, req)` returning a response, where `err = { code, message, fields, errors }` (`fields` maps each path such as `body.email` to its message; `errors` lists `{ path, part, field, rule, message, params?, label? }`). A route-level `on_invalid` option wins over it."
+desc = "The app-wide answer to a request that failed its route's `input` declaration: `function(err, req)` returning a response, where `err = { code, message, fields, errors }` (`fields` maps each path such as `body.email` or `body.items[1].sku` (list indexes are 1-based, as in Lua) to its message; `errors` lists `{ path, part, field, rule, message, params?, label? }`). A route-level `on_invalid` option wins over it."
 params = [{ name = "fn", type = "fun(err: table, req: nitr.Request): nitr.Response|table" }]
 
 [[fn]]
 name = "nitr.App:use"
-desc = "Adds app-wide middleware: a factory `fn(next) -> fn(req)`. Must be called before any route."
+desc = "Adds app-wide middleware: a factory `fn(next) -> fn(req)`. Must be called before any route. Middleware runs before a route's `input` validation, so an auth middleware answers before a schema error would."
 params = [{ name = "mw", type = "fun(next: fun): fun(req: nitr.Request): any" }]
+
+[[fn]]
+name = "nitr.App:group"
+desc = "Routes under a common prefix with their own middleware: `app:group(\"/api\", function(g) g:use(auth) g:get(\"/items\", list) g:group(\"/v2\", ...) end)`. The group has the same route methods as the app plus `use` (before its routes and nested groups) and `group`; its middleware runs after the app's and before the route's own. `g:get(\"/\")` is the prefix itself. Returns the group, so `local g = app:group(\"/admin\")` works without a body."
+params = [
+  { name = "prefix", type = "string" },
+  { name = "fn", type = "fun(g: nitr.App)?" },
+]
+returns = [{ type = "nitr.App" }]
 
 [[fn]]
 name = "nitr.App:on_error"
@@ -209,7 +218,7 @@ params = [{ name = "handler", type = "fun(err: table, req: nitr.Request): nitr.R
 
 [[fn]]
 name = "nitr.App:static"
-desc = "Mounts a static directory, served in Rust without a Lua state. Routes win: the mount answers a GET or HEAD for a path no route serves with that method. Options: `{ spa = boolean, cache_control = string, dotfiles = boolean }` — dotfiles are hidden unless `dotfiles = true` (`.well-known/` is always served)."
+desc = "Mounts a static directory, served in Rust without a Lua state. A relative `dir` is resolved against the handler script's directory (so a bundle serves the same files from anywhere), and a directory that does not exist fails the load. Routes win: the mount answers a GET or HEAD for a path no route serves with that method. Options: `{ spa = boolean, cache_control = string, dotfiles = boolean }` — with `spa = true` an unknown path under the mount is answered with `index.html` only when the request's `Accept` header names `text/html` (an API client asking for JSON, or `*/*`, gets the 404); dotfiles are hidden unless `dotfiles = true` (`.well-known/` is always served)."
 params = [
   { name = "mount", type = "string" },
   { name = "dir", type = "string" },
@@ -379,7 +388,7 @@ desc = "A database transaction handle inside `nitr.db:transaction`; same query A
 [[fn]]
 name = "nitr.json"
 feature = "json"
-desc = "As a function: a JSON response (`nitr.json({ ok = true })`). Also the codec: `nitr.json:encode(v)` / `nitr.json:decode(s)`. A table whose keys are `1..n` (holes as `null`) is an array; one mixing list items and named keys has no JSON shape and raises, here and wherever a value is serialized (cache, session, JWT, templates)."
+desc = "As a function: a JSON response (`nitr.json({ ok = true })`). Also the codec: `nitr.json:encode(v)` / `nitr.json:decode(s)`. A table whose keys are `1..n` (holes as `null`) is an array; one mixing list items and named keys has no JSON shape and raises, here and wherever a value is serialized (cache, session, JWT, templates). An empty table is `{}` unless marked with `nitr.json.array`; `nitr.json.null` is the `null` a table can hold (`nil` erases the key), and what `decode` produces for one."
 params = [
   { name = "value", type = "any" },
   { name = "status", type = "integer?", desc = "Status code (default 200)." },
@@ -387,7 +396,11 @@ params = [
 returns = [{ type = "nitr.Response" }]
 methods = [
   { name = "encode", params = [{ name = "value", type = "any" }], returns = [{ type = "string" }], desc = "Encodes a value as JSON." },
-  { name = "decode", params = [{ name = "s", type = "string" }], returns = [{ type = "any" }], desc = "Decodes JSON; errors on invalid input." },
+  { name = "decode", params = [{ name = "s", type = "string" }], returns = [{ type = "any" }], desc = "Decodes JSON; errors on invalid input. `[]` decodes to an array-marked table, `null` to `nitr.json.null`." },
+  { name = "array", dot = true, params = [{ name = "t", type = "table" }], returns = [{ type = "table", desc = "The same table." }], desc = "Marks a table as a JSON array, so an empty one encodes as `[]`. `nitr.db:query` marks its result sets." },
+]
+fields = [
+  { name = "null", type = "userdata", desc = "JSON `null` as a value a table can hold: `{ deleted_at = nitr.json.null }` encodes the key, where `nil` would drop it." },
 ]
 
 [[fn]]
@@ -467,7 +480,7 @@ returns = [{ type = "string" }]
 [[fn]]
 name = "nitr.csrf"
 feature = "http"
-desc = "As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field of an urlencoded form; a multipart form or a JSON body sends the header). Options: `secret` (required), `cookie` (the cookie NAME, default `_csrf`), `header`, `field`, and `cookie_opts` (the cookie ATTRIBUTES, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set). Note `nitr.session` spells its attribute table `cookie` — here that key is the name. Unsafe requests a browser marks `Sec-Fetch-Site: cross-site` are refused before the token is checked, unless `cookie_opts.same_site = \"None\"` (the setting that means to accept cross-site posts)."
+desc = "As a function: the CSRF middleware factory for `app:use` (signed double-submit cookie; unsafe methods must echo the token in `X-CSRF-Token` or a `_csrf` field of an urlencoded form; a multipart form or a JSON body sends the header). Options: `secret` (required), `name` (the cookie name, default `_csrf`), `header`, `field`, and `cookie` (the cookie attributes, which extend the HttpOnly/SameSite=Lax defaults rather than replacing them; `http_only` cannot be un-set), the same spellings as `nitr.session`. A refusal is a 403: plain text, or `{ code = \"CSRF_INVALID\" }` when the request accepts `application/json`. Unsafe requests a browser marks `Sec-Fetch-Site: cross-site` are refused before the token is checked, unless `cookie.same_site = \"None\"` (the setting that means to accept cross-site posts)."
 params = [{ name = "opts", type = "table" }]
 returns = [{ type = "fun" }]
 methods = [
@@ -477,7 +490,7 @@ methods = [
 [[fn]]
 name = "nitr.session"
 feature = "http"
-desc = "Loads (or starts) the stateless signed-cookie session. Options: `secret` (required), `name` (the cookie name), `max_age`, and `cookie` (the cookie ATTRIBUTES table, which extends the HttpOnly/SameSite=Lax defaults; `http_only` cannot be un-set). Note `nitr.csrf` spells the attribute table `cookie_opts` and uses `cookie` for the name."
+desc = "Loads (or starts) the stateless signed-cookie session. Options: `secret` (required), `name` (the cookie name), `max_age`, and `cookie` (the cookie ATTRIBUTES table, which extends the HttpOnly/SameSite=Lax defaults; `http_only` cannot be un-set), the same spellings as `nitr.csrf`."
 params = [
   { name = "req", type = "nitr.Request" },
   { name = "opts", type = "table" },
@@ -507,7 +520,7 @@ returns = [{ type = "any" }]
 [[fn]]
 name = "nitr.fetch"
 feature = "fetch"
-desc = "An outbound HTTP request (SSRF-guarded, redirect-checked). Options: `headers`, `query`, `json`, `body`, `timeout`, `retry`. Returns an unsent handle. `retry = { attempts, backoff }` repeats an idempotent request after a network failure or a retryable status, never after a refusal by the `[fetch]` policy."
+desc = "An outbound HTTP request (SSRF-guarded, redirect-checked). Options: `headers`, `query`, `json`, `body`, `timeout`, `retry`. Returns an unsent handle. `retry = { attempts, backoff, idempotent? }` repeats an idempotent request after a network failure or a retryable status, never after a refusal by the `[fetch]` policy; `idempotent = true` vouches for a `POST` (one carrying an idempotency key) so it may be retried too."
 params = [
   { name = "method", type = "string" },
   { name = "url", type = "string" },
@@ -536,10 +549,10 @@ feature = "db"
 desc = "The SQLite database (`database` in nitr.toml): WAL, busy timeout, foreign keys on. A row is a column→value table, so a query whose result columns share a name raises (alias one with `AS`)."
 methods = [
   { name = "execute", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?", desc = "Positional values; `nil` (anywhere, trailing included) and JSON `null` bind NULL. A table from `table.pack` counts to its `n`, which is also how a lone NULL is passed (`{ n = 1 }`): an empty list is not padded, so a statement called without its parameters fails." }], returns = [{ type = "integer", desc = "Affected row count." }], desc = "Runs a statement." },
-  { name = "query", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "table[]" }], desc = "All rows, each a column→value table. A result larger than `[database] max_rows` (default 10000) raises rather than truncating." },
+  { name = "query", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "table[]" }], desc = "All rows, each a column→value table, as a list marked for JSON (an empty result encodes as `[]`). A result larger than `[database] max_rows` (default 10000) raises rather than truncating." },
   { name = "query_row", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "table|nil" }], desc = "The first row as a column→value table, or nil when the query returns no rows." },
   { name = "query_one", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }], returns = [{ type = "table" }], desc = "The row of a query that must return exactly one row (a column→value table); raises when it returns none or more than one." },
-  { name = "transaction", params = [{ name = "fn", type = "fun(tx: nitr.Tx): any" }], returns = [{ type = "any" }], desc = "Runs `fn` atomically; rolls back on error. Nestable (savepoints). Use `tx`, not the outer `nitr.db`." },
+  { name = "transaction", params = [{ name = "fn", type = "fun(tx: nitr.Tx): ...any" }], returns = [{ type = "...any", desc = "Every value `fn` returned." }], desc = "Runs `fn` atomically: commits when it returns, rolls back when it raises and re-raises the very value it raised (`error({ code = \"OUT_OF_STOCK\" })` reaches the caller's `pcall` as that table). Nestable (savepoints). Use `tx`, not the outer `nitr.db`." },
   { name = "query_async", params = [{ name = "sql", type = "string" }, { name = "params", type = "table?" }, { name = "kind", type = "string?" }], returns = [{ type = "table", desc = "A pending handle for `nitr.await_all`." }], desc = "An unsent query to run alongside fetches." },
 ]
 
@@ -576,10 +589,10 @@ fields = [
 [[table]]
 name = "nitr.crypto.jwt"
 feature = "crypto"
-desc = "HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list and checks `exp`/`nbf` when present. It does NOT check `iss`, `aud` or `typ` — those are the caller's job — and a token with no `exp` never expires."
+desc = "HMAC JWTs (HS256/384/512). Verification demands an explicit algorithm allow-list, checks `exp`/`nbf` when present, and compares the registered claims it is asked to (`issuer`, `audience`, `subject`, `require`, `max_age`). `typ` is never checked, and a token with no `exp` never expires unless `require` names it."
 functions = [
   { name = "sign", params = [{ name = "claims", type = "table" }, { name = "key", type = "string" }, { name = "opts", type = "table?", desc = "`{ alg = \"HS256\" }`" }], returns = [{ type = "string" }], desc = "Signs a token." },
-  { name = "verify", params = [{ name = "token", type = "string" }, { name = "key", type = "string" }, { name = "opts", type = "table", desc = "`{ algorithms = {...}, leeway? }` — the allow-list is required." }], returns = [{ type = "table|nil", desc = "The claims." }, { type = "string|nil", desc = "The rejection reason." }], desc = "Verifies the signature, the `alg` against the allow-list, and `exp`/`nbf` if the token carries them. Checks no other claim: compare `iss`/`aud` yourself, and require `exp` if your tokens must expire (`aud` may be a string or an array)." },
+  { name = "verify", params = [{ name = "token", type = "string" }, { name = "key", type = "string" }, { name = "opts", type = "table", desc = "`{ algorithms = {...}, leeway?, issuer?, audience?, subject?, require?, max_age? }` — the allow-list is required; `issuer`/`audience`/`subject` must equal `iss`/`aud`/`sub` (`aud` may be a string or an array); `require` lists claims that must be present (`{ \"exp\", \"jti\" }`); `max_age` bounds the seconds since `iat`." }], returns = [{ type = "table|nil", desc = "The claims." }, { type = "string|nil", desc = "The rejection reason: `malformed token`, `invalid signature`, `algorithm not allowed`, `token expired`, `token not yet valid`, `issuer mismatch`, `audience mismatch`, `subject mismatch`, `missing claim <name>`, `token too old`, ..." }], desc = "Verifies the signature, the `alg` against the allow-list, `exp`/`nbf` if the token carries them, and the claims the options name. What is not asked for is not checked." },
 ]
 
 [[table]]
@@ -677,8 +690,12 @@ functions = [
 [[table]]
 name = "nitr.env"
 feature = "env"
-desc = "Read-only environment variable access. Opt-in; reads are filtered by `[env] allow`, and `NITR_*` internals are never visible. Getters only: no setter, no enumeration."
+desc = "Read-only environment variable access. Opt-in; reads are filtered by `[env] allow`, and `NITR_*` internals are never visible. Getters only: no setter, no enumeration. An empty value reads as unset everywhere (Compose passes an optional variable through as `\"\"`)."
+fields = [
+  { name = "mode", type = "string", desc = "`\"run\"`, `\"dev\"` (`dev_mode = true`) or `\"test\"` (under `nitr test`): what the process is doing, decided by the server, never by a script." },
+]
 functions = [
+  { name = "secret", params = [{ name = "name", type = "string" }, { name = "opts", type = "table?", desc = "`{ min_len = 32, dev = \"fallback\" }`: the shortest value accepted, and a value used only under `dev` or `test` when the variable is unset." }], returns = [{ type = "string" }], desc = "A secret that fails closed: unset (or empty) raises an error naming the variable, so does one shorter than `min_len`; the `dev` fallback never applies under `run`. Read it in config.lua, once." },
   { name = "get", params = [{ name = "name", type = "string" }, { name = "default", type = "string?" }], returns = [{ type = "string|nil", desc = "The value, or the default (nil without one) when unset or not readable." }], desc = "Reads one variable." },
   { name = "has", params = [{ name = "name", type = "string" }], returns = [{ type = "boolean" }], desc = "Whether the variable is set and readable; a policy-hidden name reports false." },
   { name = "number", params = [{ name = "name", type = "string" }, { name = "default", type = "number?" }], returns = [{ type = "number|nil" }], desc = "Reads and parses a number; unset or unparseable answers the default." },
@@ -730,7 +747,7 @@ name = "nitr.test.fetch"
 feature = "test"
 desc = "Canned responses for `nitr.fetch` in the handlers under test, answered in Rust before the `[fetch]` policy and the resolver: a matched rule never leaves the process (so a test can mock an internal host without widening `[fetch]`), an unmatched request goes out unchanged, policy included. A mocked call still counts against `max_per_request`; a canned `3xx` is returned as is and `retry` is not exercised. Reset before every test."
 functions = [
-  { name = "mock", params = [{ name = "...", type = "table", desc = "`{ url, method?, status?, headers?, json? | body?, times? }`: `url` exact, or a prefix written with a trailing `*`; `json` sets `content-type`; `times` spends the rule." }], desc = "Adds rules; the first one that matches (method, URL, uses left) answers." },
+  { name = "mock", params = [{ name = "...", type = "table", desc = "`{ url, method?, status?, headers?, json? | body?, times?, error? }`: `url` exact, or a prefix written with a trailing `*`; `json` sets `content-type`; `times` spends the rule; `error = \"connection reset\"` makes the request fail like the network would instead of answering (mocks answer before retries run, so it is not retried)." }], desc = "Adds rules; the first one that matches (method, URL, uses left) answers." },
   { name = "strict", params = [{ name = "on", type = "boolean?" }], desc = "With strict on (the default argument), a request no rule matches raises `no fetch mock matched ...` instead of going out." },
   { name = "calls", returns = [{ type = "table[]", desc = "`{ method, url, headers, body?, json?, mocked }` per call, oldest first (at most 10 000)." }], desc = "Every outbound call made since the test started, answered or not." },
   { name = "reset", desc = "Drops the rules, the recorded calls and the strict flag." },
@@ -844,7 +861,7 @@ desc = "Forgets every cookie."
 
 [[class]]
 name = "nitr.test.App"
-desc = "The application compiled into the test state (`t.app()`), for unit tests. `dispatch` runs the composed middleware chain only: route `input` validation, `on_invalid`, `on_error` and the protection layer are what `t.request` exercises."
+desc = "The application compiled into the test state (`t.app()`), for unit tests. `dispatch` runs the composed chain: the middleware and, on a route that declares `input`, its validation (and `on_invalid`) between the middleware and the handler; `on_error` and the protection layer are what `t.request` exercises."
 
 [[fn]]
 name = "nitr.test.App:handler"

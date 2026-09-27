@@ -107,8 +107,8 @@ dev_mode = true
 # `"always"` is not a nicety. The most common deployment is a loopback
 # bind behind a terminating proxy, where [tls] enabled = false is correct
 # for this process *and* the cookies must still be Secure. Nothing here
-# can detect that proxy, so a configuration resolving to "not secure"
-# warns at startup rather than guessing.
+# can detect that proxy, so the first cookie sent without Secure logs a
+# warning rather than guessing (a service that sets none is not told).
 #
 # Deliberately not forced the way HttpOnly is: a Secure cookie sent over
 # plain http is dropped by the browser silently, which is a far worse
@@ -165,6 +165,14 @@ path = "scripts/file.db"
 #credentials = false          # cannot be combined with origins = ["*"];
                               # the server refuses to start if it is
 #max_age = 86400              # seconds a browser may cache the preflight
+
+# Headers added to every response: static files, the SPA page, the
+# built-in rejections and every handler answer. A header the handler set
+# itself wins. Names and values are checked at startup.
+#[headers]
+#X-Content-Type-Options = "nosniff"
+#X-Frame-Options = "DENY"
+#Referrer-Policy = "same-origin"
 
 # Inbound TLS termination (needs the `tls` Cargo feature; rustls over the
 # `ring` provider). Off by default and never inferred from a certificate
@@ -224,6 +232,8 @@ path = "scripts/file.db"
 #[fetch]
 #allowed_hosts = ["api.example.com"] # exact-host allow-list (all hops)
 #allow_private_networks = false      # permit loopback/RFC1918 targets
+#private_hosts = ["payments"]        # hosts allowed on a private address by
+                                     # name, with allow_private_networks off
 #max_response_bytes = 8388608        # cap on resp:text()/resp:json() bodies
 #max_concurrent = 8                  # max requests of one nitr.await_all(...)
                                      # in flight at a time
@@ -234,9 +244,10 @@ path = "scripts/file.db"
                                      # `timeout` option overrides it
 #pool_max_idle_per_host = 8
 #max_retries = 5                     # ceiling on retry.attempts; retries are
-                                     # opt-in per call, only ever applied
-                                     # to idempotent methods, and never
-                                     # after a refusal by this policy
+                                     # opt-in per call, applied to idempotent
+                                     # methods (or a call marked
+                                     # idempotent = true), and never after a
+                                     # refusal by this policy
 #proxy = "http://proxy.internal:3128" # unset reads HTTPS_PROXY/HTTP_PROXY
                             # A proxy resolves targets itself, so the SSRF
                             # resolver guard cannot apply: with `fetch` enabled
@@ -253,7 +264,8 @@ path = "scripts/file.db"
 #[static]
 #dir = "public"              # directory to serve; unset disables
 #mount = "/"                 # URL prefix
-#spa = false                 # serve index.html for unknown paths
+#spa = false                 # serve index.html for unknown paths, to
+                            # requests whose Accept names text/html
 #cache_control = "public, max-age=3600"  # unset sends no Cache-Control
 #dotfiles = false            # serve .-prefixed names (.well-known/ always is)
 

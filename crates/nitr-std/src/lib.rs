@@ -68,8 +68,11 @@ pub mod validation {
 }
 // The configuration types are always available: `nitr.toml` has one shape
 // regardless of which builtins this build compiled in.
-pub use config::{EnvOptions, FetchOptions, MAX_PASSWORD_BYTES, SqlitePragmas};
-pub use http::{RequestCookies, ResponseCookies, SetCookie, best_match, parse_set_cookie};
+pub use config::{EnvOptions, FetchOptions, MAX_PASSWORD_BYTES, RunMode, SqlitePragmas};
+pub use env::set_run_mode;
+pub use http::{
+    RequestCookies, ResponseCookies, SetCookie, best_match, parse_set_cookie, response_table,
+};
 pub use utils::error_lua_value;
 
 /// Internal functions exposed for the fuzz targets in `fuzz/` only.
@@ -268,6 +271,9 @@ pub struct BuiltinsEnv {
     /// `false` in `Default` deliberately: an embedder who never sets one,
     /// and `nitr hash-password`, keep exactly today's behaviour.
     pub cookie_secure: bool,
+    /// Why a cookie built without `Secure` is worth a warning, logged once
+    /// by the first such cookie; `None` when the server has nothing to say.
+    pub cookie_insecure_warning: Option<String>,
 }
 
 /// Registers the selected builtins as fields of the global `nitr`
@@ -303,6 +309,7 @@ pub fn register_builtins(lua: &mlua::Lua, builtins: Builtins, env: &BuiltinsEnv)
     // depends on which builtins happened to be enabled.
     lua.set_app_data(http::CookieDefaults {
         secure: env.cookie_secure,
+        insecure_warning: env.cookie_insecure_warning.clone(),
     });
     for builtin in builtins.iter() {
         match builtin {

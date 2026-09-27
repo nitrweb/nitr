@@ -116,6 +116,29 @@ impl Config {
                 )));
             }
         }
+        for (name, value) in &self.headers {
+            if hyper::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                return Err(Error::Config(format!(
+                    "[headers] `{name}` is not a header name"
+                )));
+            }
+            if hyper::header::HeaderValue::from_str(value).is_err() {
+                return Err(Error::Config(format!(
+                    "[headers] the value of `{name}` is not a header value: \
+                     visible ASCII only, no line breaks"
+                )));
+            }
+        }
+        for host in &self.fetch.private_hosts {
+            let well_formed =
+                !host.is_empty() && !host.contains(['/', ':', '@', '?', '#']) && host.is_ascii();
+            if !well_formed {
+                return Err(Error::Config(format!(
+                    "[fetch] private_hosts entry `{host}` is not a host name: a bare name \
+                     such as \"payments\" or \"db.internal\", without scheme, port or path"
+                )));
+            }
+        }
         // mlua enforces the allocator limit only above zero (memory.rs),
         // so 0 would silently lift the cap on every state.
         if self.lua.memory_limit == 0 {
@@ -277,38 +300,16 @@ impl Config {
                 static_dir.display()
             ));
         }
-        // Auth cookies that will ship without `Secure`. Not a refusal:
-        // plain-HTTP local development is legitimate, and a `Secure`
-        // cookie sent over `http` is dropped by the browser silently —
-        // a far worse failure than a line an operator can read.
-        //
-        // Deliberately *not* suppressed for a loopback bind: that is
-        // precisely the terminating-proxy deployment, the one case that
-        // most needs telling, and the one `"auto"` cannot see. `dev_mode`
-        // is suppressed instead, because it is an explicit "I am
-        // developing" switch rather than a deployment shape.
-        //
-        // `"never"` on a plaintext listener is silent: the operator has
-        // answered the question, and the answer is consistent with the
-        // transport. `"never"` *with* TLS enabled is the contradiction
-        // worth naming — a server that terminates TLS and then opts its
-        // cookies out of it.
-        let secure_cookies = self.cookies.secure.resolve(self.tls.enabled);
-        let contradiction = self.cookies.secure == super::CookieSecure::Never && self.tls.enabled;
-        if !self.dev_mode
-            && (contradiction
-                || (!secure_cookies && self.cookies.secure != super::CookieSecure::Never))
-        {
-            let why = if contradiction {
-                "[cookies] secure = \"never\" is set even though [tls] enabled = true"
-            } else {
-                "[tls] enabled = false, and [cookies] secure = \"auto\" follows it"
-            };
-            out.push(format!(
-                "session and CSRF cookies will be sent without the `Secure` attribute: {why}. \
-                 If TLS is terminated by a proxy in front of this process, set \
-                 [cookies] secure = \"always\" — nothing here can detect that proxy."
-            ));
+        // A server that terminates TLS and then opts its cookies out of it.
+        // The other way round, `"auto"` on a plaintext listener, is said
+        // by the first cookie that ships that way (`cookie_insecure_warning`):
+        // a service that sets no cookie has nothing to be warned about.
+        if self.cookies.secure == super::CookieSecure::Never && self.tls.enabled && !self.dev_mode {
+            out.push(
+                "cookies will be sent without the `Secure` attribute: [cookies] secure = \
+                 \"never\" is set even though [tls] enabled = true"
+                    .into(),
+            );
         }
         // A private key other users on the box can read. A warning and
         // never a refusal: containers legitimately run as root with a

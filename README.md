@@ -141,13 +141,15 @@ Every Nitr API is a field of the global `nitr` table; nothing else is registered
 | Method | Description |
 | --- | --- |
 | `app:get/post/put/delete/patch/head/options(path, ...fns)` | Register a route; `:name` captures a parameter, a trailing `*` captures the rest. All but the last function are route middleware |
-| `app:use(fn)` | Global middleware, `function(next) return function(req) ... end end`; must precede routes |
+| `app:use(fn)` | Global middleware, `function(next) return function(req) ... end end`; must precede routes. Middleware runs before a route's `input` validation |
+| `app:group(prefix, fn?)` | Routes under a prefix with their own middleware: `app:group("/api", function(g) g:use(auth) g:get("/items", list) end)`; groups nest, and the group is returned |
+| `app:get(path, handler, { rate_limit = { requests = 10, window = 60 } })` | The route's own per-client limit, on top of `[rate_limit]`, spent before a Lua state is taken |
 | `app:on_error(fn)` | `function(err, req)` — the app-wide error response |
 | `app:doc({ title, version, description, tags, security, ... })` | Document-level information for the generated OpenAPI document (once per app) |
 | `app:get(path, handler, { doc = {...} })` | Describes the operation in the document: `summary`, `description`, `tags`, `operation_id`, `responses = { [201] = { description, schema } }` (documentation only), `security`, `deprecated`, `hidden`. Request schemas stay under `input`, which both enforces and documents them |
 | `app:on_invalid(fn)` | `function(err, req)` — the app-wide answer when a route's `input` fails (default: a JSON 422 with `fields` and `errors`) |
 | `app:post(path, handler, { input = {...} })` | Validated input: `body` (JSON or form; `{ schema = S, content = { "multipart" } }` for uploads with `file` rules, `{ file = R, content = { "raw" } }` for a single-file body), `query`, `params`, `headers` — checked in Rust before the handler, coerced from text, exposed as `req.valid.{body,query,params,headers}` |
-| `app:static(mount, dir, opts?)` | Serve files from Rust (`{ spa = true, cache_control = "..." }`) |
+| `app:static(mount, dir, opts?)` | Serve files from Rust (`{ spa = true, cache_control = "..." }`); a relative `dir` is the script's, and must exist. The SPA fallback answers only requests whose `Accept` names `text/html` |
 | `nitr.cfg` | The configuration script's snapshot |
 
 ### Request (`req`)
@@ -185,21 +187,22 @@ The `nitr.*` standard library provides building blocks — enable the features y
 
 | Module | Description |
 | --- | --- |
-| `nitr.json:encode(v)` / `nitr.json:decode(s)` | JSON codec (serde); callable as the response helper above |
-| `nitr.fetch(method, url, opts?)` → `client:send()` | HTTP client (shared pool, timeouts, SSRF policy with a guarded resolver, per-hop redirect checks, opt-in `retry = { attempts, backoff }` on idempotent methods, per-request outbound budget). Response: `.status`, `.headers`, `.raw_headers`, `.url`, `:text()`, `:json()`, `:read()` |
+| `nitr.json:encode(v)` / `nitr.json:decode(s)` | JSON codec (serde); callable as the response helper above. `nitr.json.array({})` encodes as `[]`, `nitr.json.null` is a `null` a table can hold |
+| `nitr.env.get/has/number/bool/secret(name, opts?)`, `nitr.env.mode` | Environment access under `[env] allow`; an empty value is unset. `secret` fails closed (unset or short raises), with a `dev` fallback that applies only under `nitr dev`/`nitr test` |
+| `nitr.fetch(method, url, opts?)` → `client:send()` | HTTP client (shared pool, timeouts, SSRF policy with a guarded resolver, per-hop redirect checks, opt-in `retry = { attempts, backoff, idempotent }` on idempotent methods or vouched-for ones, per-request outbound budget). Response: `.status`, `.headers`, `.raw_headers`, `.url`, `:text()`, `:json()`, `:read()` |
 | `nitr.cache:get/set/delete/clear/remember/stats` | Bounded TTL+LRU cache shared by every state. Entries are plain data, so no Lua value crosses between states; per-process, so not a session store |
 | `nitr.await_all(h1, h2, ...)` | Run several `fetch` (or `query_async`) handles concurrently, capped by `fetch.max_concurrent` |
 | `nitr.template:render(name, data?)` | minijinja templates from `[templating] dir` |
 | `nitr.db:execute/query/query_row/query_one(sql, params?)` | SQLite (`database` file); queries run on a blocking thread pool with a prepared-statement cache |
-| `nitr.db:transaction(fn)` | Atomic transaction (nestable via savepoints); rolls back on error. Use the `tx` handle inside the body — the outer `nitr.db` refuses to run while a transaction is open, rather than silently joining it |
+| `nitr.db:transaction(fn)` | Atomic transaction (nestable via savepoints); returns what `fn` returns, rolls back on error and re-raises the value `fn` raised (a table stays a table). Use the `tx` handle inside the body — the outer `nitr.db` refuses to run while a transaction is open, rather than silently joining it |
 | `nitr.db:query_async(sql, params?, kind?)` | An unsent query, so `nitr.await_all` can run it alongside a `fetch` instead of in series |
 | `nitr.log.debug/info/warn/error(msg, fields?)` | Structured logging into the request span |
 | `nitr.crypto.*` | `sha256`, `hmac_sha256`, `random_bytes`, `constant_time_eq`, `password_hash`/`password_verify` (argon2id), `seal`/`open` (XChaCha20-Poly1305 AEAD) |
-| `nitr.crypto.jwt.sign/verify` | HMAC JWTs; `verify` requires an explicit `algorithms` allow-list and checks `exp`/`nbf` by default |
+| `nitr.crypto.jwt.sign/verify` | HMAC JWTs; `verify` requires an explicit `algorithms` allow-list, checks `exp`/`nbf` by default and, on request, `issuer`, `audience`, `subject`, `require = { "exp" }` and `max_age` |
 | `nitr.auth.basic(req)` / `nitr.auth.bearer(req)` | Parse `Authorization` credentials |
 | `nitr.time.*` | `now`, `monotonic`, strftime `format`/`parse` (UTC), `http`/`parse_http`, `iso8601` — so scripts never need the `os` Lua library for a date |
 | `nitr.validate.schema({...})` → `schema:check(v)` | Declarative validation compiled once, checked in Rust: 9 types, 36 formats, shorthand rules (`"string\|trim\|min_len:1\|required"`), custom formats/checks, cross-field rules, per-field messages with placeholders; `:partial/:pick/:omit/:extend` derivations. Declared on a route as `input = {...}` it runs before the handler (see below) |
-| `nitr.csrf({ secret })` / `nitr.csrf.token(req)` | CSRF middleware (signed double-submit cookie, constant-time, unsafe methods only) |
+| `nitr.csrf({ secret, name?, cookie? })` / `nitr.csrf.token(req)` | CSRF middleware (signed double-submit cookie, constant-time, unsafe methods only); a refusal is JSON when the request accepts it, like every built-in rejection (`{ code = "NOT_FOUND" }`, `RATE_LIMITED` with `retry_after`, ...) |
 | `nitr.session(req, { secret })` | Stateless signed-cookie session: assign fields, `session:save(resp)`, `session:clear()` |
 | `nitr.base64.encode/decode` | Base64, standard and URL-safe (`{ url = true }`) alphabets |
 | `nitr.path.*` | Lexical path ops (`join`, `basename`, `dirname`, `extension`, `normalize`, `is_absolute`) for POSIX and Windows styles; no filesystem access |
@@ -233,6 +236,10 @@ output = "openapi.json"                 # dev mode: rewritten when the document 
 enabled = true                          # the vendored Swagger UI page at `path`
 path = "/docs"
 try_it_out = true
+
+[headers]                               # added to every response; a handler's own header wins
+X-Content-Type-Options = "nosniff"
+X-Frame-Options = "DENY"
 
 [tls]                                   # needs the `tls` Cargo feature
 enabled = true

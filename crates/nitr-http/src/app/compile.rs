@@ -98,15 +98,31 @@ pub(super) fn compile(
             .last()
             .expect("route registration requires at least a handler")
             .clone();
+        let invalid_fn = route.invalid_fn.clone().or_else(|| def.invalid_fn.clone());
+        let validating = match &input {
+            Some((_, holder)) => Some(validating_link(
+                lua,
+                holder.clone(),
+                handler.clone(),
+                invalid_fn,
+            )?),
+            None => None,
+        };
         chains.push(Chain {
-            fns: compose(&def.middleware, route)?,
+            fns: compose(&def.middleware, route, validating)?,
             handler,
             method: route.method.clone(),
             path: route.path.clone(),
             site: route.site.clone(),
             error_fn: route.error_fn.clone().or_else(|| def.error_fn.clone()),
             input,
-            invalid_fn: route.invalid_fn.clone().or_else(|| def.invalid_fn.clone()),
+            rate: route.rate_limit.map(|(requests, window)| {
+                Arc::new(crate::protect::RateLimiter::new(
+                    requests,
+                    window,
+                    input_env.trust_forwarded_for,
+                ))
+            }),
         });
         let pattern = to_matchit(&route.path)?;
         let slot = match index.get(&pattern) {
@@ -154,9 +170,15 @@ pub(super) fn compile(
     })
 }
 
-/// Composes `global middleware → route middleware → handler` into a single
-/// function by calling each middleware factory with its `next` link.
-fn compose(global: &[mlua::Function], route: &RouteDef) -> Result<mlua::Function> {
+/// Composes `global middleware → route middleware → validation → handler`
+/// into a single function by calling each middleware factory with its
+/// `next` link; `validating` stands in for the handler when the route
+/// declares `input`.
+fn compose(
+    global: &[mlua::Function],
+    route: &RouteDef,
+    validating: Option<mlua::Function>,
+) -> Result<mlua::Function> {
     // Invariant: route registration refuses an empty function list, so a
     // compiled route always carries at least its handler.
     #[allow(clippy::expect_used)]
@@ -164,7 +186,7 @@ fn compose(global: &[mlua::Function], route: &RouteDef) -> Result<mlua::Function
         .fns
         .split_last()
         .expect("route registration requires at least a handler");
-    let mut chain = handler.clone();
+    let mut chain = validating.unwrap_or_else(|| handler.clone());
     for mw in mws.iter().rev().chain(global.iter().rev()) {
         chain = mw.call::<mlua::Function>(chain).map_err(|err| {
             Error::Script(format!(
@@ -174,6 +196,65 @@ fn compose(global: &[mlua::Function], route: &RouteDef) -> Result<mlua::Function
         })?;
     }
     Ok(chain)
+}
+
+/// The link between a route's middleware and its handler when the route
+/// declares `input`: validation runs here, after the middleware, so an
+/// unauthenticated client never learns a schema, and a request-log
+/// middleware sees every request. A failure answers through `on_invalid`
+/// when there is one, else as the default JSON 422; the handler never
+/// runs. Every argument the middleware passed (`next(req, user)`) reaches
+/// the handler as it would without the link.
+fn validating_link(
+    lua: &Lua,
+    holder: mlua::AnyUserData,
+    handler: mlua::Function,
+    invalid_fn: Option<mlua::Function>,
+) -> Result<mlua::Function> {
+    Ok(
+        lua.create_async_function(move |lua, args: mlua::MultiValue| {
+            let holder = holder.clone();
+            let handler = handler.clone();
+            let invalid_fn = invalid_fn.clone();
+            async move {
+                let Some(Value::UserData(req)) = args.front().cloned() else {
+                    return Err(mlua::Error::RuntimeError(
+                        "a route's `next` must be called with the request".into(),
+                    ));
+                };
+                let outcome =
+                    crate::validation::run::validate(lua.clone(), (holder, req.clone())).await?;
+                let failure = match outcome {
+                    Value::Nil => return handler.call_async::<Value>(args).await,
+                    Value::Table(failure) => failure,
+                    other => {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "input validation returned {}, expected nil or a table",
+                            other.type_name()
+                        )));
+                    }
+                };
+                tracing::debug!("request rejected: input validation failed");
+                if let Some(hook) = invalid_fn {
+                    match hook.call_async::<Value>((failure.clone(), req)).await {
+                        Ok(resp) => return Ok(resp),
+                        Err(err) => tracing::error!("the on_invalid handler failed: {err}"),
+                    }
+                }
+                unprocessable(&lua, failure).map(Value::Table)
+            }
+        })?,
+    )
+}
+
+/// The default 422: the validation failure table as JSON.
+fn unprocessable(lua: &Lua, failure: mlua::Table) -> mlua::Result<mlua::Table> {
+    let body = nitr_std::json_encode(&Value::Table(failure))?;
+    let resp = nitr_std::response_table(lua, 422)?;
+    resp.get::<mlua::Table>("headers")?
+        .set("Content-Type", "application/json")?;
+    resp.set("body", lua.create_string(body)?)?;
+    Ok(resp)
 }
 
 /// Converts the route syntax (`/users/:id` parameters, trailing `*` or

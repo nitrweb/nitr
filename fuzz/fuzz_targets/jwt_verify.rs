@@ -103,8 +103,11 @@ const ALGS: &[&str] = &[
 /// `verify` must not raise for any of them.
 const ALLOW: &[&[&str]] = &[&["HS256"], &["HS384"], &["HS256", "HS512"], &["HS512"]];
 
-/// Every reason `verify` is allowed to give. A rejection outside this set
-/// means the failure path grew a case nobody wrote down.
+/// Every reason `verify` is allowed to give for the options this target
+/// passes (an allow-list and a leeway). The claim checks (`issuer`,
+/// `audience`, `subject`, `require`, `max_age`) have reasons of their own,
+/// unreachable here because the target never asks for them. A rejection
+/// outside this set means the failure path grew a case nobody wrote down.
 const REASONS: &[&str] = &[
     "malformed token",
     "malformed header",

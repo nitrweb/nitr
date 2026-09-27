@@ -180,3 +180,71 @@ fn jwt_survives_hostile_tokens_without_panicking() {
         assert!(err.is_some(), "no reason for {hostile:?}");
     }
 }
+
+/// The registered claims a service checks on every token are options of
+/// `verify`, so a token minted for another audience, by another issuer,
+/// or without the claims the caller requires fails there, with a reason.
+#[test]
+fn jwt_verify_checks_the_claims_it_is_told_to() {
+    let lua = Lua::new();
+    let crypto = create_crypto_table(&lua).expect("crypto table");
+    let jwt: Table = crypto.get("jwt").expect("jwt");
+    let sign: mlua::Function = jwt.get("sign").expect("fn");
+    let verify: mlua::Function = jwt.get("verify").expect("fn");
+    let claims: Table = lua
+        .load(
+            r#"{ sub = "42", iss = "books", aud = { "payments", "web" },
+                 iat = 1000000, exp = 4000000000 }"#,
+        )
+        .eval()
+        .expect("claims");
+    let token: String = sign.call((claims, "key")).expect("sign");
+    let check = |extra: &str| -> Option<String> {
+        let opts: Table = lua
+            .load(format!(r#"{{ algorithms = {{ "HS256" }}{extra} }}"#))
+            .eval()
+            .expect("opts");
+        let (_, err): (Value, Option<String>) =
+            verify.call((token.clone(), "key", opts)).expect("verify");
+        err
+    };
+    assert_eq!(check(r#", issuer = "books""#), None);
+    assert_eq!(
+        check(r#", issuer = "other""#).as_deref(),
+        Some("issuer mismatch")
+    );
+    assert_eq!(check(r#", audience = "payments""#), None);
+    assert_eq!(
+        check(r#", audience = "admin""#).as_deref(),
+        Some("audience mismatch")
+    );
+    assert_eq!(check(r#", subject = "42""#), None);
+    assert_eq!(
+        check(r#", subject = "7""#).as_deref(),
+        Some("subject mismatch")
+    );
+    assert_eq!(check(r#", require = { "sub", "exp" }"#), None);
+    assert_eq!(
+        check(r#", require = { "jti" }"#).as_deref(),
+        Some("missing claim jti")
+    );
+    assert_eq!(check(", max_age = 4000000000"), None);
+    assert_eq!(check(", max_age = 60").as_deref(), Some("token too old"));
+
+    // A token that carries no `aud` or `iat` fails a check that needs it.
+    let bare: Table = lua.load(r#"{ sub = "42" }"#).eval().expect("claims");
+    let bare: String = sign.call((bare, "key")).expect("sign");
+    for (extra, reason) in [
+        (r#", audience = "payments""#, "audience mismatch"),
+        (r#", issuer = "books""#, "issuer mismatch"),
+        (", max_age = 60", "missing claim iat"),
+    ] {
+        let opts: Table = lua
+            .load(format!(r#"{{ algorithms = {{ "HS256" }}{extra} }}"#))
+            .eval()
+            .expect("opts");
+        let (_, err): (Value, Option<String>) =
+            verify.call((bare.clone(), "key", opts)).expect("verify");
+        assert_eq!(err.as_deref(), Some(reason), "{extra}");
+    }
+}

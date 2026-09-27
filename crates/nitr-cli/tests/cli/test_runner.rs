@@ -573,6 +573,10 @@ app:get("/notes/:id", function(req)
     return nitr.json({ id = req.params.id, q = req.query.expand, role = req.headers["x-role"] })
 end)
 
+app:post("/checked", function(req)
+    return nitr.json({ n = req.valid.body.n })
+end, { input = { body = { n = "integer|required" } } })
+
 app:get("/private", function(req)
     return nitr.json({ via = nitr.fetch("GET", "http://10.0.0.1/b"):send().status })
 end)
@@ -763,6 +767,12 @@ t.describe("unit", function()
         t.expect(resp.body).to_match('"id":"7"')
         t.expect(app:dispatch("DELETE", "/notes/7", t.fake_request()).status).to_equal(405)
         t.expect(app:dispatch("GET", "/nope", t.fake_request()).status).to_equal(404)
+        -- The chain carries the route's validation: a bad body is the 422,
+        -- a good one reaches the handler typed.
+        local bad = t.fake_request({ method = "POST", path = "/checked", json = {} })
+        t.expect(app:dispatch("POST", "/checked", bad).status).to_equal(422)
+        local good = t.fake_request({ method = "POST", path = "/checked", json = { n = 3 } })
+        t.expect(app:dispatch("POST", "/checked", good).body).to_match('"n":3')
         t.expect(app:routes()[1]).to_match_object({ method = "GET", path = "/cookies", file = "app.lua" })
     end)
     t.it("a route registered in the test state is not served", function()

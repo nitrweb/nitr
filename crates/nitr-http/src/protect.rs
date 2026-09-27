@@ -14,10 +14,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use hyper::StatusCode;
-use hyper::header::HeaderValue;
 
 use crate::config::Config;
-use crate::handler::{HttpResponse, plain_response};
+use crate::handler::{HttpResponse, rate_limited, rejection, wants_json};
 use crate::request::LuaRequest;
 use nitr_core::Result;
 
@@ -58,6 +57,9 @@ pub(crate) struct Protection {
     cors: Option<crate::cors::Cors>,
     /// The compiled `[compression]` policy.
     compression: crate::compress::Compression,
+    /// `[headers]`, parsed once; validation refused anything that is not
+    /// a header.
+    response_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
     /// The OpenAPI document and page, swapped with the pool on reload.
     #[cfg(feature = "openapi")]
     docs: crate::openapi::docs::DocsSlot,
@@ -103,6 +105,16 @@ impl Protection {
             },
             cors: crate::cors::Cors::new(&cfg.cors),
             compression: crate::compress::Compression::new(&cfg.compression),
+            response_headers: cfg
+                .headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    Some((
+                        hyper::header::HeaderName::from_bytes(name.as_bytes()).ok()?,
+                        hyper::header::HeaderValue::from_str(value).ok()?,
+                    ))
+                })
+                .collect(),
             #[cfg(feature = "openapi")]
             docs: std::sync::Arc::new(std::sync::RwLock::new(None)),
         }
@@ -116,6 +128,13 @@ impl Protection {
     /// The compiled compression policy.
     pub(crate) fn compression(&self) -> &crate::compress::Compression {
         &self.compression
+    }
+
+    /// Adds the `[headers]` entries the response does not already carry.
+    pub(crate) fn apply_headers(&self, headers: &mut hyper::HeaderMap) {
+        for (name, value) in &self.response_headers {
+            headers.entry(name).or_insert_with(|| value.clone());
+        }
     }
 
     /// Body-parsing bounds handed to each request.
@@ -168,24 +187,21 @@ impl Protection {
 
     /// Runs the pre-Lua checks; `Some` is the rejection response.
     pub(crate) fn check(&self, req: &LuaRequest) -> Option<Result<HttpResponse>> {
+        let wants_json = wants_json(req.req.headers());
         if let Some(rate) = &self.rate
             && let Err(retry_after) = rate.check(req)
         {
             tracing::debug!(peer = %req.peer_addr, "request rate limited");
-            return Some(
-                plain_response(StatusCode::TOO_MANY_REQUESTS, "Too Many Requests").map(
-                    |mut resp| {
-                        if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
-                            resp.headers_mut().insert(hyper::header::RETRY_AFTER, value);
-                        }
-                        resp
-                    },
-                ),
-            );
+            return Some(rate_limited(retry_after, wants_json));
         }
 
         if uri_len(req) > self.max_uri_bytes {
-            return Some(plain_response(StatusCode::URI_TOO_LONG, "URI Too Long"));
+            return Some(rejection(
+                StatusCode::URI_TOO_LONG,
+                "URI_TOO_LONG",
+                None,
+                wants_json,
+            ));
         }
 
         // More than one `Authorization` header is refused outright. The
@@ -211,7 +227,12 @@ impl Protection {
                 peer = %req.peer_addr,
                 "request refused: more than one Authorization header"
             );
-            return Some(plain_response(StatusCode::BAD_REQUEST, "Bad Request"));
+            return Some(rejection(
+                StatusCode::BAD_REQUEST,
+                "BAD_REQUEST",
+                None,
+                wants_json,
+            ));
         }
 
         // Declared body size; a chunked body that lies is caught later by
@@ -223,9 +244,11 @@ impl Protection {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
         if declared.is_some_and(|len| len > self.max_body_bytes) {
-            return Some(plain_response(
+            return Some(rejection(
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "Payload Too Large",
+                "PAYLOAD_TOO_LARGE",
+                None,
+                wants_json,
             ));
         }
 
@@ -240,7 +263,7 @@ fn uri_len(req: &LuaRequest) -> usize {
 
 /// A fixed-window request counter per client.
 #[derive(Debug)]
-struct RateLimiter {
+pub(crate) struct RateLimiter {
     max: u32,
     window: Duration,
     trust_forwarded_for: bool,
@@ -255,7 +278,7 @@ struct Buckets {
 }
 
 impl RateLimiter {
-    fn new(max: u32, window: Duration, trust_forwarded_for: bool) -> Self {
+    pub(crate) fn new(max: u32, window: Duration, trust_forwarded_for: bool) -> Self {
         Self {
             max,
             window,
@@ -269,7 +292,7 @@ impl RateLimiter {
 
     /// Returns `Err(retry_after_seconds)` when the client exceeded its
     /// budget for the current window.
-    fn check(&self, req: &LuaRequest) -> std::result::Result<(), u64> {
+    pub(crate) fn check(&self, req: &LuaRequest) -> std::result::Result<(), u64> {
         // The standard library's clock, so `nitr.test.clock.advance` can
         // move a test past the window; the real monotonic clock otherwise.
         self.check_with(req, nitr_std::clock::now_instant)
@@ -383,6 +406,8 @@ fn bucket_key(ip: IpAddr) -> IpAddr {
 
 #[cfg(test)]
 mod tests {
+    use hyper::header::HeaderValue;
+
     use super::*;
     use http_body_util::BodyExt as _;
 

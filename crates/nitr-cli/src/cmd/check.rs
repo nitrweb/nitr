@@ -12,7 +12,8 @@ use nitr::{Config, Server};
 /// parsing, builtins resolution, Lua syntax, route conflicts, template and
 /// database wiring. Note: the configuration script runs once (its side
 /// effects, e.g. migrations, happen).
-pub(crate) async fn check(cfg: Config) -> anyhow::Result<()> {
+pub(crate) async fn check(mut cfg: Config) -> anyhow::Result<()> {
+    super::skip_missing_static_dir(&mut cfg);
     let workers = cfg.workers;
     let cfg = Config { workers: 1, ..cfg };
     Server::builder()
