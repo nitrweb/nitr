@@ -15,6 +15,7 @@ failure. A step you skipped is reported as skipped, never as passed.
 | 3 | Test | `make test` | always |
 | 4 | API docs | `NITR_API_REGEN=1 cargo test -p nitr-cli --test api` | `nitr-api.toml` changed |
 | 5 | Fuzz | `make fuzz FUZZ_TIME=30` | `pub mod fuzzing`, `fuzz/`, or behaviour a target asserts changed |
+| 5b | Benches | `cargo test -p nitr --benches --features all` | `benches/`, or behaviour a bench asserts changed |
 | 6 | Dependencies | `cargo deny check` | `Cargo.toml` or a `Cargo.lock` changed |
 | 7 | Live smoke | build it and run it | always, for what you touched |
 
@@ -37,6 +38,11 @@ What each step covers:
    `fuzz/corpus/`. It catches a stale oracle before CI does: grep
    `fuzz/fuzz_targets/` for any function whose output you changed. Never
    run a target against `fuzz/seeds/`.
+5b. **Benches.** Runs each divan bench once in test mode (a debug
+   build, not the fat-LTO bench profile). Every bench asserts the status
+   it measures, and `make test` never builds them, so a behaviour change
+   otherwise surfaces first as a CodSpeed panic. Divan stops a target at
+   its first panic: rerun until all three targets pass.
 6. **Dependencies.** Licences, advisories and sources (`deny.toml`). An
    advisory in a crate you did not touch is still reported. Fix it in its
    own change.

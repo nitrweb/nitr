@@ -564,18 +564,34 @@ mod static_files {
         });
     }
 
-    /// An unknown path under the SPA mount: resolved, missed, then the
-    /// index served instead.
+    /// A browser navigation to an unknown path under the SPA mount:
+    /// resolved, missed, then the index served instead. The fallback
+    /// answers only a request whose `Accept` names `text/html`.
     #[divan::bench]
     fn spa_fallback(bencher: divan::Bencher<'_, '_>) {
         let rt = tokio_runtime();
         let script = app_script(&fixture());
         let client = client(&rt, &script, builtins());
+        let headers = [header(
+            "accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )];
+        let navigate = || {
+            dispatch(
+                &rt,
+                &client,
+                "GET",
+                "/app/some/client/route",
+                &headers,
+                None,
+                200,
+            )
+        };
 
-        let probe = get(&rt, &client, "/app/some/client/route");
+        let probe = navigate();
         assert_eq!(probe.header("content-type"), Some("text/html"));
 
-        bencher.bench_local(|| divan::black_box(get(&rt, &client, "/app/some/client/route")));
+        bencher.bench_local(|| divan::black_box(navigate()));
     }
 }
 
